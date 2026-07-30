@@ -90,11 +90,22 @@ who bypasses this binary entirely** and reads the phone with their own copy of `
 goal is that *this binary* is not the instrument, and that its own history is not
 rewritable — not that the phone is unreachable from the host.
 
-Note that bypassing the broker does not obviously require root: the adb server listens on a
-loopback TCP socket with no peer-credential check, so any local process able to connect may
-be able to speak the sync protocol directly. That is unverified here and is tracked as an
-open question in `THREAT_MODEL.md`; it changes no control in this document, but it means the
-bypass should not be described as a root-only capability.
+**Measured 2026-07-31: bypassing the broker requires nothing at all.** The adb server listens
+on `127.0.0.1:5037` with no peer-credential check, and a `host:version` exchange succeeded
+both from an ordinary user and from `nobody` — a uid with no relationship to the server's
+owner. Any local process can speak the sync protocol directly, in about ten lines, and read
+whatever the device will serve.
+
+This changes no control here, because none of them was ever protecting the phone from the
+host. It does change what may be claimed for them, and the claim is worth stating in its
+weakest honest form: **the broker confines itself, not the phone.** Anything that reads the
+phone without going through this binary is outside every guarantee in this document, and that
+is cheap rather than difficult.
+
+It also bounds what the caller group buys. Restricting execution to `adb-broker-clients`
+does not restrict who can read the phone — nothing can. What it restricts is who can produce
+a *broker-attributed* read and who can append to the audit log at all, which is worth having
+and is less than it might look like from the name. See `THREAT_MODEL.md` §8.1.
 
 ---
 

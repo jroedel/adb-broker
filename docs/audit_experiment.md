@@ -189,14 +189,25 @@ their own copy of `adb`". Measured:
 ss -ltnp  ->  LISTEN 127.0.0.1:5037  users:(("adb",pid=29995,fd=9))
 ```
 
-The adb server runs as **uid 1003, not root**, and an unprivileged process completed a
-`host:version` exchange against it (`OKAY`). So the bypass is available without root, and the
-original wording overstated the barrier.
+The adb server runs as **uid 1003, not root**. Two clients completed a `host:version`
+exchange against it:
 
-Still open: whether it requires being the *same* uid as the server owner. The process that
-succeeded was that uid. adb performs no peer-credential check on a TCP socket, so the expected
-answer is that any local uid works, but that is inference. `THREAT_MODEL.md` §8.1 carries the
-one command that settles it.
+```
+as uid 1003        ->  OKAY     (the server's own owner)
+as nobody (65534)  ->  OKAY     (no relationship to the owner)
+```
+
+`nobody` settles it: this is not a same-uid effect. adb performs no peer-credential check on a
+TCP socket and nothing in its protocol authenticates a client, so **any local process can
+speak the sync protocol directly** and read whatever the device serves. The original wording
+overstated the barrier by describing it as root-only; there is no barrier.
+
+Two things follow that are easy to get backwards. It weakens no control — none was protecting
+the phone from the host — but it bounds what the caller group buys: restricting execution to
+`adb-broker-clients` restricts who can produce a *broker-attributed* read and who can append
+to the audit log, not who can read the phone. And the bypass is closable, though not by this
+binary: `ADB_SERVER_SOCKET=unix:…` would put file permissions in front of the server, which
+collides with the spec's compiled-in address. Tracked as `THREAT_MODEL.md` §8.6.
 
 The corollary is relied on elsewhere: since the socket needs no group membership, the broker's
 uid needs none either, which is why `install.sh` grants it nothing for adb access.
@@ -215,13 +226,15 @@ uid needs none either, which is why `install.sh` grants it nothing for adb acces
    truncation. Named as a gap rather than papered over.
 5. **The anchor writer caps field sizes** (§2.3), so it cannot emit a record the reader is
    unable to parse.
-6. **The bypass exclusion is not root-only** (§3).
+6. **The bypass exclusion is not root-only — it is not privileged at all** (§3). Any local uid
+   can drive the adb server, so the exclusion in `ADB_BROKER.md` is corrected from "an
+   adversary who is already root" to "any local process", and what the caller group is
+   credited with is narrowed to match.
 
 ---
 
 ## Still untested
 
-- Whether a uid *unrelated* to the adb server's owner can drive the server (§3).
 - Whether the linear entry-array walk is fast enough for `verify` on ~30 files of 8–64 MB.
 - journald retention on this host, which sets an unquantified horizon on the truncation
   guarantee: an anchor that has been rotated away proves nothing.

@@ -15,8 +15,9 @@ environment were largely unverified when this document was first written; the au
 infrastructure has since been measured on 2026-07-31 and those runs are in
 `audit_experiment.md`. That pass confirmed the anchor path end to end, confirmed both audit
 controls on real hardware, and turned up one threat this document had missed entirely (T31,
-forged anchors via a world-writable journal socket). §8.1 is now partly measured and remains
-partly open. Anything still resting on architecture rather than a run says so in place.
+forged anchors via a world-writable journal socket). §8.1 is answered and closed: bypassing
+the broker requires neither root nor any particular uid. Anything still resting on
+architecture rather than a run says so in place.
 
 ---
 
@@ -301,7 +302,10 @@ so it cannot forge entries or erase existing ones. Its own reads are simply unre
 log therefore remains truthful about what the deployed broker did; it was never a complete
 record of what happened to the phone.
 
-**This exclusion is currently mis-scoped in `ADB_BROKER.md`.** See §8.1.
+**This exclusion was mis-scoped as root-only; corrected in `ADB_BROKER.md`.** It is reachable
+by A2 with a socket call and no privilege whatsoever — measured, §8.1. That makes this the
+widest exclusion in the document, and the one most likely to be misread as narrower than it
+is.
 
 ### 6.3 Physical access to the phone, and the USB path
 
@@ -372,7 +376,7 @@ trailer digest plus an exact byte count is what remains.
 
 Ordered by how much they change the model.
 
-### 8.1 Does reaching the adb server actually require root?
+### 8.1 ~~Does reaching the adb server actually require root?~~ Answered: it requires nothing
 
 `ADB_BROKER.md` excludes *"an adversary who is already root on the host and simply reads the
 phone with their own copy of `adb`."* The adb server listens on `127.0.0.1:5037` — a TCP
@@ -385,27 +389,43 @@ wording overstates the barrier. It does not change any control — the controls 
 about protecting the phone from the host — but it does change what should be claimed for
 them, and the claim as written is the kind that gets quoted later.
 
-**Partially measured, 2026-07-31.** The socket is `LISTEN 127.0.0.1:5037`, owned by `adb`
-pid 29995 running as an *ordinary* user (`agy_user`, uid 1003) — not root. An unprivileged
-process on this host connected and completed a `host:version` exchange, receiving `OKAY`.
-
-So the bypass certainly does not require root. What is **not** yet settled is whether it
-requires being the *same* uid as the server owner: the process that succeeded was that uid.
-adb performs no peer-credential check on a TCP socket and nothing in its protocol
-authenticates a client, so the expected answer is that any local uid works — but that is
-inference, not measurement.
-
-One command settles it, run as a uid unrelated to the server owner:
+**Answered, measured 2026-07-31: no. It requires nothing.**
 
 ```
-sudo -u nobody python3 -c "import socket; s=socket.create_connection(('127.0.0.1',5037));
-s.sendall(b'000chost:version'); print(s.recv(64))"
+ss -ltnp            ->  LISTEN 127.0.0.1:5037  users:(("adb",pid=29995,fd=9))
+                        server running as uid 1003, an ordinary user, not root
+as uid 1003         ->  host:version  ->  OKAY
+as nobody (65534)   ->  host:version  ->  OKAY
 ```
 
-Until then treat §6.2 as reachable by A2, which is the conservative reading and is now
-supported by direct evidence rather than only by argument. Note the corollary already relied
-on elsewhere: because the socket needs no group membership, the broker's uid needs none
-either — which is why `install.sh` grants it nothing for adb access.
+`nobody` has no relationship to the server's owner, so this is not a same-uid effect: adb
+performs no peer-credential check on a TCP socket and nothing in its protocol authenticates a
+client. **Any local process can speak the sync protocol directly** and read whatever the
+device serves, in about ten lines.
+
+`ADB_BROKER.md`'s exclusion is corrected accordingly, and §6.2 is reachable by A2 by
+measurement rather than by argument.
+
+Three consequences worth separating, because they pull in different directions:
+
+1. **No control in this document changes.** None of them was protecting the phone from the
+   host; §1's first asset is explicitly *unreachable through this binary*, not unreachable.
+   The claim to make is the weakest honest one: the broker confines itself, not the phone.
+2. **The caller group buys less than its name suggests.** Restricting execution to
+   `adb-broker-clients` does not restrict who can read the phone — nothing does. It restricts
+   who can produce a *broker-attributed* read and who can append to the audit log at all.
+   That is worth having: it keeps the log's contents meaningful and stops arbitrary local
+   processes writing to it. It is not phone confinement and should not be credited as any.
+3. **The bypass is closable, but not by this binary.** adb can be made to listen on a unix
+   socket instead (`ADB_SERVER_SOCKET=unix:…`), at which point file permissions gate access
+   and the bypass becomes a group membership rather than a socket call. That is host
+   hardening, outside the broker — and it collides with the spec's rule that the server
+   address is compiled in and not configurable, since the broker could then no longer reach
+   it. Recorded as §8.6 rather than decided here.
+
+The corollary relied on elsewhere still holds and is now measured: because the socket needs no
+group membership, the broker's uid needs none either, which is why `install.sh` grants it
+nothing for adb access.
 
 ### 8.2 What makes "edit the source and rebuild" attributable?
 
@@ -441,6 +461,21 @@ reader, any non-UTF-8 filename (none exists here to find), a mid-transfer `RECV`
 after `DATA` has flowed, and `RECV` on a final component that is a symlink pointing outside
 the root — the T7 TOCTOU case, which needs a fixture that does not exist on this device.
 
+### 8.6 Should the adb server be moved to a unix socket?
+
+Following from §8.1: `ADB_SERVER_SOCKET=unix:<path>` would put file permissions in front of the
+server, turning the bypass from a socket call into a group membership. It would be the single
+largest reduction in A2's capability available on this host, and it is entirely outside this
+binary.
+
+It is not free. The spec compiles `127.0.0.1:5037` in and refuses to make it configurable,
+precisely so that no runtime input can point the broker somewhere else — so hardening the
+server this way would require the broker to compile in a unix socket path instead, and the
+"one address, not configurable" property would need re-deriving rather than merely edited. It
+also affects every other adb consumer on the host.
+
+Worth doing or worth explicitly declining; not worth leaving unnoticed.
+
 ---
 
 ## 9. What would force a revision
@@ -455,8 +490,9 @@ the root — the T7 TOCTOU case, which needs a fixture that does not exist on th
   shape.
 - `adbd` gains device-side confinement — §2's premise changes, and several §4.1 controls
   stop being the only boundary.
-- The answer to §8.1 turns out to be that the socket *is* access-controlled — in which case
-  the claims can be strengthened, not weakened, and should be.
+- The adb server is moved behind a unix socket (§8.6) — A2's bypass becomes a group
+  membership, several claims here can be *strengthened* rather than weakened, and the spec's
+  compiled-in `127.0.0.1:5037` has to change with them.
 - systemd changes the journal file format incompatibly — `verify` stops being able to read
   anchors, and must fail loudly rather than report "no anchors found", which is
   indistinguishable from tampering. Measured flags on this host are
