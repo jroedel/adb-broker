@@ -56,10 +56,20 @@ So, binding on the whole experiment:
   size and SHA-256, not its bytes and not its name.
 - **Directory listings are reported as aggregates** — entry count, mode
   histogram, size range. Never an enumeration.
-- Serial numbers are recorded truncated (`3C26…1KM`).
+- Serial numbers are recorded truncated (`EXAM…AL1`).
 
 If a finding genuinely cannot be demonstrated under these rules, I'll say so and
 ask rather than quietly widen them.
+
+**Where this rule was broken, and the correction.** The findings below quote wire
+output verbatim, and I recorded the device's real serial in full six times rather
+than truncating it as this section requires. Every occurrence has since been
+replaced with the placeholder `EXAMPLESERIAL1`, chosen at 14 characters to match
+the original's length so the column alignment in the `host:devices-l` example
+stays faithful. The real value is being purged from git history separately. The
+rule was right and it was not followed; noting it here rather than silently
+fixing it, because a redaction policy that is quietly violated is worse than one
+that was never written.
 
 ---
 
@@ -300,7 +310,7 @@ was never invoked. Two findings nobody was looking for turned up as well: the
 
 ## Findings
 
-Measured 2026-07-30. Device serial `3C26…1KM`, `usb:1-1`, `transport_id:2`.
+Measured 2026-07-30. Device serial `EXAM…AL1`, `usb:1-1`, `transport_id:2`.
 
 ### Phase 0 — host framing: **confirmed**
 

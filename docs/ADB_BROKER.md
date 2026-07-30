@@ -387,14 +387,47 @@ So confinement is now two mechanisms, and the second is stronger than what it re
 
 #### Part 1 — the volume pin
 
-**Once per run, before any listing, the broker resolves the storage volume and pins it.**
-It issues `STA2` on the compiled constant `/sdcard` — `STA2` follows symlinks, which is
+**Once per invocation, before any listing, the broker resolves the storage volume and pins
+it.** It issues `STA2` on the compiled constant `/sdcard` — `STA2` follows symlinks, which is
 exactly what is wanted here and is why it is in the vocabulary — and records the resulting
-`(dev, ino)` as the run's volume identity.
+`dev` as the volume identity.
 
-The resolution must yield a directory. If it does not, or `STA2` fails, the run aborts with
-`volume_unresolved` before any path is served. The device is not presenting storage in the
-shape this broker understands, and guessing is not an option.
+The resolution must yield a directory. If it does not, or `STA2` fails, the invocation aborts
+with `volume_unresolved` before any path is served. The device is not presenting storage in
+the shape this broker understands, and guessing is not an option.
+
+**The pin is `dev` only. `ino` is recorded but not enforced.** This was a deliberate
+narrowing of an earlier draft that pinned both.
+
+`ino` would add exactly one thing: distinguishing `/storage/emulated/0` from
+`/storage/emulated/10`, which is Android's multi-user layout. Both are `dev=190`, so `dev`
+alone cannot tell them apart. Enforcing `ino` therefore defends against `/sdcard` being
+re-pointed at a different user's storage — which requires privilege on the *phone*, and the
+threat model above explicitly excludes a compromised device. The target phone has no second
+user and is not expected to gain one.
+
+So enforcing it would be ceremony: a control against a threat this document has already
+declared out of scope, paid for with a flag threaded through the caller's contract. `dev`
+alone catches what is actually in scope — a symlink or bind mount leading off the media
+volume, to `/data` (`dev=65088`) or the root filesystem (`dev=65034`).
+
+`ino` is still written to the audit record, as **provenance rather than as a control**: the
+log's job is to answer "what did this binary read," and the identity of the directory it
+started from is part of that answer at the cost of one integer. It is not checked, and
+nothing branches on it.
+
+**Nothing about the volume crosses the wire to the caller.** No `--expect-volume` flag, no
+`volume` field in any response. The pin is resolved fresh inside each invocation and the
+caller is never asked to hold or pass phone internals. This is a deliberate constraint on the
+interface: the archiver's job is to ask for paths, not to reason about the phone's storage
+topology.
+
+**If the volume changes mid-invocation**, which a replug or a storage remount can cause with
+no adversary involved at all, the `dev` comparison starts failing for every remaining entry.
+Rather than emitting a per-file `path_denied` storm — which reads as "these thousand files
+are all forbidden" instead of "the ground moved" — the broker re-stats the root once on the
+first mismatch and, if it no longer resolves to the pinned `dev`, aborts that source with
+`volume_unresolved`. One clear cause beats a thousand misleading symptoms.
 
 This resolution is the **only** place the broker traverses a symlink deliberately. It
 happens once, in one function, against a compiled constant — not once per caller-supplied
@@ -474,9 +507,10 @@ with a particular mounted volume, not of the path.
 
 So it gets its own type and the same treatment:
 
-- `devicevolume.Volume` holds the pinned `(dev, ino)` and is constructible only by the
+- `devicepath.Volume` holds the pinned `dev` and `ino` and is constructible only by the
   resolver that performed the `STA2`. There is no literal, no zero value that means
-  anything, and no setter.
+  anything, and no setter. Its single comparison method tests `dev`; `ino` is carried for the
+  audit record and enforced nowhere.
 - The `Storer` methods take **both** an `AuthorizedPath` and a `Volume`. A caller with a
   validated path but no pinned volume cannot express a fetch.
 - Checking a dirent's `dev` against the `Volume` is the only exported operation on it.
@@ -505,7 +539,7 @@ photos-adb-broker probe [--serial <id>]
 ```
 
 ```json
-{"proto":1,"status":"ok","serial":"EXAMPLESERIAL1","state":"device","model":"Pixel_8_Pro","broker":"0.1.0","adb":"1.0.41","volume":{"dev":190,"ino":3252}}
+{"proto":1,"status":"ok","serial":"EXAMPLESERIAL1","state":"device","model":"Pixel_8_Pro","broker":"0.1.0","adb":"1.0.41"}
 ```
 
 Called once before a run. A disconnected phone makes every configured source unreachable,
@@ -545,10 +579,13 @@ kill-server'`) that the broker must never take.
 Note also that **an empty device list is `OKAY` with a zero-length payload, not `FAIL`**.
 Code that keys off `FAIL` alone will not notice that no phone is attached.
 
-`probe` performs the volume resolution described under **Confinement** and reports the pinned
-`volume` shown above, so that a run's audit trail records which filesystem it read and not
-merely which path strings it used. It fails with `volume_unresolved` if `/sdcard` does not
-resolve to a directory.
+`probe` performs the volume resolution described under **Confinement** and fails with
+`volume_unresolved` if `/sdcard` does not resolve to a directory — so a device whose storage
+is not in the expected shape is discovered once, up front, rather than eleven times.
+
+The pinned volume is **not** reported in the response. It goes to the audit log and nowhere
+else. The caller has no use for it and giving it one would invite the archiver to reason
+about the phone's storage layout, which is this binary's job and not its consumer's.
 
 ### 2. `list` — enumerate a tree
 
@@ -705,7 +742,7 @@ machine-readable `code`:
 | `no_adb_server` | Nothing listening on `127.0.0.1:5037` | Aborts. The host must start it. |
 | `path_denied` | Outside the allowlist, wrong spelling, a symlink, or off the pinned volume | **Aborts that source.** A configuration error, not a device condition. |
 | `audit_unavailable` | The audit log cannot be opened or its head does not verify | Aborts the run before any device contact. |
-| `volume_unresolved` | `/sdcard` does not `STA2` to a directory | Aborts the run. Storage is not in the expected shape; nothing is served. |
+| `volume_unresolved` | `/sdcard` does not `STA2` to a directory, or stopped resolving to the pinned `dev` mid-listing | From `probe`, aborts the run. From a `list`, aborts that source. Storage is not in the shape that was pinned. |
 | `root_not_found` | The named tree does not exist | **Skips that source, continues.** One of eleven folders having been removed says nothing about the other ten. |
 | `not_a_directory` | Root is a file | Skips that source. |
 | `permission_denied` | A path could not be read | Per-path: warn, continue. Never ends a run. |
@@ -785,10 +822,14 @@ unvalidated one would be logged in full while a shorter path was actually read. 
 records a different operation from the one performed is worse than no log, because it is
 believed.
 
-The run's pinned volume is recorded once per run, as `{"op":"probe","volume":{"dev":190,
-"ino":3252}}`, so that the trail says which filesystem was read and not merely which path
-strings were used. Since `dev` is reassigned at mount time, this is the only way two runs
-can be compared meaningfully.
+The pinned volume is recorded once per invocation, as `"volume":{"dev":190,"ino":3252}`, so
+that the trail says which filesystem was read and not merely which path strings were used.
+Both numbers are recorded; only `dev` is enforced (see **Confinement**). `ino` is here purely
+as provenance — it costs one integer and it is the difference between a log that says "read
+`/sdcard/DCIM`" and one that says which directory that actually was.
+
+Since `dev` is reassigned at mount time, neither value is meaningful as a long-term
+identifier. They are evidence about a particular invocation, not a name for the volume.
 
 **`usb:` path and `transport_id` must not be logged as device identity.** Measured across a
 port change: the serial was stable while `usb:1-1` became `usb:1-2` and `transport_id` went
@@ -970,8 +1011,9 @@ business/domain/device/stores/adbsyncdb/
   volume.go                                 STA2 root resolution; the only deliberate symlink traversal
   reconnect.go                              re-establish transport after a terminal RECV FAIL
   convert.go                                toSync* / toBusFileRecord
-business/types/devicepath/                  DevicePath, AuthorizedPath, the allowlist
-business/types/devicevolume/                Volume — the pinned (dev, ino)
+business/types/devicepath/
+  path.go                                   DevicePath, AuthorizedPath, the allowlist
+  volume.go                                 Volume — pinned dev (enforced) + ino (recorded)
 business/types/serial/                      Serial
 business/types/mtime/                       Mtime
 business/types/filekind/                    Kind — regular, dir, symlink, other
@@ -987,22 +1029,41 @@ foundation/adbwire/                         framing, host services, sync command
 | App request | `ListRequest{Root, Serial string; MaxDepth int; Prune []string}` | flags arrive as primitives |
 | App response | `FileRecordResponse{Path, PathB64 string; Size, Mtime int64}` | exactly the wire format above |
 | Business | `FileRecord{Path devicepath.AuthorizedPath; Size int64; Mtime mtime.Mtime; Kind filekind.Kind}` | strong throughout |
-| Storage row | `syncFileRecord{Path, PathB64 string; Size, MtimeSec int64; Mode uint32; Dev, Ino uint64}` | natives, as `LIST_V2` returns them |
+| Storage row | `syncFileRecord{Path, PathB64 string; Size, MtimeSec int64; Mode uint32; Dev, Ino int64}` | natives, as `LIST_V2` returns them |
 
-`Dev` and `Ino` are new on the storage row and are `uint64` primitives there, per the house
-rule that DB/wire rows hold natives only. They are parsed into `devicevolume.Volume` by the
+`Dev` and `Ino` are new on the storage row. They are parsed into `devicepath.Volume` by the
 storage-layer `toBusFileRecord`, which is also where the pinned-volume comparison happens —
-the row cannot cross into Business unless its `dev` matches. `Volume` never appears in an App
-request or response struct; `probe`'s response carries `dev` and `ino` as plain `int64`
-fields, converted explicitly in `fromBusProbeResponse`.
+the row cannot cross into Business unless its `dev` matches.
 
-**Types to confirm before implementation.** Per the house rules the concrete choices at each
-boundary are yours, and three here are worth an explicit decision rather than my default:
-`Dev`/`Ino` as `uint64` on the row (the kernel's own width) versus `int64` throughout to
-avoid an unsigned/signed conversion at the JSON edge; whether `devicevolume.Volume` is its
-own `business/types` package or lives inside `devicepath` alongside the allowlist; and
-whether `probe`'s response nests `volume` as an object or flattens to `volume_dev` /
-`volume_ino`.
+**`Volume` never crosses into the App layer at all.** It appears in no request struct, no
+response struct and no converter in `app/broker`; the only thing outside Business that ever
+sees it is the audit extension. That makes the layering question here unusually simple: there
+is no App-side representation to keep in step, because there is no App-side representation.
+
+### Settled type decisions
+
+**`dev` and `ino` are `int64` at every layer that holds them** — the storage row, `Volume`,
+and the audit record. Uniform with `size` and `mtime`, so there are no casts anywhere in our
+own code and no unsigned value in the JSON that does carry them.
+
+The wire carries both as unsigned 64-bit, so the reinterpretation happens once, in
+`foundation/adbwire`'s decoder. It is **checked rather than silent**: a value with the high
+bit set is a decode error, not a negative number. This costs one comparison per dirent and
+means the uniformity above is a genuine simplification rather than a lie told quietly at the
+boundary. Real inode numbers are nowhere near 2^63, so the branch should never fire — which
+is exactly why it must be an error rather than a wrap, since a firing branch would mean an
+assumption had failed and silence would be the worst possible response.
+
+**`Volume` lives in `business/types/devicepath`**, in `volume.go` alongside `path.go`. Both
+halves of confinement are then one package with one dense test file, which is where a
+reviewer wants to read them together. The package therefore holds two different kinds of
+thing on purpose — a validated string type and runtime device state — and the file split
+keeps that legible.
+
+`Volume` holds both `dev` and `ino`, and exposes exactly one comparison, which tests `dev`
+only. `ino` is readable for the audit record and is compared by nothing. A reader who expects
+a two-field type to compare two fields will find a comment at that method explaining why it
+does not.
 
 ### Converters
 
@@ -1064,7 +1125,7 @@ that exercise confinement must exercise the real confinement code, or they are t
 something else.
 
 **The volume pin applies in fixture mode too**, resolved against the fixture directory's own
-`(dev, ino)` rather than being stubbed out. This matters more than it looks: the pin is now
+`dev` rather than being stubbed out. This matters more than it looks: the pin is now
 half of confinement, and a fixture mode that skips it can only test the other half. It also
 makes the escape case cheap to test for real — a symlink inside the fixture tree pointing at
 `/tmp` crosses a filesystem boundary on most hosts and must be refused, and one pointing
@@ -1091,18 +1152,48 @@ The audit guarantee depends on file ownership the binary cannot establish for it
 installation is a documented, root-run step rather than something the broker does on first
 use. A process that can create its own audit log can also recreate it.
 
+### The broker runs as its own uid
+
+**Decided: a dedicated service account, distinct from the one `photos` runs as.**
+
+This is what makes the audit log's protection two independent controls instead of one. If
+the broker shared `photos`' uid, then anything that compromised `photos` could open the
+audit log directly, and `chattr +a` would be carrying the entire guarantee by itself. With a
+separate uid:
+
+```
+photos (uid A)  --exec-->  broker (uid B)  --append-->  audit.log (owned B, +a)
+```
+
+- A compromise of `photos` cannot open the log for writing at all — wrong owner.
+- A compromise of the broker can only append — `chattr +a`, and removing that attribute
+  needs `CAP_LINUX_IMMUTABLE`, which the broker does not have.
+- Neither can unlink it, because the parent directory is `root:root`.
+
+Two controls that fail independently. Against local root both still fall, which the threat
+model already says.
+
 `make install`, run as root:
 
-1. Creates `/var/log/photos-adb-broker/`, owned `root:root`, mode `0755`.
-2. Creates `audit.log`, owned by the uid the broker runs as, mode `0640`.
-3. Sets `chattr +a` on `audit.log`.
-4. Installs the binary to the target path, owned `root:root`, mode `0755`.
-5. Prints what it did, and verifies each property afterwards rather than assuming the
+1. Creates the `photos-adb-broker` service account if absent — no login shell, no home
+   directory, not a member of `photos`' group.
+2. Creates `/var/log/photos-adb-broker/`, owned `root:root`, mode `0755`.
+3. Creates `audit.log`, owned by the broker's uid, mode `0640`.
+4. Sets `chattr +a` on `audit.log`.
+5. Installs the binary to the target path, owned `root:root`, mode `0755`.
+6. Prints what it did, and verifies each property afterwards rather than assuming the
    commands worked.
 
-`make verify-install` re-checks all four properties without changing anything, and is
-worth running from monitoring. The broker's own startup check covers the log; it cannot
-check that it is not itself writable by the adversary, because by then it is too late.
+Note that the broker's uid needs whatever group grants access to the adb server's socket, and
+that `photos` must be able to execute the broker binary — but **not** the reverse: nothing
+requires the broker to be able to read anything `photos` owns.
+
+`make verify-install` re-checks every property without changing anything, and is worth
+running from monitoring. It must specifically assert that **the broker's uid differs from the
+uid `photos` runs as**, since that is the property the second control depends on and it is
+the one most likely to be quietly undone by a later packaging change. The broker's own startup
+check covers the log; it cannot check that it is not itself writable by the adversary, because
+by then it is too late.
 
 ---
 
@@ -1136,8 +1227,8 @@ that would deserve one on a shipped interface.
    start: the empty-list-is-`OKAY` case, all four `FAIL` strings, and every malformed-framing
    case are reachable with no phone. Must include the `DONE`-carries-72-zero-bytes test and
    the double-encoded `host:version` payload.
-2. `business/types/*` — `devicepath` with the full allowlist rule set, `devicevolume`,
-   `mtime`, `filekind`, `serial`, `errcode`. `devicepath` gets the densest test file in the
+2. `business/types/*` — `devicepath` with the full allowlist rule set plus `Volume`,
+   then `mtime`, `filekind`, `serial`, `errcode`. `devicepath` gets the densest test file in the
    repo. Every one of these is a measured device behaviour, not a hypothetical, and each
    deserves a named test case:
    - `Download-private` — segment-boundary matching
@@ -1147,7 +1238,10 @@ that would deserve one on a shipped interface.
    - a relative path such as `sdcard/DCIM` (the device resolves it)
    - trailing slash and doubled slash (the device accepts both)
    - parent-of-root: `/sdcard` and `/`
-   - `devicevolume`: a dirent whose `dev` differs from the pin is refused
+   - `Volume`: a dirent whose `dev` differs from the pin is refused, and one whose `ino`
+     differs while `dev` matches is **allowed** — the deliberate narrowing, and a test that
+     will look wrong to anyone who has not read why
+   - `adbwire` decode: a `dev`/`ino` with the high bit set is a decode error, not a negative
 3. `foundation/audit` — chain, canonical serialization, append sink, journald anchor,
    `verify`. Round-trip and tamper-detection tests: edit a record, reorder two, truncate
    the tail, and confirm each is caught.
@@ -1170,20 +1264,24 @@ Steps 1–3 are independent and have no dependency on a phone being present.
    parked until we are less busy. Revisiting it needs a one-off inspection of the top level
    of the volume, which is a deliberate act rather than something the tool does — `/sdcard`
    remains denied as a `--root`.
-2. **Which uid does the broker run as, and is it the same one `photos` runs as?** If they
-   are the same, the audit log is writable by whatever compromises `photos`, and the
-   `chattr +a` is doing all the work. A dedicated uid is better and costs nothing. **Still
-   unanswered and still the most consequential open item here** — it decides whether the
-   audit guarantee has two independent controls or one.
+2. ~~**Which uid does the broker run as?**~~ **Answered: a dedicated service account,
+   distinct from `photos`.** See **Installation**. The audit log now has two controls that
+   fail independently — ownership and `chattr +a` — rather than `+a` alone.
 3. **Off-box anchoring.** Deferred, because it would introduce network access to a binary
    that otherwise has none. Worth revisiting if the threat model ever includes local root.
-4. **Is the volume pin the right mechanism, and is `(dev, ino)` the right pin?** This is the
-   one genuinely new design decision the measurements forced, and it replaces a rule that
-   could not work. It should be reviewed on its merits rather than adopted because it was
-   the first fix to hand. Specific things to push on: whether `ino` adds anything over `dev`
-   alone; whether a remount mid-run could change `dev` underneath a long first run and what
-   should happen if it does; and whether refusing *all* symlinks below the root is too blunt
-   if a future device ships one legitimately.
+4. ~~**Is the volume pin the right mechanism, and is `(dev, ino)` the right pin?**~~
+   **Answered: pin `dev` only.** `ino` would only distinguish Android's multi-user volumes,
+   which requires phone-side privilege that the threat model excludes and a second user this
+   device does not have. It is recorded as provenance and enforced nowhere, and nothing about
+   the volume crosses the wire to the caller. The mid-invocation remount case is handled by
+   re-stating the root once and failing the source with `volume_unresolved` rather than
+   emitting per-file denials.
+
+   Still genuinely open within this: **is refusing *all* symlinks below the root too blunt?**
+   Zero symlinks were found among 1,778 files, so it costs nothing today, and a future device
+   shipping a legitimate one would show up as missing files rather than as an error. The
+   `list` summary counts refused non-regular entries specifically so that this is visible
+   instead of silent.
 5. **Should `list` and `fetch` be combinable?** A `fetch-many` reading paths from stdin
    would amortize spawn cost on a first-ever run. Explicitly *not* requested for v1 — the
    measurement above says it is a 3% effect — but it is the natural extension if a
