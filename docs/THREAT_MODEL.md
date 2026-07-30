@@ -1,0 +1,469 @@
+# The adb Broker — Threat Model
+
+What this binary is built to defend against, what it is not, and what each control
+actually buys. It expands the short **Threat model** section in `ADB_BROKER.md`; where the
+two disagree, this document is the one to fix.
+
+The rule throughout is that a control is only worth having if it is clear what it stops
+and what it does not. Several of the broker's mechanisms look like ceremony until the
+adversary they answer is named, and at least two of them are weaker than their names
+suggest. Both cases are stated in place rather than left for a reader to discover.
+
+**Evidence status.** Claims about device and protocol behaviour are measured — the runs are
+in `adb_experiment.md`, 2026-07-30, against the target phone. Claims about the host
+environment were largely unverified when this document was first written; the audit
+infrastructure has since been measured on 2026-07-31 and those runs are in
+`audit_experiment.md`. That pass confirmed the anchor path end to end, confirmed both audit
+controls on real hardware, and turned up one threat this document had missed entirely (T31,
+forged anchors via a world-writable journal socket). §8.1 is now partly measured and remains
+partly open. Anything still resting on architecture rather than a run says so in place.
+
+---
+
+## 1. What is being protected
+
+Three assets, in priority order. The ordering matters because two of the controls trade
+against each other and the tie is broken by this list.
+
+1. **The phone's storage outside the user's own media.** Application sandboxes under
+   `/data`, system paths, and anything on `/sdcard` that is not one of the six allowlisted
+   trees. The requirement is that these are unreachable *through this binary*, including
+   by a caller that asks for them deliberately and by a device that offers them in a
+   directory listing.
+
+2. **The record of what was read.** If the broker did reach something, that fact must
+   survive an attempt to erase, truncate, reorder or rewrite it — and the record must
+   describe the operation that actually happened, not one that was merely validated.
+
+3. **The archive's correctness.** Photos that exist on the phone must not be silently
+   omitted, and bytes that are archived must be the bytes the device holds. This is not a
+   security property in the usual sense, but it shares controls with the first two and it
+   is the reason the tool exists, so it belongs here rather than in a separate document.
+
+Availability is deliberately **not** on this list. See §7.1.
+
+---
+
+## 2. System and trust boundaries
+
+```
+   ┌─ host ──────────────────────────────────────────────────────────┐
+   │                                                                 │
+   │  consumer (uid A) ─exec─▶ adb-broker (uid B, setuid 4550)       │
+   │        │                        │        │                      │
+   │        │                        │        └─append─▶ audit.log   │
+   │        │                        │                   (owner B,   │
+   │        │                        │                    +a, in a   │
+   │        │                        │                    root:root  │
+   │        │                        │                    directory) │
+   │        │                        │                               │
+   │        │                        └─anchor─▶ systemd journal      │
+   │        │                                         ▲              │
+   │        │                                         │  ← §4.2 T31  │
+   │        └────────────── any other local process ──┤              │
+   │                                                  │  socket is   │
+   │                          adb server ◀────────────┘  mode 0666   │
+   │                        127.0.0.1:5037    ← §8.1                 │
+   └──────────────────────────────┬──────────────────────────────────┘
+                                  │ USB
+                             ┌────▼────┐
+                             │  adbd   │   no confinement of its own (measured)
+                             │  phone  │
+                             └─────────┘
+```
+
+Four boundaries, and it is worth being explicit about which are enforced by what:
+
+| Boundary | Enforced by | Strength |
+|---|---|---|
+| Caller → broker | `AuthorizedPath` / `Volume` types; compiled allowlist and service vocabulary | Compile-time; a caller cannot express a denied operation |
+| Broker → phone | The adb sync service vocabulary the broker will emit | Compiled constant, not convention |
+| Broker → audit log | Separate uid, `chattr +a`, root-owned parent directory | Two independent kernel-enforced controls |
+| Audit log → tamper detection | Hash chain + journald anchor | Detection, not prevention |
+
+`adbd` is **inside** the trust boundary in the sense that the broker believes what it
+says — and outside it in the sense that everything it says is re-validated. It applies no
+confinement of its own: measured, the sync channel stats `/`, `/data/data` and `/data/misc`
+freely. The broker's rules are the only boundary there is.
+
+---
+
+## 3. Adversaries in scope
+
+### A1 — A hostile or buggy caller
+
+Anything invoking the broker: the archiver, a shell, a script, a compromised `photos`. It
+controls `--root`, `--path`, `--serial`, the optional configuration file, the environment,
+and whether it reads stdout at all.
+
+**Assumed capable of:** asking for any path in any spelling, supplying malformed or
+adversarial path forms, discarding stdout and stderr, invoking the broker in a loop.
+
+**Not assumed capable of:** modifying the installed binary, or writing to the audit log
+(owned by a different uid). Note the binary is owned by the *broker's* uid rather than root —
+setuid takes its uid from the file owner — and carries mode `4550` with no owner write bit
+precisely so that ownership does not imply the ability to rewrite it.
+
+This is the adversary most of the confinement design answers, and it is the one where the
+controls are strongest — a denied operation is not a check that was skipped, it is a
+program that does not compile.
+
+### A2 — A local unprivileged process on the host
+
+Can write files and execute code as an ordinary user, can read this repository and rebuild
+the binary from modified source.
+
+**What it cannot do** is the interesting part: it cannot install over the deployed binary
+(`adb-broker:adb-broker-clients 4550`, in a root-owned directory), cannot open the audit log
+for writing (owned by the broker's uid), and cannot unlink it (root-owned parent). Unless it
+is a member of `adb-broker-clients` it cannot even execute the installed broker. It can build
+and run *its own* copy — and that copy is a different program, whose reads are unlogged. See
+§6.2 for what the audit guarantee actually reduces to under this adversary, and §8.1 for why
+this adversary is stronger than `ADB_BROKER.md` currently admits.
+
+**What it can do that this document originally missed:** write to
+`/run/systemd/journal/socket`, which is mode `0666`. That makes it able to publish forged
+anchors. See T31.
+
+### A3 — A malicious or compromised application on the phone
+
+An ordinary Android app with write access to shared storage. It cannot escape its own
+sandbox, but it can create entries inside the media tree — including a symlink at
+`/sdcard/Pictures/x` pointing at `/data/data/com.something/databases/`.
+
+This is a real adversary, not a hypothetical, and it is the one the volume pin and the
+symlink refusal exist for. A broker that validated only the requested path string and read
+whatever came back would have an allowlist that any app on the device could step around.
+
+### A4 — The environment, behaving badly without malice
+
+A replug that renumbers the transport, a storage remount that reassigns `dev`, an adb
+upstream release that rewords a `FAIL` message, a depth-limited configuration, a device
+whose `adbd` predates the V2 sync commands.
+
+Not an adversary, but it exercises the same paths and produces the same class of outcome —
+a confident, wrong, silent answer. The controls are shared, so it is modelled here.
+
+---
+
+## 4. Threats and the controls that answer them
+
+Grouped by asset. **Evidence** is `measured` where `adb_experiment.md` demonstrates the
+device behaviour the threat depends on, `judgement` where the rule is retained on prudence.
+
+### 4.1 Reaching storage outside the media tree
+
+| # | Threat | Control | Evidence | Residual |
+|---|---|---|---|---|
+| T1 | Caller names a path outside the allowlist (`/data/data/...`) | Compiled six-root allowlist; `ParseAuthorizedPath` is the only constructor for a path the storage layer will accept | measured (roots exist; `adbd` stats `/data` freely) | None from A1 |
+| T2 | Caller widens authority via flag, env var or config file | No input can widen. A config file may only *narrow*; an entry not already under a compiled root is a startup error | judgement (design rule) | Editing source and rebuilding — attributable, and see §8.2 |
+| T3 | Caller reaches the same bytes under `/storage/emulated/0/…` | Refused, and deliberately **not** resolved | measured (three spellings, one inode) | **This is not an authority boundary.** The bytes are reachable under the accepted spelling. It is a canonicalization rule; its value is in T11 |
+| T4 | Path-form tricks: `..`, relative paths, trailing/doubled slash, NUL | Rejected before anything else looks at the path | measured — each form tested against the device; `..` genuinely escapes upward, relative paths resolve with cwd `/` | None for the forms tested |
+| T5 | Prefix confusion: `/sdcard/Download-private` | Comparison is over path segments, never string prefixes | measured (`error=2`, so the device would have answered) | None |
+| T6 | An app plants a symlink in the media tree pointing at `/data` | Two independent checks: `LIST_V2` dirents carry `lstat` semantics and non-regular/non-directory entries are omitted; **and** every dirent's `dev` must equal the pinned volume | measured (`LST2` does not follow symlinks, `STA2` does; `/data` is `dev=65088`, media is `dev=190`) | TOCTOU — see T7 |
+| T7 | The file is swapped for a symlink between `LST2` and `RECV` | None available. `RECV` follows symlinks and the protocol offers no `openat`-style handle | measured (`RECV` necessarily traverses two symlinks on every read) | **Accepted.** Requires code execution on the phone timed against the broker; such an adversary has better options |
+| T8 | A bind mount inside the tree introduces a foreign filesystem with no symlink anywhere | The `dev` pin catches it; a string rule never could | judgement (mechanism follows from the measured `dev` values) | None known |
+| T9 | The device returns a directory entry naming something outside the tree | Device-supplied paths are re-parsed through `ParseAuthorizedPath` **and** `dev`-checked on the return path | measured (`adbd` applies no confinement) | None known |
+| T10 | The broker is used as a general remote-execution channel to the phone | There is no shell. The outbound vocabulary is a compiled constant: six host services plus `LST2`, `STA2`, `LIS2`, `RECV`. `shell:`, `exec:`, `SEND`, `root:`, `tcpip:`, `reverse:` are never sent | judgement (design rule, enforced by construction) | A source edit and rebuild — again attributable |
+
+T3 deserves the emphasis it gets in the table. An earlier draft of the spec implied the
+single-spelling rule was itself containment. It is not: all three spellings reach the same
+inode, so refusing two of them denies access to nothing. Keeping it is still correct, but
+for the audit reason below, and misplacing the trust would leave the real boundary — the
+allowlist plus the volume pin — carrying more than it was credited with.
+
+### 4.2 The audit record
+
+| # | Threat | Control | Evidence | Residual |
+|---|---|---|---|---|
+| T11 | The log describes an operation other than the one performed | NUL rejection (the device truncates at the NUL and would act on a shorter path than the one validated and logged); one accepted spelling per directory; `path_b64` as the authoritative path field | measured — `/sdcard/DCIM\x00x` returns the inode for `/sdcard/DCIM` | None for the forms tested |
+| T12 | A record is edited, reordered, or removed from the middle | `hash_n = SHA-256(hash_{n-1} ‖ canonical(record_n))`, with byte-exact specified serialization | judgement | Detection only, not prevention |
+| T13 | The tail is truncated, or the whole file deleted and a shorter valid chain recomputed | The chain head is anchored to the systemd journal under a stable `MESSAGE_ID`, written by a process the broker does not run as | measured — anchor round-tripped with its custom fields intact, 2026-07-31 | Local root can rewrite both sinks — §5.1. **Detected by `verify`, not at startup** — see §5.5, and note the horizon set by journald retention (spec, open question 9) |
+| T31 | A forged anchor is published to make a truncated chain verify | `verify` accepts only anchors whose journald-stamped `_UID` is the broker's uid and whose `_EXE` is the installed path; everything else is discarded | **measured — a well-formed anchor carrying the real `MESSAGE_ID` with a fabricated seq and hash was published from an ordinary uid, and is now permanently in this host's journal** | None from A2 once the filter is in place. `_UID` is set by journald from socket credentials and the sender cannot influence it |
+| T14 | The caller suppresses the record by discarding stdout/stderr | Neither stream is the audit trail. The record is written where the caller cannot influence it | judgement | None from A1 |
+| T15 | A denial goes unrecorded | Denials are logged with the same weight as successes, no sampling | judgement | None |
+| T16 | The audit extension is not wired, so nothing is written | The log is opened and its head verified in `main`, **before** the bus is constructed. Wiring the extension is not what makes the log exist | judgement | None from a wiring mistake; see §5.2 |
+| T17 | The log cannot be opened, or its head does not verify | `audit_unavailable`, exit, no device contact | judgement | Availability — deliberately, §7.1 |
+| T18 | Device identity in the log is unstable or forgeable | Serial only. `usb:` path and `transport_id` are never logged as identity | measured — across a port change the serial was stable while `usb:1-1`→`usb:1-2` and `transport_id` 2→3 | `transport_id` reuse could address a different phone; not logged, so moot |
+
+### 4.3 Archive correctness
+
+| # | Threat | Control | Evidence | Residual |
+|---|---|---|---|---|
+| T19 | A failure is misclassified and a run continues past a condition that should stop it — or aborts on one that should not | Error codes derive from `errno`, the `host:devices` state token, and a single isolated `FAIL`→code table with a test per string | measured — four distinct prose strings catalogued; `errno` 0/2/13 observed | An upstream rewording breaks one table rather than leaking into behaviour |
+| T20 | A >4 GiB file reports a wrong size, silently disabling the incremental path | `STAT_V2`/`LIST_V2` required; a device lacking them is refused with `unsupported`, with no fallback and no degradation | measured — 64-bit size round-tripped exactly; V2 present on the target | Refusing to run is the intended failure |
+| T21 | The capability check passes against a device that does not support V2 | Features **must** be read from `host-serial:<serial>:features` | measured — `host:host-features` reports `stat_v2`, `ls_v2`, `sendrecv_v2` **with no phone attached at all** | A check that can never fail is the worst kind; naming the right service is the whole control |
+| T22 | A `LIS2` reader desyncs and reports empty directories | The terminating `DONE` carries a 72-byte zeroed body that must be consumed; explicit test required | measured — hit during discovery, presented as *"all these directories are empty"* | None once tested |
+| T23 | A transfer is truncated and the short file is archived as complete | Header/raw-bytes/trailer framing: exactly `size` bytes then a required trailer; `sha256` of forwarded bytes | measured — byte count matches listing size exactly; chunks are 64 KiB | **Not** end-to-end device verification. The broker never re-reads the device, and `--verify-device` was removed because hashing on the phone needs a shell |
+| T24 | An empty file is treated as a failure | Zero `DATA` packets is success | measured — one such file exists on the device | None |
+| T25 | The run hangs forever | Deadlines on every read and write | measured — an over-sized length prefix blocks with no reply, no timeout, ever | None |
+| T26 | `mtime` is "corrected" and every cheap-path comparison breaks | `mtime.Mtime` wraps `int64` seconds and exposes no timezone conversion, no `time.Time`, no arithmetic | measured — camera files and screenshots disagree about what `mtime` means | The helpful mistake is not available to write |
+| T27 | A non-UTF-8 filename is silently never archived | `path_b64` is MUST and authoritative; `path` is lossy and for humans | **judgement, not measured** — every name sampled was pure ASCII, and the folders most likely to hold one were not fully walked | Cost of the check is nil; cost of being wrong is a silently unarchived file |
+| T28 | A depth-limited run reports a phone with no photos, successfully | Documented: all six roots have zero regular files at the top level | measured — 7 entries in `DCIM`, 8 in `Movies`, all directories | Not an error condition, so only documentation and a test guard it |
+| T29 | `ENOENT` is reported as proof a tree is gone | It is not authoritative — `adbd` returns `error=2` for paths it can see but not read | measured (`/data/data/com.android.providers.media`) | Affects wording shown to a human |
+| T30 | A fixture binary in a production path bypasses the allowlist | Fixture mode is behind a build tag, absent from the release binary, produces a differently-named binary, and reports a `+fixture` version visible in the first `probe` and in the audit log | judgement | The allowlist still applies to virtual paths, so a fixture binary is not itself an escape — only a remap |
+
+---
+
+## 5. Where controls stop
+
+Stated plainly, because a control credited with more than it does is worse than no control.
+
+### 5.1 Local root defeats every control here
+
+Root can rewrite the audit log and the journal, replace the installed binary, remove
+`chattr +a` (it has `CAP_LINUX_IMMUTABLE`), and read the phone with its own copy of `adb`
+without involving this binary at all. The anchor raises the bar from *"any local user with
+a text editor"* to *"root, tampering with two independent sinks consistently"* — which is
+the entire claim, and it is not a claim of resistance.
+
+The honest answer against a root adversary is an off-box sink. It is deferred (spec, open
+question 3) because it would put network access into a binary that currently has none, and
+that trade is worth making deliberately.
+
+### 5.2 The confinement/extension split is a real distinction, not a stylistic one
+
+Confinement lives in the core `Business` type; audit logging is an extension. The asymmetry
+is deliberate: a decorator can be omitted at wiring time, and a wiring mistake must not be
+able to disable the allowlist. Audit logging survives the same mistake only because the
+fail-closed check runs in `main` before the bus exists. If that check is ever moved or made
+conditional, audit logging inherits the weakness the extension pattern has and the split
+stops being justified.
+
+### 5.3 The type system carries confinement; the runtime carries the volume pin
+
+`AuthorizedPath` makes "fetch a path that was never checked" fail to compile. The `dev`
+check cannot work that way — it depends on a value that only exists once a device is
+reachable — so it gets its own unforgeable type (`Volume`, constructible only by the
+resolver that performed the `STA2`) and both are required by every `Storer` method. The
+guarantee is structural in both halves, but by two different mechanisms, and only the first
+is checked by the compiler alone.
+
+### 5.4 `ino` is provenance, not a control
+
+The pin enforces `dev` only. Enforcing `ino` would defend against `/sdcard` being
+re-pointed at another Android user's storage — which requires privilege on the phone, and a
+compromised phone is out of scope. It is recorded in the audit log because the log's job is
+to answer *what did this binary read*, and nothing branches on it.
+
+### 5.5 The anchor's whole weight rests on one journald-stamped field
+
+The journal socket is world-writable, so `MESSAGE_ID` proves nothing about who wrote an
+anchor — anyone can write one, and one forged during the experiment is in this host's journal
+permanently. What cannot be forged is `_UID`, which journald derives from the sending socket's
+credentials.
+
+So the anchor is trustworthy exactly insofar as the `_UID` filter is applied. Drop that filter
+and the control inverts: it accepts every anchor, including the adversary's, which is worse
+than having no anchor at all because it produces a confident pass. This is the same failure
+shape as the `host:host-features` trap in T21 — a check that cannot fail — and it deserves the
+same treatment: a test whose fixture is the forged anchor itself.
+
+`_EXE` and `_AUDIT_LOGINUID` are also stamped by journald and are recorded, but only `_UID`
+is load bearing. `_AUDIT_LOGINUID` is the more interesting of the two for forensics, since it
+survives a setuid exec and names the login session behind it.
+
+### 5.6 Startup detects a rewritten tail; only `verify` detects a removed one
+
+The fail-closed startup check re-hashes the tail record. It does not consult the journal,
+because doing so would require granting the broker read access to every service's logs on the
+host — an authority expansion paid for a read-only check on a hot path.
+
+The consequence is a real, named gap: a truncated chain recomputes cleanly, so startup passes
+on a log whose most recent records were removed. Closing it is `verify`'s job, which is why
+`verify` belongs in monitoring on a schedule rather than being reached for after something
+already looks wrong. A control that only runs when someone suspects a problem is not
+protecting the period nobody was suspicious.
+
+---
+
+## 6. Explicitly out of scope
+
+Each of these is excluded on purpose. Where exclusion would change if circumstances
+changed, that is said.
+
+### 6.1 A compromised `adbd`, or a rooted phone
+
+If the device lies about `dev`, about dirent kinds, or about what a path resolves to, every
+control in §4.1 rests on a false premise. Nothing in this design detects that, and nothing
+can over this protocol.
+
+### 6.2 Anyone reading the phone without using this binary
+
+The goal is that *this binary* is not the instrument, and that its own history is not
+rewritable. It is not that the phone is unreachable from the host. A separate copy of `adb`,
+or a rebuilt copy of the broker with its checks removed, reads whatever the device will
+serve.
+
+What the controls still buy under that adversary is narrower and worth naming: such a copy
+**cannot open the audit log** (wrong uid) and **cannot unlink it** (root-owned directory),
+so it cannot forge entries or erase existing ones. Its own reads are simply unrecorded. The
+log therefore remains truthful about what the deployed broker did; it was never a complete
+record of what happened to the phone.
+
+**This exclusion is currently mis-scoped in `ADB_BROKER.md`.** See §8.1.
+
+### 6.3 Physical access to the phone, and the USB path
+
+An unlocked phone in someone's hand, a malicious USB host, or interception on the cable are
+all outside this design. USB debugging authorization is the device's control, not the
+broker's; the broker reports `unauthorized` and stops.
+
+### 6.4 Everything downstream of the handoff
+
+Once bytes leave the broker's stdout, their confidentiality and integrity are `photos`'
+problem. The staging file, `O_EXCL`, the refuse-to-overwrite guarantee and the archive at
+rest are all outside this boundary — the broker never writes to the local filesystem except
+appending to the audit log.
+
+### 6.5 Denial of service against the phone or the run
+
+The broker is a read-only client that a caller can invoke in a loop. Nothing rate-limits it,
+and nothing needs to: the caller already has whatever access it would abuse.
+
+### 6.6 Supply chain
+
+Nothing in the design verifies that the installed binary was built from reviewed source —
+no signature, no reproducible build, no attestation. "Widening the allowlist requires
+editing the source and rebuilding, which is a reviewable, attributable act" is a claim about
+process, not a control the binary enforces. See §8.2.
+
+### 6.7 Confidentiality of the audit log
+
+The log records paths — which are personal data on a personal phone. It is mode `0640`, so
+it is not world-readable, but no stronger protection is specified and log confidentiality is
+not a goal of this design. Worth knowing before it is shipped anywhere.
+
+---
+
+## 7. Deliberate trades
+
+### 7.1 Availability is sacrificed for auditability
+
+A misconfigured install cannot back up photos. That is the intended behaviour: an
+unauditable read of the phone is exactly the thing being prevented, and a control that
+disengages under pressure is not a control. `audit_unavailable`, `volume_unresolved` and
+`unsupported` all abort rather than degrade, and asset 3 — archive correctness — outranks
+getting a run to finish.
+
+### 7.2 Refusing to resolve, rather than resolving carefully
+
+Alternate spellings are refused rather than canonicalized, because path-resolution logic is
+where confinement bugs live. A guarantee with no moving parts beats a correct one that has
+some.
+
+### 7.3 Refusing all symlinks below the root may be too blunt
+
+It costs nothing today — zero symlinks among 1,778 files. A future device shipping a
+legitimate one shows up as *missing files*, not as an error, which is the failure direction
+this tool exists to prevent. The `list` summary counts refused non-regular entries
+specifically so the cost is visible rather than silent. Still genuinely open (spec, open
+question 4).
+
+### 7.4 End-to-end verification given up to keep the shell channel closed
+
+`--verify-device` would require running `sha256sum` on the phone, which requires a shell
+channel, and a binary that can execute one command on the device can execute any. The
+trailer digest plus an exact byte count is what remains.
+
+---
+
+## 8. Open questions
+
+Ordered by how much they change the model.
+
+### 8.1 Does reaching the adb server actually require root?
+
+`ADB_BROKER.md` excludes *"an adversary who is already root on the host and simply reads the
+phone with their own copy of `adb`."* The adb server listens on `127.0.0.1:5037` — a TCP
+socket with no peer-credential check — so on the face of it **any local process that can
+open a loopback connection can speak the sync protocol directly**, root or not. That is the
+same A2 adversary the document says is *in* scope.
+
+If that is right, the bypass in §6.2 costs an adversary nothing but a socket, and the spec's
+wording overstates the barrier. It does not change any control — the controls were never
+about protecting the phone from the host — but it does change what should be claimed for
+them, and the claim as written is the kind that gets quoted later.
+
+**Partially measured, 2026-07-31.** The socket is `LISTEN 127.0.0.1:5037`, owned by `adb`
+pid 29995 running as an *ordinary* user (`agy_user`, uid 1003) — not root. An unprivileged
+process on this host connected and completed a `host:version` exchange, receiving `OKAY`.
+
+So the bypass certainly does not require root. What is **not** yet settled is whether it
+requires being the *same* uid as the server owner: the process that succeeded was that uid.
+adb performs no peer-credential check on a TCP socket and nothing in its protocol
+authenticates a client, so the expected answer is that any local uid works — but that is
+inference, not measurement.
+
+One command settles it, run as a uid unrelated to the server owner:
+
+```
+sudo -u nobody python3 -c "import socket; s=socket.create_connection(('127.0.0.1',5037));
+s.sendall(b'000chost:version'); print(s.recv(64))"
+```
+
+Until then treat §6.2 as reachable by A2, which is the conservative reading and is now
+supported by direct evidence rather than only by argument. Note the corollary already relied
+on elsewhere: because the socket needs no group membership, the broker's uid needs none
+either — which is why `install.sh` grants it nothing for adb access.
+
+### 8.2 What makes "edit the source and rebuild" attributable?
+
+T2 and T10 both fall back on it. Nothing specified establishes it: there is no signing, no
+build provenance, and `make install` is a root-run step with no stated policy about who may
+run it. If the answer is *"the repository is reviewed and only root installs"*, that is a
+fine answer, but it is an assumption about the operating environment and it belongs written
+down next to the controls that lean on it.
+
+**Partially narrowed since.** `zarf/install.sh` now makes two parts of the environment
+explicit rather than assumed: root is required (it escalates and every write needs it), and
+the set of uids permitted to execute the broker is an enumerated group, `adb-broker-clients`,
+which `verify-install` reports. So *who may run it* is now written down and checkable. *What
+was built* still is not — there is no signature and no provenance, so a rebuilt binary
+installed by root is indistinguishable from a reviewed one. That half of the question stands.
+
+### 8.3 Off-box anchoring
+
+Deferred (spec, open question 3). Worth revisiting only if local root enters scope — at
+which point most of §4.2 needs rethinking, not just the anchor.
+
+### 8.4 Allowlist completeness
+
+Six roots, all confirmed to exist; whether the set is *complete* is open. Note the direction
+of the risk: an incomplete allowlist threatens asset 3 (files silently never archived), not
+asset 1. Widening it is a security decision; narrowing it is a data-loss one. They should not
+be reviewed with the same reflex.
+
+### 8.5 Untested cases that touch this model
+
+From `adb_experiment.md`, still unmeasured: a `LIS2` stream large enough to stress the
+reader, any non-UTF-8 filename (none exists here to find), a mid-transfer `RECV` failure
+after `DATA` has flowed, and `RECV` on a final component that is a symlink pointing outside
+the root — the T7 TOCTOU case, which needs a fixture that does not exist on this device.
+
+---
+
+## 9. What would force a revision
+
+- Local root enters scope — most of §4.2 changes, and §5.1 becomes the document.
+- The phone gains a second Android user — `ino` stops being provenance and becomes a
+  control (§5.4).
+- The broker gains network access for any reason — §6.5 and the entire "no exec, one
+  loopback socket" posture need re-deriving.
+- A persistent/daemon mode is added — the process-per-operation model is doing quiet work
+  here, and a long-lived process holding a pinned volume across many callers is a different
+  shape.
+- `adbd` gains device-side confinement — §2's premise changes, and several §4.1 controls
+  stop being the only boundary.
+- The answer to §8.1 turns out to be that the socket *is* access-controlled — in which case
+  the claims can be strengthened, not weakened, and should be.
+- systemd changes the journal file format incompatibly — `verify` stops being able to read
+  anchors, and must fail loudly rather than report "no anchors found", which is
+  indistinguishable from tampering. Measured flags on this host are
+  `COMPRESSED-ZSTD KEYED-HASH COMPACT`; a fourth would be a hard error by design.
+- journald retention rotates away an anchor older than the window being verified — the
+  truncation guarantee (T13) has a horizon nothing here sets. Unquantified.
+- The broker is granted `systemd-journal` membership for any reason — the startup check could
+  then compare against the journal (§5.6), but at the cost of read access to every service's
+  logs on the host. The trade was declined once; declining it again should be a decision, not
+  an oversight.
