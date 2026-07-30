@@ -7,6 +7,14 @@ implemented and tested independently.
 The consumer is `foundation/source/adb`, which satisfies the `foundation/source.Reader`
 port. Nothing above that port knows the broker exists.
 
+**Provenance.** This revision replaces assumptions with measurements taken against a real
+device on 2026-07-30; the raw hex dumps and per-phase reasoning are in `adb_experiment.md`
+alongside this file. Where a claim below is measured it says so and gives the numbers. Where
+a rule is retained on judgement without supporting evidence — there are two, and they are
+flagged in place — it says that instead. One finding invalidated part of the original
+confinement design and it has been reworked rather than patched, which is the largest change
+here.
+
 ---
 
 ## Why a broker at all
@@ -125,10 +133,61 @@ This is the decision that makes the rest of the document possible:
 - **No shell channel exists at all.** The single most valuable property here: an adapter
   built on `adb shell` can do anything the phone's shell user can do, and is restrained
   only by intent. This broker's outbound vocabulary is a fixed, compiled-in set of adb
-  service strings — `host:version`, `host:devices-l`, `host:transport:<serial>`,
-  `host:transport-any`, and `sync:`. Within `sync:` it sends only `LST2`, `LIS2` and
-  `RECV`. It never sends `shell:`, `exec:`, `SEND`, `reverse:`, `root:`, `tcpip:`, or
-  anything else. This list is a constant in the source, not a convention.
+  service strings — `host:version`, `host:devices`, `host-serial:<serial>:features`,
+  `host:transport:<serial>`, `host:transport-any`, and `sync:`. Within `sync:` it sends
+  only `LST2`, `STA2`, `LIS2` and `RECV`. It never sends `shell:`, `exec:`, `SEND`,
+  `reverse:`, `root:`, `tcpip:`, or anything else. This list is a constant in the source,
+  not a convention.
+
+  `STA2` is present for exactly one purpose — resolving the storage volume once per run,
+  described under **Confinement** — and is used nowhere else. `host:devices` replaces
+  `host:devices-l`: the short form is tab-separated (`EXAMPLESERIAL1\tdevice\n`) where the
+  long form is space-padded columns, and only the state token is needed.
+
+### Framing, measured
+
+Confirmed against a live server. The host layer is `%04x`-length-prefixed ASCII; replies
+are `OKAY` or `FAIL` followed by a `%04x`-length-prefixed payload. Inside `sync:`, framing
+is a 4-byte ASCII ID plus a 4-byte little-endian argument.
+
+Three framing facts that must be encoded once, in `foundation/adbwire`, and tested there:
+
+- **`host:version`'s payload is itself ASCII hex** — a length field of `0004` wrapping the
+  four characters `0029`. It is double-encoded, and reading the length as the value is an
+  easy mistake.
+- **A `LIS2` stream's terminating `DONE` is not a bare ID.** It carries a full 72-byte
+  zeroed dirent body which must be consumed. A reader that stops at the ID leaves 72 stray
+  zero bytes in the stream, and every subsequent command on that channel desyncs. This was
+  hit during protocol discovery and it presented as *"all these directories are empty"* —
+  a confident, wrong, silent answer rather than an error. It is the single most dangerous
+  framing bug available here and deserves an explicit test.
+- **An under-sized length prefix produces a device-shaped error.** Sending
+  `0004host:version` makes the server read the request as `host` and reply `device offline
+  (no transport)`. An off-by-one in our own encoder therefore surfaces as a phone problem,
+  sending whoever debugs it to the hardware instead of to the framing code.
+
+### Deadlines are mandatory
+
+**Every read and write carries a deadline.** An over-sized length prefix makes the server
+block waiting for bytes that never arrive, and it never replies — measured, no timeout, no
+error, forever. A broker without its own deadlines hangs the archiver's run.
+
+### Connection lifecycle: a sync `FAIL` is terminal
+
+A single sync channel can carry many commands — measured with nine consecutive `LST2`
+calls and mixed `LIS2`/`RECV` sequences on one socket. But the two failure classes behave
+completely differently:
+
+- **`LST2`/`LIS2` errors are in-band and recoverable.** The reply carries an `errno` in its
+  `error` field and the channel stays usable. Confirmed: a nonexistent path returns
+  `error=2` and two further commands succeeded on the same socket.
+- **Any `RECV` `FAIL` kills the sync session.** Measured on fresh channels for each case —
+  `open failed: No such file or directory`, `open failed: Permission denied`, `read failed:
+  Is a directory` — and in every case the channel was dead afterwards.
+
+So the fetch loop must reconnect after a failed `RECV`, and the spec says so rather than
+leaving an implementation to discover it under load. On a first-ever run every unreadable
+file costs a full transport re-establishment; that is acceptable but must be deliberate.
 
 ### The adb server must already be running
 
@@ -154,6 +213,36 @@ the thing that makes an incremental run fast — keys on size and mtime.
 broker does not fall back and does not degrade. A wrong size that looks right is worse
 than a run that refuses to start, because the first is discovered years later and the
 second is discovered immediately.
+
+Confirmed available on the target device: `stat_v2`, `ls_v2` and `sendrecv_v2` are all
+present, so the no-fallback rule costs nothing today. The 64-bit `size` was verified by
+round-tripping a 27,190,943-byte file exactly.
+
+#### The capability check must query the device, not the server
+
+This is a trap with a live footgun in it, and naming the wrong service produces a check
+that silently never fails.
+
+**The feature list MUST be read from `host-serial:<serial>:features`.** It MUST NOT be read
+from `host:host-features`, which reports the *adb server's* own capabilities. Measured, with
+no phone attached at all:
+
+```
+host:host-features  ->  OKAY  'shell_v2,cmd,stat_v2,ls_v2,…,sendrecv_v2,…'
+host:features       ->  FAIL  'no devices/emulators found'
+```
+
+`host:host-features` reports `stat_v2`, `ls_v2` and `sendrecv_v2` against an empty USB bus.
+A broker wired to it would pass its V2 check on a disconnected device, on an unauthorized
+device, and on a device whose `adbd` predates V2 entirely — the guarantee would rest on a
+constant. That is a check that can never fail, which is the worst kind, because it never
+looks broken.
+
+Note also that `host:features` — without the `host-` prefix on the second word — is *not*
+the server's list either. It implicitly selects a device and fails when none is usable. The
+three names are easy to confuse and only one of them is evidence about the phone. The two
+lists are genuinely different sets, not one a subset of the other: the server's includes
+`push_sync`, the device's includes `devraw`, `app_info` and `delayed_ack`.
 
 ---
 
@@ -183,21 +272,73 @@ roots or restrict to a subset, and any entry that is not already a subpath of a 
 root is a startup error rather than an addition. The invariant is one-directional and
 worth stating baldly: **no input the broker reads at runtime can increase its authority.**
 
+All six roots were confirmed to exist on the target device — directories, mode `0o2770`,
+`uid=10269 gid=1023`, all on the same filesystem.
+
+### There is no device-side confinement to fall back on
+
+Worth stating before the rules, because it establishes what they are carrying. The sync
+channel stats freely outside `/sdcard`:
+
+```
+/            error=0   dir 0o40755
+/data/data   error=0   dir 0o40771   nlink=430
+/data/misc   error=0   dir 0o41771
+/init                error=13 (EACCES)
+/proc/1/environ      error=13 (EACCES)
+```
+
+`adbd` applies no confinement of its own to the paths it will stat. **The rules below are
+the only boundary between this transport and the rest of the device.** That is the design
+premise, and it is now measured rather than assumed — which is also why `devicepath` gets
+the densest test file in the repo.
+
 ### One spelling
 
 Android reaches the same storage through several paths — `/sdcard`,
-`/storage/self/primary`, `/storage/emulated/0`, and a per-user variant. They are the same
-bytes under three names.
+`/storage/self/primary`, `/storage/emulated/0`, and a per-user variant.
+
+They are not merely equivalent, they are the *same inode*, confirmed by `dev`+`ino`:
+
+```
+/sdcard/DCIM                  dev=190 ino=4812
+/storage/self/primary/DCIM    dev=190 ino=4812
+/storage/emulated/0/DCIM      dev=190 ino=4812
+```
 
 **Only the `/sdcard/…` spelling is accepted.** A request naming any other prefix is
 refused with `path_denied` and is *not* resolved to see whether it would have been
-permitted. This is deliberate: resolving alternate spellings means writing path-resolution
-logic that the confinement guarantee then depends on, and path-resolution logic is where
-confinement bugs live. Refusing to resolve is a guarantee with no moving parts.
+permitted. Resolving alternate spellings means writing path-resolution logic that the
+confinement guarantee then depends on, and path-resolution logic is where confinement bugs
+live. Refusing to resolve is a guarantee with no moving parts.
+
+**But be honest about what the rule buys.** Since the three spellings reach the same
+directory, refusing `/storage/emulated/0/…` does not deny access to anything — a caller
+that wanted those bytes can ask for them under the accepted name. The single-spelling rule
+is a **canonicalization rule, not an authority boundary**: it keeps the broker's own path
+construction honest and it makes audit records comparable, because one directory cannot
+appear in the log under three names. The authority boundary is the allowlist plus the
+volume pin below. Earlier drafts of this document implied the spelling rule was itself
+containment; it is not, and pretending otherwise would misplace the trust.
+
+### Rejected path forms, and why each one is real
 
 A path is rejected before anything else looks at it if it is not absolute, does not begin
-with `/sdcard/`, contains a `..` segment, contains an empty segment or a trailing slash,
-or contains a NUL byte.
+with `/sdcard/`, contains a `..` segment, contains an empty segment or a trailing slash, or
+contains a NUL byte.
+
+Every one of these was measured against the device rather than assumed:
+
+| Form | Device behaviour | Consequence if not rejected |
+|---|---|---|
+| `/sdcard/DCIM\x00x` | **`error=0`, returns the inode for `/sdcard/DCIM`** | The path is truncated at the NUL. The broker would validate one string, the device would act on a shorter one, and the audit log would record the string that was validated — a faithful record of an operation that never happened. |
+| `/sdcard/DCIM/..` | **`error=0`, resolves to the volume root** | `..` genuinely escapes upward. Resolution is physical — symlinks expanded first — which is why `/sdcard/DCIM/..` succeeds while `/sdcard/../sdcard/DCIM` returns `error=2`. |
+| `sdcard/DCIM` | **`error=0`, same inode as `/sdcard/DCIM`** | Relative paths resolve, with `adbd`'s working directory at `/`. `.` returns the root inode. |
+| `/sdcard/DCIM/` and `/sdcard/DCIM//` | **`error=0`, same inode** | Two spellings of one path produce two different audit records for one operation. |
+
+The NUL case is the one to remember. It is the only measured behaviour in this document
+where a missing check would make the **audit log lie** rather than merely permit an
+unwanted read.
 
 ### Segment-aware prefix matching
 
@@ -210,29 +351,107 @@ A `--root` that is a *parent* of an allowed root — `/sdcard`, or `/` — is re
 asking for `/sdcard` is asking for something the broker will not do, and telling it so is
 more useful than quietly doing something else.
 
-### Symlinks are the escape hatch, and are refused
+### Symlinks are the escape hatch — but the root is itself a symlink
 
 Any application on the phone can create `/sdcard/Pictures/x` as a symlink pointing at
 `/data/data/com.something/databases/`. A broker that checks only the *requested* path
 string and then reads whatever comes back has an allowlist that any app on the device can
-step around.
+step around. That much is unchanged.
 
-So:
+What changed is the rule. An earlier draft of this document said *"every component of the
+path is checked, and a symlink at any component is refused."* **That rule is
+unimplementable, because `/sdcard` is itself a symlink**, and so is one of the components
+it resolves through. Measured:
 
-- Traversal uses `LIST_V2`, whose dirents carry `mode` with `lstat` semantics. Anything
-  that is not a regular file — directory entries excepted, which are recursed into — is
-  omitted. Symlinks, sockets, FIFOs, block and character devices never appear in a
-  listing.
-- `fetch` issues `LST2` (`LSTAT_V2`, which does *not* follow symlinks) and requires
-  `S_ISREG` before issuing `RECV`. A symlink is refused with `path_denied`, not followed
-  and not reported as its target.
-- Every component of the path is checked, not only the leaf. A regular file beneath a
-  symlinked *directory* is still outside the tree the user named.
+```
+LST2 /sdcard  ->  mode 0o120644  SYMLINK  size=21   (target: /storage/self/primary)
+STA2 /sdcard  ->  mode 0o42770   dir      dev=190 ino=3252
+```
+
+| Path | Kind | dev | ino |
+|---|---|---|---|
+| `/storage` | dir `0o710` | 23 | 13 |
+| `/storage/self` | dir `0o755` | 23 | 14 |
+| `/storage/self/primary` | **SYMLINK** `0o120777` | 23 | 45 |
+| `/storage/emulated` | dir `0o550` | 190 | 129 |
+| `/storage/emulated/0` | dir `0o2770` | 190 | 3252 |
+| `/sdcard` | **SYMLINK** `0o120644` | 65034 | 48 |
+
+Two symlinks sit in the `/sdcard/…` prefix, both fixed by Android's storage layout rather
+than created by any app. A rule refusing symlinks at every component rejects every path the
+allowlist exists to permit. The rule has to distinguish *the platform's own root
+indirection*, which is unavoidable, from *a symlink inside the media tree*, which is the
+actual attack.
+
+So confinement is now two mechanisms, and the second is stronger than what it replaces.
+
+#### Part 1 — the volume pin
+
+**Once per run, before any listing, the broker resolves the storage volume and pins it.**
+It issues `STA2` on the compiled constant `/sdcard` — `STA2` follows symlinks, which is
+exactly what is wanted here and is why it is in the vocabulary — and records the resulting
+`(dev, ino)` as the run's volume identity.
+
+The resolution must yield a directory. If it does not, or `STA2` fails, the run aborts with
+`volume_unresolved` before any path is served. The device is not presenting storage in the
+shape this broker understands, and guessing is not an option.
+
+This resolution is the **only** place the broker traverses a symlink deliberately. It
+happens once, in one function, against a compiled constant — not once per caller-supplied
+path. `/sdcard` here is not an `AuthorizedPath` and does not become one; the volume
+resolver takes the constant directly, which is why `/sdcard` remains denied as a `--root`
+(see below) without contradiction.
+
+#### Part 2 — everything beneath the root must be on the pinned volume, and must not be a symlink
+
+- Traversal uses `LIST_V2`, whose dirents carry `mode` with `lstat` semantics **and `dev`**.
+  An entry is omitted unless it is a regular file or a directory. Symlinks, sockets, FIFOs,
+  block and character devices never appear in a listing and are never followed.
+- **Every dirent's `dev` must equal the pinned `dev`.** An entry on any other filesystem is
+  refused with `path_denied` regardless of its name or kind.
+- `fetch` issues `LST2` (which does *not* follow symlinks — confirmed, see below) and
+  requires both `S_ISREG` **and** a matching `dev` before issuing `RECV`.
+- Every directory the walk descends into is re-checked against both conditions, so
+  confinement is re-established at each step rather than asserted once at the root.
+
+**Why the `dev` check is stronger than the string rule it replaces.** The old rule compared
+spellings; this compares filesystems. A symlink escaping the media tree lands on a
+different `dev` — the media volume is `dev=190`, `/data` is `dev=65088`, the root filesystem
+is `dev=65034` — and is therefore detectable *by where it actually leads* rather than by
+what it is named. It also catches a case the string rule never could: a **bind mount**
+inside the tree, which introduces a foreign filesystem with no symlink involved anywhere.
+
+The kind check and the `dev` check are deliberately both present. The kind check refuses
+symlinks outright, including ones that stay on the same volume; the `dev` check catches
+anything that leads off-volume by any mechanism. Neither subsumes the other.
+
+**`dev` is not stable and must never be compiled in.** Device numbers are assigned at mount
+time and can differ across reboots or remounts. The pin is established at runtime, per run,
+and is recorded in the run's audit record so that two runs can be compared after the fact. A
+hard-coded `190` would be a latent, silent failure the first time the phone rebooted.
+
+**What this costs on a real device: nothing.** A bounded 12-directory walk of the media tree
+found 1,778 regular files, all on `dev=190`, and **zero symlinks**. Refusing symlinks below
+the root does not exclude any real content on this phone.
+
+#### `LST2` does not follow symlinks; `STA2` does
+
+Confirmed, and confirmed without ever opening a shell on the device — the root symlink
+provided the test case for free:
+
+```
+LST2 /sdcard        ->  SYMLINK      LST2 /sdcard/DCIM  ->  dir
+STA2 /sdcard        ->  dir          STA2 /sdcard/DCIM  ->  dir   (identical)
+```
+
+`RECV` also follows symlinks. This is not merely documented upstream, it is unavoidable
+here: every successful read under `/sdcard/…` traverses two of them.
 
 **Residual risk, stated rather than hidden:** there is a window between the `LST2` and the
 `RECV`, and `RECV` follows symlinks on the device side. An adversary with code execution
 on the phone could replace a regular file with a symlink inside that window. The sync
-protocol offers no `openat`-style handle to close it. This is accepted: an adversary who
+protocol offers no `openat`-style handle to close it, and the `dev` check cannot help
+because it is performed on the pre-swap `LST2` result. This is accepted: an adversary who
 already has code execution on the phone has better options than racing this broker, and
 the alternative — not reading the phone at all — defeats the purpose. It is recorded here
 so that nobody later mistakes the check for something stronger than it is.
@@ -242,10 +461,29 @@ so that nobody later mistakes the check for something stronger than it is.
 Confinement is not a check that each operation remembers to call. It is a type:
 
 `devicepath.AuthorizedPath` has no exported fields and no exported way to construct a
-non-zero value other than `ParseAuthorizedPath`, which applies every rule above. The
-storage layer's methods accept `AuthorizedPath` and nothing else. "Fetch a path that was
+non-zero value other than `ParseAuthorizedPath`, which applies every *string* rule above.
+The storage layer's methods accept `AuthorizedPath` and nothing else. "Fetch a path that was
 never checked" is therefore not a bug that review has to catch — it is a program that
 does not compile.
+
+The volume pin cannot work the same way, and it is worth being precise about why rather
+than pretending one type covers both. The string rules are decidable from the path alone,
+so they can be enforced by a constructor. The `dev` check depends on a value that only
+exists at runtime, after a device is reachable — it is a property of the pairing of a path
+with a particular mounted volume, not of the path.
+
+So it gets its own type and the same treatment:
+
+- `devicevolume.Volume` holds the pinned `(dev, ino)` and is constructible only by the
+  resolver that performed the `STA2`. There is no literal, no zero value that means
+  anything, and no setter.
+- The `Storer` methods take **both** an `AuthorizedPath` and a `Volume`. A caller with a
+  validated path but no pinned volume cannot express a fetch.
+- Checking a dirent's `dev` against the `Volume` is the only exported operation on it.
+
+The result is that both halves of confinement are unforgeable rather than remembered: a
+path that skipped validation will not compile, and a fetch attempted before the volume was
+pinned will not compile either.
 
 For the same reason confinement lives in the core `Business` type and **not** in a
 business-layer extension. Extensions are decorators applied at wiring time, and a
@@ -267,7 +505,7 @@ photos-adb-broker probe [--serial <id>]
 ```
 
 ```json
-{"proto":1,"status":"ok","serial":"EXAMPLESERIAL1","state":"device","model":"Pixel_8_Pro","broker":"0.1.0","adb":"1.0.41"}
+{"proto":1,"status":"ok","serial":"EXAMPLESERIAL1","state":"device","model":"Pixel_8_Pro","broker":"0.1.0","adb":"1.0.41","volume":{"dev":190,"ino":3252}}
 ```
 
 Called once before a run. A disconnected phone makes every configured source unreachable,
@@ -285,8 +523,32 @@ whichever phone happened to answer.
 `adb` reports the version of the *server* the broker is talking to, obtained from
 `host:version` — not the version of any binary on PATH, since none is consulted.
 
-`probe` also confirms `STAT_V2` availability and fails with `unsupported` if it is
-absent, so that an incompatible device is discovered before eleven listings are attempted.
+`probe` also confirms `STAT_V2` availability — via `host-serial:<serial>:features`, never
+`host:host-features` — and fails with `unsupported` if it is absent, so that an incompatible
+device is discovered before eleven listings are attempted.
+
+`state` comes from the `host:devices` state token, **not** from parsing a `FAIL` message.
+Four distinct prose failures were catalogued during discovery:
+
+| Condition | `FAIL` message |
+|---|---|
+| No device attached | `no devices/emulators found` |
+| Named serial absent | `device '<serial>' not found` |
+| Present, not trusted | `device unauthorized.\nThis adb server's $ADB_VENDOR_KEYS is not set…` |
+| No transport selected | `device offline (no transport)` |
+
+They are distinguishable, so the temptation to branch on them is real — and it is exactly
+the mistake this broker exists to remove from the CLI adapter. The state token is structured
+and stable; the prose is neither, and one of these messages even contains advice (`try 'adb
+kill-server'`) that the broker must never take.
+
+Note also that **an empty device list is `OKAY` with a zero-length payload, not `FAIL`**.
+Code that keys off `FAIL` alone will not notice that no phone is attached.
+
+`probe` performs the volume resolution described under **Confinement** and reports the pinned
+`volume` shown above, so that a run's audit trail records which filesystem it read and not
+merely which path strings it used. It fails with `volume_unresolved` if `/sdcard` does not
+resolve to a directory.
 
 ### 2. `list` — enumerate a tree
 
@@ -301,9 +563,21 @@ photos-adb-broker list --root /sdcard/DCIM/Camera [--max-depth 1] [--serial <id>
 transport connection is made.
 
 The sync protocol's `LIST_V2` enumerates one directory, so recursion is driven by the
-broker rather than the device. That is an advantage here: every directory the walk
-descends into is re-checked against the allowlist and re-checked for symlink-ness, so
+broker rather than the device — confirmed by measurement, listings are strictly one level.
+That is an advantage here: every directory the walk descends into is re-checked against the
+allowlist, re-checked for symlink-ness, and re-checked against the pinned volume, so
 confinement is re-established at each step instead of being asserted once at the root.
+
+`.` and `..` are not returned by `adbd` in a `LIS2` stream. The broker must still not
+recurse into them if they ever appear; relying on the device to filter them is relying on
+the wrong party.
+
+**A `--max-depth 1` listing of an allowlist root returns nothing.** Measured: all seven
+entries of `/sdcard/DCIM` and all eight of `/sdcard/Movies` are directories, and there is not
+a single regular file at the top level of any of the six roots. This is worth stating in the
+spec because the failure it produces is not an error — a depth-limited run reports a phone
+with no photos on it, successfully. Any test that lists a root at depth 1 and asserts a
+non-empty result will fail for reasons that have nothing to do with the code.
 
 **NDJSON on stdout, one record per regular file, streamed as discovered** — so a 20,000-file
 listing can be parsed incrementally rather than buffered:
@@ -324,7 +598,13 @@ Terminated by exactly one summary line, distinguished by having no `path`:
 | `path_b64` | MUST | Base64 of the raw path bytes. See *Filenames are bytes* below. |
 | `size` | MUST | Exact bytes, `int64`, from `LIST_V2`. |
 | `mtime` | MUST | Unix **seconds**. See *Timestamps are not to be corrected*. |
-| `mtime_nsec` | MAY | Only if the transport genuinely provides it. |
+| `mtime_nsec` | MUST NOT | **The transport cannot provide it.** See below. |
+
+`mtime_nsec` is downgraded from MAY to MUST NOT, and this closes an open question rather
+than deferring it. The `STAT_V2`/`LIST_V2` reply was decoded field by field and carries
+`atime`, `mtime` and `ctime` as 64-bit **whole seconds** with no sub-second companion field.
+Sub-second precision is not unimplemented, it is **unavailable over this protocol**. A field
+that can never be populated should not be in the contract inviting someone to try.
 
 `path_b64` is upgraded from SHOULD to MUST. It costs nothing, it is the authoritative
 field, and making it optional invites an implementation that omits it on the ASCII paths
@@ -365,6 +645,27 @@ The framing exists so that a truncated transfer is detectable: the archiver read
 `size` bytes and then requires a trailer. A stream that ends without one is a failure,
 whatever the byte count said.
 
+**Measured properties of `RECV` that the implementation must accommodate:**
+
+- **Chunks are 64 KiB.** A 27,190,943-byte file arrived as 415 `DATA` packets with a maximum
+  chunk of exactly 65536 bytes.
+- **The byte count matches the listing's `size` exactly.** Verified on the largest file
+  available. This is the property the archiver's cheap-path comparison depends on, and it
+  holds.
+- **A zero-byte file produces no `DATA` packets at all** — just an immediate `DONE`. An
+  implementation that expects at least one `DATA`, or that treats "no data received" as a
+  failure, will break on empty files, and there is one on the target device. Its digest is
+  the empty-input SHA-256 `e3b0c442…`, which is exactly the value in this document's own
+  example trailer.
+- **A `RECV` failure kills the sync channel** and the next operation must reconnect. See
+  *Connection lifecycle* under **Transport**. The three observed failures were `open failed:
+  No such file or directory`, `open failed: Permission denied`, and `read failed: Is a
+  directory`.
+
+Throughput was measured at ~39.5 MiB/s, but over a USB 2.0 port that this is close to
+saturating. It is a port measurement, not a device or protocol one, and is not a number to
+size anything against.
+
 `sha256` in the trailer is the digest of the bytes the broker forwarded. To be precise
 about what that buys: it detects corruption between the broker and the archiver, and a bug
 in the archiver's own write path. It is *not* end-to-end device verification, because the
@@ -402,8 +703,9 @@ machine-readable `code`:
 | `offline` | Attached but not usable | Aborts. |
 | `multiple_devices` | Ambiguous without `--serial` | Aborts. Never guesses. |
 | `no_adb_server` | Nothing listening on `127.0.0.1:5037` | Aborts. The host must start it. |
-| `path_denied` | Outside the allowlist, wrong spelling, or a symlink | **Aborts that source.** A configuration error, not a device condition. |
+| `path_denied` | Outside the allowlist, wrong spelling, a symlink, or off the pinned volume | **Aborts that source.** A configuration error, not a device condition. |
 | `audit_unavailable` | The audit log cannot be opened or its head does not verify | Aborts the run before any device contact. |
+| `volume_unresolved` | `/sdcard` does not `STA2` to a directory | Aborts the run. Storage is not in the expected shape; nothing is served. |
 | `root_not_found` | The named tree does not exist | **Skips that source, continues.** One of eleven folders having been removed says nothing about the other ten. |
 | `not_a_directory` | Root is a file | Skips that source. |
 | `permission_denied` | A path could not be read | Per-path: warn, continue. Never ends a run. |
@@ -416,6 +718,29 @@ machine-readable `code`:
 `message` is free-form and for humans only; the archiver logs it and never branches on
 it. New codes may be added — an unrecognized code is treated as `internal`, which is the
 safe direction.
+
+### Where the codes come from
+
+The whole point of the broker is that these codes are derived from structured signals rather
+than from English. There are exactly three sources, and only the last is prose:
+
+1. **`errno` from `LST2`/`LIS2`.** The `error` field is a plain errno and is fully
+   machine-readable — `0`, `2` (`ENOENT`), `13` (`EACCES`) were all observed. This is the
+   primary source and covers per-path outcomes.
+2. **The `host:devices` state token** — `device`, `unauthorized`, `offline`, … — for device
+   state. Structured and stable.
+3. **`FAIL` message text**, for the small set of transport-level failures that offer nothing
+   better. The broker maps these to codes at a single chokepoint in `foundation/adbwire`,
+   and that mapping is the one place in the binary where matching adb's English is
+   tolerated. It is isolated there deliberately, with a test per string, so that a wording
+   change upstream breaks one table rather than leaking into behaviour.
+
+**`ENOENT` does not prove absence.** Measured: `/data/data/com.android.providers.media`
+returns `error=2` even though it exists — `adbd` hides existence rather than admitting a
+permission failure. So `root_not_found` must not be reported as authoritative evidence that
+a tree is gone. For allowlist roots this is harmless, since they resolve or they do not; it
+matters for the wording the archiver shows a human, which should say the root could not be
+read rather than that it does not exist.
 
 `path_denied` deserves a note on why it aborts its source rather than warning. A denied
 path is never a transient device condition; it means the archiver was configured to read
@@ -453,6 +778,23 @@ not an audit trail.
 
 Paths are recorded as `path_b64` for the same reason the wire format uses it — a log that
 cannot faithfully record the path of the file it read is not evidence of anything.
+
+This is also why the NUL rejection under **Confinement** is an audit requirement and not
+merely a hygiene rule. A path containing a NUL is truncated by the device, so an
+unvalidated one would be logged in full while a shorter path was actually read. A log that
+records a different operation from the one performed is worse than no log, because it is
+believed.
+
+The run's pinned volume is recorded once per run, as `{"op":"probe","volume":{"dev":190,
+"ino":3252}}`, so that the trail says which filesystem was read and not merely which path
+strings were used. Since `dev` is reassigned at mount time, this is the only way two runs
+can be compared meaningfully.
+
+**`usb:` path and `transport_id` must not be logged as device identity.** Measured across a
+port change: the serial was stable while `usb:1-1` became `usb:1-2` and `transport_id` went
+from `2` to `3`. `transport_id` is a monotonic per-connection counter — it advances on
+re-enumeration, so a cached one identifies nothing and after enough churn could address a
+*different* phone. The serial is the only durable handle.
 
 ### The chain
 
@@ -566,6 +908,14 @@ The archiver uses `path_b64`. The cost of getting this wrong is a file that is n
 archived, which is the one outcome the whole design exists to prevent — cheap insurance
 for a case that may never arise.
 
+**Honest status of this rule: it is justified by prudence, not by evidence from this
+device.** Every name sampled during protocol discovery — across `DCIM`, `Movies`, `Music`
+and `Recordings` — was pure ASCII, and no invalid-UTF-8 name was found to point at. The rule
+stays, because the cost of the check is nil and the cost of being wrong is a silently
+unarchived file, and because the folders most likely to contain such a name (messaging and
+download caches) are exactly the ones not fully walked. But it should not be cited as
+something the measurements confirmed, because they did not.
+
 `devicepath.DevicePath` holds the raw bytes in a `string`, which in Go is byte-safe. The
 lossy UTF-8 coercion happens once, in `fromBusFileRecordResponse`, and only for the `path`
 field.
@@ -617,14 +967,17 @@ business/domain/device/devicebus/
   extensions/deviceaudit/deviceaudit.go     hash-chained audit decorator
 business/domain/device/stores/adbsyncdb/
   adbsyncdb.go                              Storer implementation over the sync protocol
+  volume.go                                 STA2 root resolution; the only deliberate symlink traversal
+  reconnect.go                              re-establish transport after a terminal RECV FAIL
   convert.go                                toSync* / toBusFileRecord
 business/types/devicepath/                  DevicePath, AuthorizedPath, the allowlist
+business/types/devicevolume/                Volume — the pinned (dev, ino)
 business/types/serial/                      Serial
 business/types/mtime/                       Mtime
 business/types/filekind/                    Kind — regular, dir, symlink, other
 business/types/errcode/                     Code
 foundation/audit/                           chain, append-only sink, journald anchor
-foundation/adbwire/                         sync protocol framing
+foundation/adbwire/                         framing, host services, sync commands, FAIL→code table
 ```
 
 ### Type boundaries
@@ -634,7 +987,22 @@ foundation/adbwire/                         sync protocol framing
 | App request | `ListRequest{Root, Serial string; MaxDepth int; Prune []string}` | flags arrive as primitives |
 | App response | `FileRecordResponse{Path, PathB64 string; Size, Mtime int64}` | exactly the wire format above |
 | Business | `FileRecord{Path devicepath.AuthorizedPath; Size int64; Mtime mtime.Mtime; Kind filekind.Kind}` | strong throughout |
-| Storage row | `syncFileRecord{Path, PathB64 string; Size, MtimeSec int64; Mode uint32}` | natives, as `LIST_V2` returns them |
+| Storage row | `syncFileRecord{Path, PathB64 string; Size, MtimeSec int64; Mode uint32; Dev, Ino uint64}` | natives, as `LIST_V2` returns them |
+
+`Dev` and `Ino` are new on the storage row and are `uint64` primitives there, per the house
+rule that DB/wire rows hold natives only. They are parsed into `devicevolume.Volume` by the
+storage-layer `toBusFileRecord`, which is also where the pinned-volume comparison happens —
+the row cannot cross into Business unless its `dev` matches. `Volume` never appears in an App
+request or response struct; `probe`'s response carries `dev` and `ino` as plain `int64`
+fields, converted explicitly in `fromBusProbeResponse`.
+
+**Types to confirm before implementation.** Per the house rules the concrete choices at each
+boundary are yours, and three here are worth an explicit decision rather than my default:
+`Dev`/`Ino` as `uint64` on the row (the kernel's own width) versus `int64` throughout to
+avoid an unsigned/signed conversion at the JSON edge; whether `devicevolume.Volume` is its
+own `business/types` package or lives inside `devicepath` alongside the allowlist; and
+whether `probe`'s response nests `volume` as an object or flattens to `volume_dev` /
+`volume_ino`.
 
 ### Converters
 
@@ -651,10 +1019,12 @@ small lie repeated in every file. The reverse direction keeps `toBusFileRecord`,
 the house name in both directions anyway.
 
 Note that the storage layer's `toBusFileRecord` re-parses each discovered path through
-`ParseAuthorizedPath`. Paths that come *back* from the device are as untrusted as paths
-that come in from the caller — a directory entry naming something outside the tree is
-precisely the attack the symlink rules address, and re-parsing means the confinement type
-is never bypassed by data flowing the other way.
+`ParseAuthorizedPath` **and** checks the dirent's `dev` against the pinned `Volume`. Paths
+that come *back* from the device are as untrusted as paths that come in from the caller — a
+directory entry naming something outside the tree is precisely the attack the symlink rules
+address, and re-parsing means the confinement type is never bypassed by data flowing the
+other way. Since `adbd` applies no confinement of its own, this return path is not a
+theoretical concern.
 
 ### Validation lives in one place
 
@@ -692,6 +1062,19 @@ audit log rather than being indistinguishable.
 The allowlist still applies in fixture mode, against the virtual `/sdcard/…` paths. Tests
 that exercise confinement must exercise the real confinement code, or they are testing
 something else.
+
+**The volume pin applies in fixture mode too**, resolved against the fixture directory's own
+`(dev, ino)` rather than being stubbed out. This matters more than it looks: the pin is now
+half of confinement, and a fixture mode that skips it can only test the other half. It also
+makes the escape case cheap to test for real — a symlink inside the fixture tree pointing at
+`/tmp` crosses a filesystem boundary on most hosts and must be refused, and one pointing
+elsewhere within the same filesystem must still be refused by the kind check. Those are the
+two mechanisms exercised independently, on hardware nobody has to plug in.
+
+A caveat worth writing down before someone hits it: on a host where the fixture directory and
+the escape target share a filesystem, the `dev` half of that test silently passes for the
+wrong reason. Fixture tests that mean to exercise the `dev` check must place the target on a
+genuinely different mount, or assert on the refusal reason rather than merely the refusal.
 
 Worth supporting for the same reason:
 
@@ -733,20 +1116,38 @@ check that it is not itself writable by the adversary, because by then it is too
   values are compatible, since unknown codes degrade to `internal`.
 
 `proto` stays at `1`. The removal of `--verify-device` and the addition of `path_denied`,
-`no_adb_server` and `audit_unavailable` are compatible under the rules above, and nothing
-consumes the interface yet.
+`no_adb_server`, `audit_unavailable` and `volume_unresolved` are compatible under the rules
+above, and nothing consumes the interface yet.
+
+The one field that changed meaning rather than being added is `mtime_nsec`, which went from
+MAY to MUST NOT. That is a tightening of a field no implementation ever populated, on an
+interface with no consumers, so it does not warrant a `proto` bump — but it is recorded here
+rather than passed over silently, since "MAY became MUST NOT" is exactly the kind of edit
+that would deserve one on a shipped interface.
 
 ---
 
 ## Build order
 
 1. `foundation/adbwire` — connect to `127.0.0.1:5037`, host services, `sync:`, `LST2`,
-   `LIS2`, `RECV`. Tested against a real adb server with no device attached, which
-   exercises the failure paths first.
-2. `business/types/*` — `devicepath` with the full allowlist rule set, `mtime`,
-   `filekind`, `serial`, `errcode`. `devicepath` gets the densest test file in the repo,
-   including the `Download-private` case, every alternate spelling, `..`, NUL, and the
-   parent-of-root case.
+   `STA2`, `LIS2`, `RECV`, deadlines on every exchange, and the `FAIL`→code table. Tested
+   against a real adb server with **no device attached**, which exercises the failure paths
+   first — and which the discovery experiment showed is a genuinely productive place to
+   start: the empty-list-is-`OKAY` case, all four `FAIL` strings, and every malformed-framing
+   case are reachable with no phone. Must include the `DONE`-carries-72-zero-bytes test and
+   the double-encoded `host:version` payload.
+2. `business/types/*` — `devicepath` with the full allowlist rule set, `devicevolume`,
+   `mtime`, `filekind`, `serial`, `errcode`. `devicepath` gets the densest test file in the
+   repo. Every one of these is a measured device behaviour, not a hypothetical, and each
+   deserves a named test case:
+   - `Download-private` — segment-boundary matching
+   - all three spellings of the same directory
+   - `..` mid-path, and `..` as the final segment (which resolves to the volume root)
+   - a NUL byte (the device truncates at it)
+   - a relative path such as `sdcard/DCIM` (the device resolves it)
+   - trailing slash and doubled slash (the device accepts both)
+   - parent-of-root: `/sdcard` and `/`
+   - `devicevolume`: a dirent whose `dev` differs from the pin is refused
 3. `foundation/audit` — chain, canonical serialization, append sink, journald anchor,
    `verify`. Round-trip and tamper-detection tests: edit a record, reorder two, truncate
    the tail, and confirm each is caught.
@@ -764,19 +1165,35 @@ Steps 1–3 are independent and have no dependency on a phone being present.
 ## Open questions
 
 1. **The allowlist roots are provisional.** Six roots covering camera, downloads, audio
-   recordings and pictures. Revisit against an actual top-level listing of the device once
-   the broker can produce one — which it can, since `/sdcard` itself is denied, so this is
-   a deliberate one-off inspection rather than something the tool does.
+   recordings and pictures. All six were confirmed to exist on the target device, so the
+   list is at least not wrong; whether it is *complete* is still open and is deliberately
+   parked until we are less busy. Revisiting it needs a one-off inspection of the top level
+   of the volume, which is a deliberate act rather than something the tool does — `/sdcard`
+   remains denied as a `--root`.
 2. **Which uid does the broker run as, and is it the same one `photos` runs as?** If they
    are the same, the audit log is writable by whatever compromises `photos`, and the
-   `chattr +a` is doing all the work. A dedicated uid is better and costs nothing.
+   `chattr +a` is doing all the work. A dedicated uid is better and costs nothing. **Still
+   unanswered and still the most consequential open item here** — it decides whether the
+   audit guarantee has two independent controls or one.
 3. **Off-box anchoring.** Deferred, because it would introduce network access to a binary
    that otherwise has none. Worth revisiting if the threat model ever includes local root.
-4. **Does the sync service give better than whole-second `mtime`?** `STAT_V2` returns
-   seconds. Not needed — the ledger column stores seconds — so `mtime_nsec` stays
-   unimplemented.
+4. **Is the volume pin the right mechanism, and is `(dev, ino)` the right pin?** This is the
+   one genuinely new design decision the measurements forced, and it replaces a rule that
+   could not work. It should be reviewed on its merits rather than adopted because it was
+   the first fix to hand. Specific things to push on: whether `ino` adds anything over `dev`
+   alone; whether a remount mid-run could change `dev` underneath a long first run and what
+   should happen if it does; and whether refusing *all* symlinks below the root is too blunt
+   if a future device ships one legitimately.
 5. **Should `list` and `fetch` be combinable?** A `fetch-many` reading paths from stdin
    would amortize spawn cost on a first-ever run. Explicitly *not* requested for v1 — the
    measurement above says it is a 3% effect — but it is the natural extension if a
    persistent mode is ever wanted. Note that it would need every path re-parsed through
-   `ParseAuthorizedPath` individually, which is cheap.
+   `ParseAuthorizedPath` individually, which is cheap. The terminal-`RECV`-`FAIL` finding
+   strengthens the case slightly: a persistent mode would amortize reconnects too.
+6. **A non-UTF-8 filename has never been observed on this device.** The `path_b64` rule is
+   retained on prudence. If it ever matters it will matter silently, so there is nothing to
+   watch for — this is recorded so the rule is not mistaken for a measured requirement.
+
+**Answered and closed since the first draft:** whether `STAT_V2` offers sub-second `mtime`
+(it does not — whole seconds only, so `mtime_nsec` is now MUST NOT); whether `LST2` follows
+symlinks (it does not, `STA2` does); and whether the six roots exist (they do).
