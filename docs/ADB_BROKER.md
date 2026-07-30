@@ -1,15 +1,28 @@
 # The adb Broker — Interface Specification
 
-A small Go binary, packaged alongside `photos`, that mediates every read of the phone.
-This document specifies what the archiver needs from it and why, so the broker can be
-implemented and tested independently.
+A small Go binary that mediates every read of the phone. This document specifies what a
+consumer needs from it and why, so the broker can be implemented and tested
+independently.
 
-The consumer is `foundation/source/adb`, which satisfies the `foundation/source.Reader`
-port. Nothing above that port knows the broker exists.
+`photos` is the originating consumer — its `foundation/source/adb` adapter satisfies the
+`foundation/source.Reader` port, and nothing above that port knows the broker exists — but
+**the broker is not exclusive to it.** It is a standalone binary in its own repository,
+`github.com/jroedel/adb-broker`, installed once per host and invoked by any number of
+consumers. Nothing below is specific to one of them, and the authority boundary does not
+widen for any of them: every consumer gets exactly the same six media roots.
+
+**Dependencies: none.** The binary imports only the Go standard library; `go.mod` has no
+`require` block. Lint and vulnerability tooling is pinned in the `Makefile` via
+`go run pkg@version` so it never enters the module graph. For a binary whose whole purpose
+is to be a narrow, auditable boundary, third-party code in the production build would be
+working against the point.
 
 **Provenance.** This revision replaces assumptions with measurements taken against a real
 device on 2026-07-30; the raw hex dumps and per-phase reasoning are in `adb_experiment.md`
-alongside this file. Where a claim below is measured it says so and gives the numbers. Where
+alongside this file. The host-side audit infrastructure — journald anchoring, the
+append-only log, the install-time controls — was measured separately on 2026-07-31 and is
+recorded in `audit_experiment.md`. The full threat model, including what each control does
+*not* buy, is in `THREAT_MODEL.md`. Where a claim below is measured it says so and gives the numbers. Where
 a rule is retained on judgement without supporting evidence — there are two, and they are
 flagged in place — it says that instead. One finding invalidated part of the original
 confinement design and it has been reworked rather than patched, which is the largest change
@@ -53,7 +66,10 @@ what it is *able* to ask for. See **Confinement**.
 
 ## Threat model
 
-Stating this plainly, because two design decisions below look like ceremony without it.
+**The full model is in `THREAT_MODEL.md`** — assets, adversaries, the threat/control table,
+and the residual risks each control leaves behind. Stated here is only what the rest of this
+document leans on directly, because two design decisions below look like ceremony without
+it.
 
 The broker runs on a host that also runs automated agents with the ability to write files
 and execute code as ordinary users. The assets being protected are:
@@ -68,10 +84,17 @@ The adversary is assumed to be a local unprivileged process, possibly one that c
 this repository and rebuild the binary. It is *not* assumed to have local root; where a
 control fails against root, this document says so rather than implying otherwise.
 
-Two things are explicitly out of scope. The broker cannot defend against a compromised
-`adbd` on the phone, and it cannot defend against an adversary who is already root on
-the host and simply reads the phone with their own copy of `adb`. The goal is that *this
-binary* is not the instrument, and that its own history is not rewritable.
+Two exclusions are load bearing below and so are repeated here. The broker cannot defend
+against **a compromised `adbd` on the phone**, and it cannot defend against **an adversary
+who bypasses this binary entirely** and reads the phone with their own copy of `adb`. The
+goal is that *this binary* is not the instrument, and that its own history is not
+rewritable — not that the phone is unreachable from the host.
+
+Note that bypassing the broker does not obviously require root: the adb server listens on a
+loopback TCP socket with no peer-credential check, so any local process able to connect may
+be able to speak the sync protocol directly. That is unverified here and is tracked as an
+open question in `THREAT_MODEL.md`; it changes no control in this document, but it means the
+bypass should not be described as a root-only capability.
 
 ---
 
@@ -107,12 +130,20 @@ entirely still leaves one behind.
 
 ### Discovery
 
-The archiver locates the binary in this order, and reports clearly if it finds nothing:
+**Discovery is the consumer's concern, not the broker's.** The broker is installed to a
+path and executed; it does not search for itself and has no opinion about how it was
+found. What it does require is that the path is the *installed* one, since only that copy
+carries the setuid bit that gives it its own uid (see **Installation**).
+
+For reference, `photos` locates it in this order and reports clearly if it finds nothing:
 
 1. `source.broker_path` in `photos.yaml`, if set.
-2. A binary named `photos-adb-broker` in the same directory as the running `photos`
-   executable — the packaged case.
-3. `photos-adb-broker` on `PATH`.
+2. `adb-broker` on `PATH`.
+
+Other consumers may do whatever suits them. Note that a broker found *beside a consumer's
+own executable* — the packaged case an earlier draft specified — is the one arrangement to
+avoid now: a per-consumer copy would not be the installed setuid binary, so it would run as
+its caller and fail closed at the audit check.
 
 ---
 
@@ -535,7 +566,7 @@ device, and `--json` is implied (there is no human output mode on stdout).
 ### 1. `probe` — is a device reachable
 
 ```
-photos-adb-broker probe [--serial <id>]
+adb-broker probe [--serial <id>]
 ```
 
 ```json
@@ -590,7 +621,7 @@ about the phone's storage layout, which is this binary's job and not its consume
 ### 2. `list` — enumerate a tree
 
 ```
-photos-adb-broker list --root /sdcard/DCIM/Camera [--max-depth 1] [--serial <id>]
+adb-broker list --root /sdcard/DCIM/Camera [--max-depth 1] [--serial <id>]
 ```
 
 `--max-depth 1` means immediate children only; omitted means unlimited. (The port's
@@ -667,7 +698,7 @@ the broker, because it is enforced against the caller and the caller does not ge
 ### 3. `fetch` — stream one file
 
 ```
-photos-adb-broker fetch --path /sdcard/DCIM/Camera/IMG_0182.JPG [--serial <id>]
+adb-broker fetch --path /sdcard/DCIM/Camera/IMG_0182.JPG [--serial <id>]
 ```
 
 Framed as header line, raw bytes, trailer line:
@@ -810,11 +841,30 @@ matter most, and a design where the interesting events are the ones that go unwr
 not an audit trail.
 
 ```json
-{"seq":1042,"ts":"2026-07-30T16:52:03.114Z","op":"fetch","serial":"EXAMPLESERIAL1","path_b64":"L3NkY2FyZC8…","decision":"allow","result":"ok","bytes":103159,"sha256":"e3b0c442…","prev":"9f2b…","hash":"41d0…"}
+{"seq":1042,"ts":"2026-07-30T16:52:03.114Z","op":"fetch","caller_uid":1003,"client_asserted":"photos","serial":"EXAMPLESERIAL1","path_b64":"L3NkY2FyZC8…","decision":"allow","result":"ok","bytes":103159,"sha256":"e3b0c442…","prev":"9f2b…","hash":"41d0…"}
 ```
 
 Paths are recorded as `path_b64` for the same reason the wire format uses it — a log that
 cannot faithfully record the path of the file it read is not evidence of anything.
+
+### Who asked — two fields, only one of them evidence
+
+Because the broker serves several consumers through one log, a record that says only *what*
+was read cannot attribute it. Two fields answer that, and the difference between them
+matters more than either:
+
+- **`caller_uid`** is the real uid of the invoking process, from `getuid()`. Under setuid
+  the real uid is the caller's while the effective uid is the broker's, so this is supplied
+  by the kernel and **a caller cannot forge it**. This is the field to trust.
+- **`client_asserted`** is a free label from `--client <name>`. It is caller-controlled and
+  therefore **not evidence of anything**; it exists so a log is readable by a human who
+  would otherwise be mapping uids by hand. It is deliberately not named `client`, so that
+  nobody reading the log mistakes it for a verified identity.
+
+`client_asserted` is bounded rather than sanitized: at most 64 bytes, `[A-Za-z0-9._-]` only,
+and anything else is rejected outright at the flag boundary. It participates in the hash
+chain exactly like every other field — an untrusted value is still a recorded one, and a
+caller that lies about its name has that lie preserved.
 
 This is also why the NUL rejection under **Confinement** is an audit requirement and not
 merely a hygiene rule. A path containing a NUL is truncated by the device, so an
@@ -857,9 +907,43 @@ So the chain head is anchored outside the file. Periodically, and at process exi
 broker emits `{seq, hash}` to the systemd journal under a stable `MESSAGE_ID`. The journal
 is written by a process the broker does not run as and cannot rewrite.
 
-Verification compares the file's tail against the most recent journal anchor. A file
-whose chain is internally valid but whose head is *behind* the anchor has been truncated,
-and that is now visible.
+Measured 2026-07-31 (`audit_experiment.md`): the write is a single `AF_UNIX`/`SOCK_DGRAM`
+datagram of newline-separated `KEY=value` pairs to `/run/systemd/journal/socket`. No
+library, no exec, no reply. The compiled-in identity is
+
+```
+MESSAGE_ID=8f3c1d7a5e4b42c9b1d06a2f7c93e5a4
+ADB_BROKER_SEQ=<seq>  ADB_BROKER_HASH=<hex>  ADB_BROKER_LOG=<path>
+```
+
+Changing that `MESSAGE_ID` later orphans every anchor already written, so it is fixed.
+
+**journald stamps provenance the broker does not assert.** Confirmed in the round trip:
+`_UID`, `_GID`, `_PID`, `_COMM`, `_EXE`, `_CMDLINE` and `_AUDIT_LOGINUID` are all added by
+journald from the sending socket's credentials. In production an anchor therefore carries
+the broker's uid, `_COMM=adb-broker` and `_EXE=/usr/local/bin/adb-broker` without the
+broker claiming any of it, and `_AUDIT_LOGINUID` carries the login session behind a setuid
+exec — a third attribution channel, stronger than either audit-record field.
+
+#### Anchors are forgeable; only `_UID` distinguishes a real one
+
+`/run/systemd/journal/socket` is mode `0666`. **Any local process can emit a well-formed
+anchor carrying this `MESSAGE_ID` and a fabricated `seq` and `hash`** — this was done
+during the experiment, from an ordinary uid, and that anchor is now permanently in the
+journal because journal entries cannot be removed.
+
+The consequence is direct: an adversary who truncates the audit log can also publish an
+anchor matching the shortened chain, and a verifier comparing on `MESSAGE_ID` alone would
+accept it. So:
+
+**`verify` accepts only anchors whose journald-stamped `_UID` equals the broker's uid, and
+whose `_EXE` is the installed path. Everything else is discarded.** Filtering on
+`MESSAGE_ID` alone would be a check that accepts everything, which is the same failure
+shape as the `host:host-features` trap under **Transport** — a test that cannot fail.
+
+The forged test anchor is left in place deliberately. It is a permanent fixture: the first
+real `verify` run must discard it on exactly this rule, which makes the rule testable
+against something an adversary actually did rather than against something synthetic.
 
 Be clear about the limit: an adversary with local root can rewrite the journal too. The
 anchor raises the bar from "any local user with a text editor" to "root, tampering with
@@ -868,27 +952,70 @@ off-box sink, which is deferred (see **Open questions**) because it would put ne
 access into a binary that currently has none, and that is a trade worth making
 deliberately rather than by default.
 
+#### Reading the journal back
+
+Anchor comparison needs a journal *reader*, and the broker may not exec `journalctl` — the
+no-exec rule is absolute — while the Go standard library has no journal reader at all. So
+`foundation/journal` parses the journal files directly, opened `O_RDONLY`, writing nothing
+and never touching the journal directory.
+
+Measured header flags on this host (systemd 255): `COMPRESSED-ZSTD KEYED-HASH COMPACT`,
+compatible `TAIL_ENTRY_BOOT_ID`. Each one shapes the reader:
+
+- **`KEYED-HASH`** means the hash tables are keyed with SipHash-2-4, which is not in the
+  standard library. So the reader walks the header's global entry-array chain instead of
+  doing a hash-table lookup. That is `O(all journal files)` per `verify`, which is
+  acceptable for an operator command; the hash-table path is a later optimization, not a
+  rewrite.
+- **`COMPACT`** narrows entry items and entry-array offsets to 32 bits. Both layouts are
+  supported, selected by the flag. Because the walk starts from the global entry array,
+  `DataObject` back-references are never read and the compact surface stays small.
+- **`COMPRESSED-ZSTD`** is the sharp one: **zstd is not in the standard library either**, so
+  the reader cannot decompress. journald compresses payloads above 512 bytes, and anchor
+  fields are ~30, so it never arises — but that is an invariant, not a coincidence. The
+  *writer* therefore caps every anchor field value at a compile-time constant well under the
+  threshold, so it is structurally incapable of emitting an anchor the reader cannot read,
+  and the reader errors loudly on a compressed object it needs rather than skipping it and
+  reporting "no anchors found".
+- **Any unrecognized incompatible flag is a hard error.** A future systemd format change
+  must break `verify` visibly. Silently returning "no anchors" would read as tampering.
+
+The reader also tolerates a live file: journald may be mid-write, so it trusts the header's
+committed entry count and ignores a truncated trailing object.
+
 ### Fail closed
 
-At startup, before any device contact, the broker opens the audit log, reads the tail
-record, and checks that its hash matches the most recent journal anchor. If the log cannot
-be opened, cannot be appended to, or the head does not verify, the broker exits with
+At startup, before any device contact, the broker opens the audit log, confirms it can be
+appended to, reads the tail record, and recomputes its hash. If the log cannot be opened,
+cannot be appended to, or the tail does not verify, the broker exits with
 `audit_unavailable` and does nothing else.
 
-This means a misconfigured install cannot back up photos. That is the intended behaviour:
-an unauditable read of the phone is the thing being prevented, and a control that
-disengages under pressure is not a control. Full verification of the entire chain is a
-separate `verify` subcommand rather than a startup cost, since startup only needs to
-detect truncation.
+**The startup check does not consult the journal.** An earlier draft had it compare the tail
+against the newest anchor, which would require the broker's uid to be a member of
+`systemd-journal` — read access to every service's logs on the host, granted so that a
+read-only check could run on a hot path. That trade is not worth it. Anchor comparison lives
+in `verify` instead, and the broker's authority stays as narrow as it is: it writes anchors
+and never reads them.
 
-`verify` reads the log and the journal anchors and reports the first divergence. It takes
-no device and no network.
+The cost is stated rather than hidden: the startup check alone detects a corrupted or edited
+tail, but **not** a truncated one, because a shorter chain recomputes cleanly. Truncation is
+caught by `verify`, which is why `verify` belongs in monitoring rather than being run only
+when something already looks wrong.
+
+This means a misconfigured install cannot read the phone. That is the intended behaviour:
+an unauditable read is the thing being prevented, and a control that disengages under
+pressure is not a control. Full verification of the entire chain is a separate `verify`
+subcommand rather than a startup cost.
+
+`verify` reads the log and the journal anchors and reports the first divergence. It takes no
+device and no network. Whoever runs it needs journal read access — root, or membership in
+`systemd-journal`; the broker itself has neither.
 
 ### Where it lives
 
 ```
-/var/log/photos-adb-broker/          root:root 0755   — broker cannot unlink from it
-/var/log/photos-adb-broker/audit.log <broker uid>     — opened O_WRONLY|O_APPEND
+/var/log/adb-broker/            root:root 0755   — broker cannot unlink from it
+/var/log/adb-broker/audit.log   <broker uid>     — opened O_WRONLY|O_APPEND, chattr +a
 ```
 
 The directory is root-owned so the broker cannot unlink or replace the file. The file
@@ -998,8 +1125,8 @@ Layered per the house rules. Primitives at the edges, strong types only in Busin
 crossing through a named converter.
 
 ```
-cmd/photos-adb-broker/main.go               wiring; fail-closed audit init before anything else
-app/broker/{probe,list,fetch}.go            subcommands: flags in, wire JSON out
+cmd/adb-broker/main.go                      wiring; fail-closed audit init before anything else
+app/broker/{probe,list,fetch,verify}.go     subcommands: flags in, wire JSON out
 app/broker/wire.go                          request + response structs, primitives only
 app/broker/convert.go                       toBus* / fromBus*Response
 business/domain/device/devicebus/
@@ -1018,9 +1145,18 @@ business/types/serial/                      Serial
 business/types/mtime/                       Mtime
 business/types/filekind/                    Kind — regular, dir, symlink, other
 business/types/errcode/                     Code
-foundation/audit/                           chain, append-only sink, journald anchor
+foundation/audit/                           chain, append-only sink, journald anchor writer
+foundation/journal/                         read-only journal file reader; anchors for verify
 foundation/adbwire/                         framing, host services, sync commands, FAIL→code table
+foundation/errs/                            FieldErrors, for App-layer toBus* validation
 ```
+
+`foundation/journal` is read-only by construction and is the only package that opens a file
+the broker does not own. It is used by `verify` alone; nothing on the `probe`/`list`/`fetch`
+paths imports it.
+
+Module path is `github.com/jroedel/adb-broker`, and the module graph is the standard library
+plus nothing.
 
 ### Type boundaries
 
@@ -1100,7 +1236,7 @@ for device-supplied paths, as above. The exception is documented at the call sit
 The most valuable thing the broker can add beyond production use.
 
 ```
-photos-adb-broker-fixture --fixture /path/to/tree list --root /sdcard/DCIM/Camera
+adb-broker-fixture --fixture /path/to/tree list --root /sdcard/DCIM/Camera
 ```
 
 With `--fixture DIR`, the broker serves `DIR` as though it were the device: `/sdcard/…`
@@ -1116,7 +1252,7 @@ CI a run that covers the whole path.
 remaps `/sdcard/…` onto an arbitrary local directory is an allowlist bypass by
 construction, and one that ships in production is a bypass an attacker can use without
 building anything. The fixture build produces a differently-named binary
-(`photos-adb-broker-fixture`) and reports a `broker` version with a `+fixture` suffix, so a
+(`adb-broker-fixture`) and reports a `broker` version with a `+fixture` suffix, so a
 fixture binary in a production path is visible in the first `probe` response and in the
 audit log rather than being indistinguishable.
 
@@ -1154,18 +1290,18 @@ use. A process that can create its own audit log can also recreate it.
 
 ### The broker runs as its own uid
 
-**Decided: a dedicated service account, distinct from the one `photos` runs as.**
+**Decided: a dedicated `adb-broker` service account, distinct from every consumer's uid.**
 
 This is what makes the audit log's protection two independent controls instead of one. If
-the broker shared `photos`' uid, then anything that compromised `photos` could open the
-audit log directly, and `chattr +a` would be carrying the entire guarantee by itself. With a
-separate uid:
+the broker shared a consumer's uid, then anything that compromised that consumer could open
+the audit log directly, and `chattr +a` would be carrying the entire guarantee by itself.
+With a separate uid:
 
 ```
-photos (uid A)  --exec-->  broker (uid B)  --append-->  audit.log (owned B, +a)
+consumer (uid A)  --exec-->  broker (uid B)  --append-->  audit.log (owned B, +a)
 ```
 
-- A compromise of `photos` cannot open the log for writing at all — wrong owner.
+- A compromise of a consumer cannot open the log for writing at all — wrong owner.
 - A compromise of the broker can only append — `chattr +a`, and removing that attribute
   needs `CAP_LINUX_IMMUTABLE`, which the broker does not have.
 - Neither can unlink it, because the parent directory is `root:root`.
@@ -1173,27 +1309,70 @@ photos (uid A)  --exec-->  broker (uid B)  --append-->  audit.log (owned B, +a)
 Two controls that fail independently. Against local root both still fall, which the threat
 model already says.
 
-`make install`, run as root:
+#### The binary must be setuid, and `4550` rather than `4750`
 
-1. Creates the `photos-adb-broker` service account if absent — no login shell, no home
-   directory, not a member of `photos`' group.
-2. Creates `/var/log/photos-adb-broker/`, owned `root:root`, mode `0755`.
-3. Creates `audit.log`, owned by the broker's uid, mode `0640`.
-4. Sets `chattr +a` on `audit.log`.
-5. Installs the binary to the target path, owned `root:root`, mode `0755`.
-6. Prints what it did, and verifies each property afterwards rather than assuming the
+**A `0755` binary does not produce uid B at all.** `exec` does not change uid, so a consumer
+executing a `0755` broker runs it as the *consumer's* uid, which cannot open a log owned by
+B — and the two-control property silently collapses to `chattr +a` alone. An earlier draft
+of this section specified `root:root 0755` and therefore never actually delivered the
+separation it argued for.
+
+The mode is `4550`, owner `adb-broker`, group `adb-broker-clients`:
+
+- **setuid**, because that is the only way a plain `exec` yields uid B. setuid takes the uid
+  from the file's *owner*, so the binary must be owned by the broker.
+- **No owner write bit.** `4750` would leave the broker able to overwrite its own setuid
+  binary while keeping the uid, which is not a boundary. Root performs installs, so the
+  owner never needs write.
+- **Group `adb-broker-clients`**, whose `r-x` is what permits a consumer to exec it, and
+  whose absence is what stops everyone else. Adding a consumer is one `usermod -aG`.
+
+Since the broker is setuid, it **ignores its environment entirely**. A setuid binary inherits
+the caller's environment and Go's runtime does not sanitize it; the stdlib-only rule means no
+library reads `ADB_*` or proxy variables behind our back, but this is an explicitly tested
+property rather than an emergent one. It follows from the same rule as the allowlist: no
+input the broker reads at runtime can increase its authority.
+
+`zarf/install.sh`, run as root — `make install` and `make verify-install` are thin wrappers
+over it. It escalates with `sudo` if it is not already root, and it is idempotent:
+
+1. Creates the `adb-broker` service account if absent — system uid, its own group, no login
+   shell, no home directory, and **not** a member of `adb-broker-clients`.
+2. Creates the `adb-broker-clients` group, and adds each `--client USER|UID` to it.
+3. Creates `/var/log/adb-broker/`, owned `root:root`, mode `0755`.
+4. Creates `audit.log`, owned by the broker's uid, mode `0640` — guarded, so re-running can
+   never truncate an existing log.
+5. Sets `chattr +a` on `audit.log`.
+6. Installs the binary as `adb-broker:adb-broker-clients`, mode `4550`, then sets the mode
+   again explicitly since some `install` builds drop the setuid bit on copy.
+7. Prints what it did, and verifies each property afterwards rather than assuming the
    commands worked.
 
-Note that the broker's uid needs whatever group grants access to the adb server's socket, and
-that `photos` must be able to execute the broker binary — but **not** the reverse: nothing
-requires the broker to be able to read anything `photos` owns.
+The broker's uid needs **no** group for the adb server, which listens on loopback TCP with no
+peer-credential check — see `THREAT_MODEL.md` §8.1, since that fact cuts both ways. It needs
+no journal read access either: it writes anchors and never reads them.
 
 `make verify-install` re-checks every property without changing anything, and is worth
-running from monitoring. It must specifically assert that **the broker's uid differs from the
-uid `photos` runs as**, since that is the property the second control depends on and it is
-the one most likely to be quietly undone by a later packaging change. The broker's own startup
-check covers the log; it cannot check that it is not itself writable by the adversary, because
-by then it is too late.
+running from monitoring. It asserts that **the broker's uid differs from every member of
+`adb-broker-clients`**, since that is the property the second control depends on and it is
+the one most likely to be quietly undone by a later packaging change. The broker's own
+startup check covers the log; it cannot check that it is not itself writable by the
+adversary, because by then it is too late.
+
+#### Verification must not be destructive
+
+Two of the obvious checks — truncating the log to prove `+a` refuses it, unlinking it to
+prove the directory refuses that — **destroy the audit log in exactly the case where they
+fail**, which is when the evidence matters most. So `verify-install` never attempts either
+against the real log. It inspects ownership, mode and attributes; it opens the log
+`O_APPEND` and writes zero bytes; and it proves the kernel actually enforces `+a` against a
+throwaway replica created on the same filesystem. Suppressing the expected errors would be
+worse than the noise: a command failing for an unrelated reason would silently register as a
+pass, so the refusals are checked for being *permission* errors specifically.
+
+Measured on this host 2026-07-31 (`audit_experiment.md`): broker uid 995, `/var/log` on ext4,
+`+a` enforced, append permitted, log directory not writable by the broker, and the broker not
+a member of the caller group. Both controls verified independently before any Go existed.
 
 ---
 
@@ -1210,6 +1389,11 @@ by then it is too late.
 `no_adb_server`, `audit_unavailable` and `volume_unresolved` are compatible under the rules
 above, and nothing consumes the interface yet.
 
+The rename from `photos-adb-broker` to `adb-broker`, the new `--client` flag, and the
+`caller_uid`/`client_asserted` audit fields are all likewise compatible: the flag is
+additive and optional, and the audit record is not part of the stdout contract at all. A
+consumer that never passes `--client` behaves exactly as before.
+
 The one field that changed meaning rather than being added is `mtime_nsec`, which went from
 MAY to MUST NOT. That is a tightening of a field no implementation ever populated, on an
 interface with no consumers, so it does not warrant a `proto` bump — but it is recorded here
@@ -1220,6 +1404,12 @@ that would deserve one on a shipped interface.
 
 ## Build order
 
+0. **`zarf/install.sh`, and run it.** Done, 2026-07-31. Moved to the front deliberately: the
+   fail-closed startup check has nothing to check against until the audit identity exists, so
+   every later step that runs the real binary depends on this. It also means the two audit
+   controls were verified on real hardware before any code existed to depend on them, which
+   is the right order — a control established after the code that assumes it is a control
+   nobody tested failing.
 1. `foundation/adbwire` — connect to `127.0.0.1:5037`, host services, `sync:`, `LST2`,
    `STA2`, `LIS2`, `RECV`, deadlines on every exchange, and the `FAIL`→code table. Tested
    against a real adb server with **no device attached**, which exercises the failure paths
@@ -1242,17 +1432,23 @@ that would deserve one on a shipped interface.
      differs while `dev` matches is **allowed** — the deliberate narrowing, and a test that
      will look wrong to anyone who has not read why
    - `adbwire` decode: a `dev`/`ino` with the high bit set is a decode error, not a negative
-3. `foundation/audit` — chain, canonical serialization, append sink, journald anchor,
-   `verify`. Round-trip and tamper-detection tests: edit a record, reorder two, truncate
-   the tail, and confirm each is caught.
-4. `business/domain/device` — model, `Storer`, `Business`, then `adbsyncdb` over the wire
+3. `foundation/audit` — chain, canonical serialization, append sink, journald anchor writer
+   with its field-size cap. Round-trip and tamper-detection tests: edit a record, reorder
+   two, truncate the tail, and confirm each is caught. Note that the truncation test can only
+   be caught by `verify`, not by the startup check, and the tests must reflect that split
+   rather than asserting a guarantee startup does not provide.
+4. `foundation/journal` + `verify` — read-only journal reader, both entry layouts, the
+   `_UID`/`_EXE` anchor filter, a hard error on unknown incompatible flags. The forged anchor
+   already in this host's journal is a required test case: `verify` must discard it.
+5. `business/domain/device` — model, `Storer`, `Business`, then `adbsyncdb` over the wire
    package.
-5. `app/broker` + `cmd` — subcommands, wire structs, converters, fail-closed startup.
-6. `deviceaudit` extension and wiring.
-7. Fixture mode behind the build tag, then the `--fail-after` / `--inject-error` hooks.
-8. `make install` and `make verify-install`.
+6. `app/broker` + `cmd` — subcommands, wire structs, converters, fail-closed startup,
+   `--client` validation.
+7. `deviceaudit` extension and wiring.
+8. Fixture mode behind the build tag, then the `--fail-after` / `--inject-error` hooks.
+9. Re-run `zarf/install.sh` with the built binary, so the setuid install is exercised.
 
-Steps 1–3 are independent and have no dependency on a phone being present.
+Steps 1–4 are independent and have no dependency on a phone being present. Step 0 is done.
 
 ---
 
@@ -1264,11 +1460,16 @@ Steps 1–3 are independent and have no dependency on a phone being present.
    parked until we are less busy. Revisiting it needs a one-off inspection of the top level
    of the volume, which is a deliberate act rather than something the tool does — `/sdcard`
    remains denied as a `--root`.
-2. ~~**Which uid does the broker run as?**~~ **Answered: a dedicated service account,
-   distinct from `photos`.** See **Installation**. The audit log now has two controls that
-   fail independently — ownership and `chattr +a` — rather than `+a` alone.
+2. ~~**Which uid does the broker run as?**~~ **Answered: a dedicated `adb-broker` service
+   account, distinct from every consumer.** See **Installation**. The audit log now has two
+   controls that fail independently — ownership and `chattr +a` — rather than `+a` alone, and
+   the binary is setuid `4550` so that the separation actually happens rather than being
+   merely described.
 3. **Off-box anchoring.** Deferred, because it would introduce network access to a binary
    that otherwise has none. Worth revisiting if the threat model ever includes local root.
+   Note that the world-writable journal socket weakens the on-box anchor further than the
+   original draft assumed — see **Audit logging** — though the `_UID` filter restores the
+   guarantee against every adversary short of root.
 4. ~~**Is the volume pin the right mechanism, and is `(dev, ino)` the right pin?**~~
    **Answered: pin `dev` only.** `ino` would only distinguish Android's multi-user volumes,
    which requires phone-side privilege that the threat model excludes and a second user this
@@ -1291,7 +1492,21 @@ Steps 1–3 are independent and have no dependency on a phone being present.
 6. **A non-UTF-8 filename has never been observed on this device.** The `path_b64` rule is
    retained on prudence. If it ever matters it will matter silently, so there is nothing to
    watch for — this is recorded so the rule is not mistaken for a measured requirement.
+7. **Is the linear entry-array walk fast enough for `verify`?** This host has ~30 journal
+   files of 8–64 MB. Unmeasured. The fallback is a keyed hash-table lookup, which means
+   implementing SipHash-2-4 — deferred until the walk is shown to be too slow, rather than
+   written speculatively.
+8. **Should `verify` gain a `--since` bound?** Anchors accumulate for the life of the host and
+   the journal is never pruned by us. A time-bounded verification would be cheaper but would
+   also let a caller choose not to look at the interesting window, which is the wrong shape
+   for this control. Parked.
+9. **The broker is unaffected by journal rotation, but `verify` is not.** journald rotates and
+   eventually deletes journal files. An anchor old enough to have been rotated away is simply
+   gone, so the truncation guarantee has a horizon set by journald's retention rather than by
+   anything here. Unquantified on this host.
 
 **Answered and closed since the first draft:** whether `STAT_V2` offers sub-second `mtime`
 (it does not — whole seconds only, so `mtime_nsec` is now MUST NOT); whether `LST2` follows
-symlinks (it does not, `STA2` does); and whether the six roots exist (they do).
+symlinks (it does not, `STA2` does); whether the six roots exist (they do); whether anchors
+actually reach the journal and survive with their custom fields (they do, measured
+2026-07-31); and whether the broker needs journal read access (it does not — `verify` does).
