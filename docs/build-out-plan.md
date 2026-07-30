@@ -10,6 +10,56 @@ one of them.
 
 ---
 
+## 0. Resume here (updated 2026-07-31 ~01:20 CEST)
+
+**Wave 1 is four-fifths done and gate G1 is green.** `go build ./...`, `make test-unit`,
+`make lint` and `make deps-check` all pass across eight packages.
+
+Landed and committed: `foundation/errs`, `foundation/adbwire`, `foundation/audit`,
+`business/types/devicepath`, and `business/types/{mtime,filekind,serial,errcode}`.
+
+**Outstanding from wave 1: `foundation/journal`.** Its agent was stopped part-way to save
+credits. The work is **not lost** — it is in `git stash@{0}`:
+
+```
+git stash pop        # restores foundation/journal/{format.go,journal.go,journal_test.go}
+```
+
+State of that stash: `format.go` and `journal.go` are complete and **compile**.
+`journal_test.go` holds 28 well-named tests, including
+`TestEntriesRejectsForgedAnchorFromWrongUID`. It does **not compile** — the test helpers
+`builder` and `testEntry` were being written when the agent stopped and live in a file that
+was never created. **Finishing it means writing those two helpers**, then the hand-built
+golden-byte fixtures and `journal_integration_test.go`. It was stashed rather than left in
+the tree because a non-compiling test package would fail G1 for a reason unrelated to the
+code under test.
+
+Next actions, in order:
+
+1. `git stash pop`, write the missing test helpers, get `go test ./foundation/journal/...`
+   green, commit. Do not weaken a test to make it pass — the golden-byte fixtures exist
+   specifically to break the circularity of a writer and reader sharing one wrong assumption.
+2. Wave 2 (`devicebus`), then wave 3 (`adbsyncdb` + `deviceaudit`), then wave 4
+   (`app`/`cmd` + fixture mode + device tests), with the gates in §7.
+
+Three findings from wave 1 that should be folded into the other docs, recorded here so they
+are not lost with a session:
+
+- **`adb_experiment.md` is missing two measured protocol facts.** `OKAY` has two shapes —
+  `host:transport*` and `sync:` reply with a *bare* `OKAY` and no length-prefixed payload,
+  after which the socket is a stream. And the adb server **closes the socket after answering
+  a value query**, so a second request on the same connection reads zero bytes and the client
+  must redial. Both were probed against the live server while building `adbwire`.
+- **`ADB_BROKER.md` should drop `devicepath.DevicePath`.** No such type exists and none
+  should: a second, *unvalidated* path type is a way to hold a path that skipped validation.
+  `AuthorizedPath` holds raw device bytes in a `string`, and device-supplied names enter
+  through `Child`, which revalidates.
+- **One unverified assumption exists in the whole codebase**: `RECV`'s `DONE` carries a 4-byte
+  argument rather than `LIS2`'s 72-byte dirent body. Reasoned from AOSP's client and
+  `SYNC.TXT`, not measured. It is now the top item on the device manifest in §9.
+
+---
+
 ## 1. Where we are
 
 Done and committed:
