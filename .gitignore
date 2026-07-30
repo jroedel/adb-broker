@@ -1,0 +1,15 @@
+# Claude Code local, per-machine settings
+**/.claude/settings.local.json
+**/.claude/worktrees/
+
+# Go
+*.exe
+*.test
+*.out
+coverage.*
+/bin/
+/dist/
+
+# Local env
+.env
+.env.local
