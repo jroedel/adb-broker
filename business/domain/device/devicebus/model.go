@@ -13,7 +13,6 @@ import (
 type Device struct {
 	Serial        serial.Serial
 	State         string
-	Model         string
 	BrokerVersion string
 	ServerVersion string
 	Features      []string

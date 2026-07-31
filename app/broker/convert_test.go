@@ -155,7 +155,6 @@ func TestFromBusDeviceResponse(t *testing.T) {
 	res := fromBusDeviceResponse(devicebus.Device{
 		Serial:        serial.MustParseSerial("EXAMPLESERIAL1"),
 		State:         "unauthorized",
-		Model:         "",
 		BrokerVersion: "0.1.0",
 		ServerVersion: "1.0.41",
 		Features:      []string{"stat_v2", "ls_v2", "sendrecv_v2"},

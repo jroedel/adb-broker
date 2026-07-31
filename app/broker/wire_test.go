@@ -31,14 +31,13 @@ func TestProbeResponseBytes(t *testing.T) {
 		Status:          statusOK,
 		Serial:          "EXAMPLESERIAL1",
 		State:           "device",
-		Model:           "",
 		Broker:          "0.1.0",
 		ADB:             "1.0.41",
 		AttachedDevices: 1,
 		Allowlist:       []string{"/sdcard/DCIM", "/sdcard/Download"},
 	})
 
-	want := `{"proto":1,"status":"ok","serial":"EXAMPLESERIAL1","state":"device","model":"","broker":"0.1.0","adb":"1.0.41","attached_devices":1,"allowlist":["/sdcard/DCIM","/sdcard/Download"]}` + "\n"
+	want := `{"proto":1,"status":"ok","serial":"EXAMPLESERIAL1","state":"device","broker":"0.1.0","adb":"1.0.41","attached_devices":1,"allowlist":["/sdcard/DCIM","/sdcard/Download"]}` + "\n"
 
 	if got != want {
 		t.Errorf("\n got: %q\nwant: %q", got, want)
@@ -56,7 +55,7 @@ func TestProbeResponseMembersAreAlwaysPresent(t *testing.T) {
 		t.Fatalf("decode: %v", err)
 	}
 
-	for _, member := range []string{"proto", "status", "serial", "state", "model", "broker", "adb", "attached_devices", "allowlist"} {
+	for _, member := range []string{"proto", "status", "serial", "state", "broker", "adb", "attached_devices", "allowlist"} {
 		if _, ok := decoded[member]; !ok {
 			t.Errorf("the zero probe response omits %q", member)
 		}

@@ -127,7 +127,7 @@ func TestToBusDevice(t *testing.T) {
 		attachedDevices: 2,
 	}
 
-	t.Run("natives become the model", func(t *testing.T) {
+	t.Run("natives become the device", func(t *testing.T) {
 		dev, err := toBusDevice(row)
 		if err != nil {
 			t.Fatalf("toBusDevice: %v", err)
@@ -142,8 +142,6 @@ func TestToBusDevice(t *testing.T) {
 			t.Errorf("ServerVersion = %q, want %q", dev.ServerVersion, testServerVer)
 		case dev.BrokerVersion != testBrokerVer:
 			t.Errorf("BrokerVersion = %q, want %q", dev.BrokerVersion, testBrokerVer)
-		case dev.Model != "":
-			t.Errorf("Model = %q, want empty: reading it needs a shell, and there is none", dev.Model)
 		case !slices.Equal(dev.Features, row.features):
 			t.Errorf("Features = %v, want %v", dev.Features, row.features)
 		}

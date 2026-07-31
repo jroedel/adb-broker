@@ -199,7 +199,7 @@ func (s *Store) localPath(p devicepath.AuthorizedPath) string {
 
 // Probe reports this store's one synthetic device: state "device", the caller's broker
 // version with fixtureVersionSuffix appended, and the V2 feature set the capability gate
-// requires. Model is left empty, matching adbsyncdb, since a fixture has no shell either.
+// requires. It reports no model, matching adbsyncdb; see adbsyncdb.Store.Probe for why.
 //
 // AttachedDevices is 1, and it is a fact about this store rather than a stub: a fixture
 // Store serves exactly one synthetic device — Probe refuses any serial but its own — so
@@ -221,7 +221,6 @@ func (s *Store) Probe(_ context.Context, ser serial.Serial) (devicebus.Device, e
 	return devicebus.Device{
 		Serial:          s.serial,
 		State:           "device",
-		Model:           "",
 		BrokerVersion:   s.brokerVersion + fixtureVersionSuffix,
 		ServerVersion:   "fixture",
 		Features:        features,

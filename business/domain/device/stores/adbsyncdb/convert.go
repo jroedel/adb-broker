@@ -83,10 +83,6 @@ func toBusFileRecord(p devicepath.AuthorizedPath, st adbwire.Stat) (devicebus.Fi
 
 // toBusDevice parses a probe's natives into the Business Device.
 //
-// Model is left empty. It is not obtainable over this transport — reading it needs a
-// shell, and there is no shell in this binary — so the field stays empty rather than being
-// filled from an invented source that the audit record would then carry as fact.
-//
 // attachedDevices crosses as the int it already is. It is the one field here with no
 // parsing step, because there is nothing to parse: the transport counted its own device
 // list and a count has no invalid spelling. It is copied rather than recomputed — this
@@ -106,7 +102,6 @@ func toBusDevice(row deviceRow) (devicebus.Device, error) {
 	return devicebus.Device{
 		Serial:          ser,
 		State:           row.state,
-		Model:           "",
 		BrokerVersion:   row.brokerVersion,
 		ServerVersion:   row.serverVersion,
 		Features:        features,

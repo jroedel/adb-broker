@@ -371,7 +371,7 @@ func TestProbeEmitsOneObjectMatchingTheSpecifiedShape(t *testing.T) {
 
 	got := run(t, store, "probe")
 
-	want := fmt.Sprintf(`{"proto":1,"status":"ok","serial":%q,"state":"device","model":"","broker":%q,"adb":%q,"attached_devices":1,"allowlist":%s}`+"\n",
+	want := fmt.Sprintf(`{"proto":1,"status":"ok","serial":%q,"state":"device","broker":%q,"adb":%q,"attached_devices":1,"allowlist":%s}`+"\n",
 		exampleSerial, version, exampleServer, exampleAllowlist)
 
 	if got.stdout != want {
@@ -1056,7 +1056,7 @@ func TestStdoutCarriesOnlyProtocolBytes(t *testing.T) {
 		{
 			name: "probe",
 			args: []string{"probe"},
-			want: fmt.Sprintf(`{"proto":1,"status":"ok","serial":%q,"state":"device","model":"","broker":%q,"adb":%q,"attached_devices":1,"allowlist":%s}`+"\n",
+			want: fmt.Sprintf(`{"proto":1,"status":"ok","serial":%q,"state":"device","broker":%q,"adb":%q,"attached_devices":1,"allowlist":%s}`+"\n",
 				exampleSerial, version, exampleServer, exampleAllowlist),
 		},
 		{

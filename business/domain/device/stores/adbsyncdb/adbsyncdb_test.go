@@ -466,8 +466,6 @@ func TestProbeSingleDeviceReportsStateVerbatim(t *testing.T) {
 		t.Errorf("ServerVersion = %q, want %q", dev.ServerVersion, testServerVer)
 	case dev.BrokerVersion != testBrokerVer:
 		t.Errorf("BrokerVersion = %q, want %q", dev.BrokerVersion, testBrokerVer)
-	case dev.Model != "":
-		t.Errorf("Model = %q, want empty: it needs a shell, and there is no shell", dev.Model)
 	case !slices.Contains(dev.Features, "stat_v2"):
 		t.Errorf("Features = %v, want the device's own list", dev.Features)
 	}

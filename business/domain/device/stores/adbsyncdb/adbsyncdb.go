@@ -207,9 +207,10 @@ func NewStore(brokerVersion string) *Store {
 // state token, the feature list that decides whether this device can be served at all, and
 // how many devices the server reported as attached.
 //
-// Model is left empty. It is not obtainable without a shell, this package has no shell and
-// never will, and inventing a source for it would put a value in the audit record that
-// nothing measured.
+// It reports no model, and devicebus.Device has no field for one: reading a device's model
+// requires a shell, this package has no shell and never will, so the wire contract dropped
+// the member outright rather than leave a place for something to invent a value for it. See
+// ProbeResponse in app/broker/wire.go, where that decision is recorded.
 //
 // The attached-device count is not a second question asked of the server. It is counted
 // from the host:devices reply this store already read in order to select a device at all —

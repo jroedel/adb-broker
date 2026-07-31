@@ -131,7 +131,7 @@ func TestProbe_PopulatesVolume(t *testing.T) {
 
 	store := &fakeStorer{
 		probeFn: func(_ context.Context, s serial.Serial) (devicebus.Device, error) {
-			return devicebus.Device{Serial: s, Model: "Pixel"}, nil
+			return devicebus.Device{Serial: s, State: "unauthorized"}, nil
 		},
 		resolveVolumeFn: func(context.Context) (devicepath.Volume, error) {
 			return vol, nil
@@ -144,8 +144,8 @@ func TestProbe_PopulatesVolume(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Probe: unexpected error: %v", err)
 	}
-	if dev.Model != "Pixel" {
-		t.Errorf("Model = %q, want %q", dev.Model, "Pixel")
+	if dev.State != "unauthorized" {
+		t.Errorf("State = %q, want %q", dev.State, "unauthorized")
 	}
 	if dev.Volume != vol {
 		t.Errorf("Volume = %+v, want %+v", dev.Volume, vol)
@@ -159,7 +159,7 @@ func TestProbe_FailsWhenResolveVolumeFails(t *testing.T) {
 
 	store := &fakeStorer{
 		probeFn: func(_ context.Context, s serial.Serial) (devicebus.Device, error) {
-			return devicebus.Device{Serial: s, Model: "Pixel"}, nil
+			return devicebus.Device{Serial: s, State: "unauthorized"}, nil
 		},
 		resolveVolumeFn: func(context.Context) (devicepath.Volume, error) {
 			return devicepath.Volume{}, errBoom

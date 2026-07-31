@@ -250,10 +250,6 @@ func isClientByte(b byte) bool {
 // is what makes "the volume never crosses into the App layer" a fact rather than a rule to
 // remember.
 //
-// Model is copied through and is always empty in practice. Neither store can populate it:
-// reading a device model needs a shell, and this binary has none and never will. The member
-// stays because it is in the published contract, not because anything fills it.
-//
 // Allowlist is the one member that does NOT come from dev, and that is the deliberate part.
 // devicepath.Roots reports what THIS BINARY compiled in — nothing the phone said, nothing a
 // Storer measured — so routing it through devicebus.Device would have both stores populate a
@@ -275,7 +271,6 @@ func fromBusDeviceResponse(dev devicebus.Device) ProbeResponse {
 		Status:          statusOK,
 		Serial:          dev.Serial.String(),
 		State:           dev.State,
-		Model:           dev.Model,
 		Broker:          dev.BrokerVersion,
 		ADB:             dev.ServerVersion,
 		AttachedDevices: dev.AttachedDevices,

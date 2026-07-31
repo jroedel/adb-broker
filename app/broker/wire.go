@@ -16,6 +16,17 @@ package broker
 //
 // Note that not every stdout object carries it: a list record and a fetch trailer do not.
 // See ListSummaryResponse and FetchTrailer, where the reason is recorded.
+//
+// proto stayed at 1 when ProbeResponse.Model was removed (see ProbeResponse), and that is a
+// one-time exception, not a precedent. Removing a member is normally exactly what a major
+// bump exists to record: a consumer must be able to tell "this field never existed" from
+// "this field existed and vanished out from under me", and only a version number carries
+// that distinction. The exception held here only because nothing has ever consumed this
+// contract — the first consumer is being written now — so proto 1 had no installed base to
+// protect and no reader who had ever depended on Model. A version number recording the
+// removal of a member no consumer ever read would be noise every future reader has to
+// decode. The next member removed from this contract, once a consumer exists, does not get
+// this exception: bump proto.
 const proto = 1
 
 // The three values of the status field. status is authoritative and the process exit code
@@ -68,6 +79,13 @@ type VerifyRequest struct{ LogPath, AnchorsPath string }
 // else: a consumer has no use for it, and giving it one would invite reasoning about the
 // phone's storage layout, which is this binary's job and not its consumer's.
 //
+// There is no Model member and there must never be one. Reading a device's model requires
+// a shell, and this binary has none and never will — see adbsyncdb.Store.Probe and
+// fixturedb.Store.Probe, where that is the measured reason both stores leave it out. This is
+// the same call already made for FileRecordResponse's mtime_nsec: a field that can never be
+// populated does not belong in a contract inviting someone to try, so the rule is documented
+// as MUST NOT rather than always-empty.
+//
 // The last two members are the only ones a consumer reads in order to decide how to CALL
 // this binary rather than to learn about the phone. Both replace something a consumer could
 // otherwise only discover by connecting to a device and being refused.
@@ -76,7 +94,6 @@ type ProbeResponse struct {
 	Status string `json:"status"`
 	Serial string `json:"serial"`
 	State  string `json:"state"`
-	Model  string `json:"model"`
 	Broker string `json:"broker"`
 	ADB    string `json:"adb"`
 
