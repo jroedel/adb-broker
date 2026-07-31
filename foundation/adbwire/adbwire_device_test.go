@@ -399,6 +399,8 @@ func TestDeviceRootsHaveNoRegularFilesAtDepthOne(t *testing.T) {
 	ctx := deviceCtx(t)
 	sc := fx.sync(t, ctx)
 
+	var depthOneEmpty int
+
 	for _, root := range devicepath.Roots() {
 		var regularCount int
 
@@ -412,9 +414,32 @@ func TestDeviceRootsHaveNoRegularFilesAtDepthOne(t *testing.T) {
 			t.Fatalf("List(%q): %v", root, err)
 		}
 
-		if regularCount != 0 {
-			t.Errorf("root %q has %d regular file(s) at depth 1, want 0 (measured empty on the reference device)", root, regularCount)
+		// Reported, not asserted. The original version of this test required zero, on the
+		// strength of a discovery run that sampled only DCIM and Movies and generalized to
+		// all six roots. Measured 2026-07-31 that generalization is false: Download had 503
+		// regular files at depth 1 and Pictures had 47, while DCIM, Movies, Music and
+		// Recordings had none.
+		//
+		// Requiring zero would be asserting a property of one phone's file layout rather
+		// than of this code, and it would fail the moment anyone saves a file to Download.
+		// What matters is that the trap stays visible, and it is worse than uniformly empty:
+		// a depth-limited configuration appears to work, because Download and Pictures
+		// produce files, while silently archiving nothing from DCIM.
+		t.Logf("root %q: %d regular file(s) at depth 1", root, regularCount)
+
+		if regularCount == 0 {
+			depthOneEmpty++
 		}
+	}
+
+	// The trap only exists if at least one root is empty at depth 1. If a future device
+	// has files at the top level of every root, a depth-limited run would no longer
+	// silently archive nothing and this warning could be retired.
+	if depthOneEmpty == 0 {
+		t.Log("no root is empty at depth 1 on this device; the depth-1 trap does not arise here")
+	} else {
+		t.Logf("%d of %d roots are empty at depth 1: a --max-depth 1 run archives nothing from those",
+			depthOneEmpty, len(devicepath.Roots()))
 	}
 }
 

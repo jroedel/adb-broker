@@ -111,21 +111,39 @@ and is less than it might look like from the name. See `THREAT_MODEL.md` §8.1.
 
 ## Process model
 
-**One-shot subcommands, not a long-running daemon.** This is a recommendation from
-measurement rather than a preference.
+**One-shot subcommands, not a long-running daemon.** This is a design decision, and an
+earlier revision of this section misrepresented it as a performance measurement.
 
-Measured on the real device: enumeration is **one call per configured source root** — 11
-of them — and returns 23,939 records in about 10 seconds total. Fetching is one call per
-*file that is actually new*, which on a settled library is a handful. Process spawn at
-~10 ms is invisible against either.
+That revision claimed to be "measured on the real device" and gave figures — 23,939 records
+across 11 source roots, ~10 ms process spawn, 21 MB/s, "under 3%" — that appear nowhere in
+`adb_experiment.md`. The "11 roots" was the archiver's configured source count under the
+pre-broker CLI adapter; this broker has six. The 21 MB/s contradicts the experiment's own
+39.5 MiB/s. The numbers were carried over from the tool this one replaces.
 
-The one case where it matters is a first-ever run, which fetches everything: ~20,000
-spawns is about 200 seconds of overhead on top of roughly 110 minutes of transfer at the
-measured 21 MB/s. Under 3%, once, is not worth a daemon's lifecycle and deadlock
-surface.
+Measured properly on 2026-07-31, with the built binary (`phase3_device_findings.md`):
 
-If a later measurement contradicts this, a persistent mode can be added behind the same
-subcommand names without changing the wire formats below.
+| | Measured |
+|---|---|
+| Session setup — dial, `host:version`, `host:devices`, features, transport select, `sync:` | **4.48 ms** mean of 5 (2.27–7.78 ms) |
+| Volume pin — `STA2` on `/sdcard` | **2.28 ms** |
+| **Protocol cost per invocation, before any work and before process spawn** | **≈ 6.76 ms** |
+| Full enumeration, all six roots, unlimited depth | **48,704 files in 12.87 s** |
+| Fetch throughput through the Go `RECV` path | **39.1 MiB/s** on a 5.33 GB file |
+
+So the real per-invocation overhead is not "~10 ms of spawn" — it is roughly **6.8 ms of
+protocol**, a dial plus six host-service exchanges plus an `STA2`, paid on every invocation
+*before* spawn cost. On a first-ever run fetching all 48,704 files that is about **329 seconds
+of protocol setup alone**, several times the discarded estimate.
+
+**The decision stands, on the grounds it always actually rested on.** A daemon would add
+lifecycle, a deadlock surface, and a long-lived process holding a pinned volume across
+callers — and the volume pin is half of confinement, so a process that outlives one caller's
+invocation is a different security shape, not merely a faster one. That argument does not
+depend on the overhead being 3% rather than 8%, which is why quoting a percentage was the wrong
+way to defend it.
+
+If a persistent mode is ever wanted, it can be added behind the same subcommand names without
+changing the wire formats below — but it would need the volume-pin lifetime re-derived first.
 
 ### Streams
 
@@ -244,6 +262,24 @@ diagnosable error rather than something papered over.
 
 The broker also never enables ADB-over-network, and never connects to anything other than
 `127.0.0.1:5037`. The address is compiled in and not configurable.
+
+#### What "running" actually requires, measured
+
+Two host preconditions cost real time before the first device test could run, and neither was
+written down. Both are the operator's responsibility, not something this binary can arrange.
+
+**The phone's USB mode must be file transfer**, not "No data transfer".
+
+**USB debugging authorization is per adb-server RSA key.** This is the one that misleads. The
+phone can have USB debugging enabled and be showing "USB debugging connected" while the server
+still reports `unauthorized` — because the trust is granted to the *key* at
+`~/.android/adbkey` of whichever user account runs the adb server, not to the host. A different
+account on the same machine has a different key, and authorizing one grants nothing to the
+other. Replugging re-triggers the trust dialog; it must be accepted, ideally with "Always allow
+from this computer".
+
+This matters for the broker specifically because `probe` reports `unauthorized` in exactly this
+case, and the obvious reading of that — "USB debugging is off" — is wrong.
 
 ### `STAT_V2` / `LIST_V2` are required
 
@@ -675,12 +711,29 @@ confinement is re-established at each step instead of being asserted once at the
 recurse into them if they ever appear; relying on the device to filter them is relying on
 the wrong party.
 
-**A `--max-depth 1` listing of an allowlist root returns nothing.** Measured: all seven
-entries of `/sdcard/DCIM` and all eight of `/sdcard/Movies` are directories, and there is not
-a single regular file at the top level of any of the six roots. This is worth stating in the
-spec because the failure it produces is not an error — a depth-limited run reports a phone
-with no photos on it, successfully. Any test that lists a root at depth 1 and asserts a
-non-empty result will fail for reasons that have nothing to do with the code.
+**A `--max-depth 1` listing of *some* allowlist roots returns nothing, and this is a trap
+either way.** The original claim here was stronger and was wrong: it said "there is not a
+single regular file at the top level of any of the six roots", generalizing from `DCIM` and
+`Movies`, which were the only two roots the discovery run sampled. Measured against the
+device on 2026-07-31 with the built binary:
+
+| Root | Regular files at depth 1 |
+|---|---|
+| `/sdcard/DCIM` | 0 |
+| `/sdcard/Movies` | 0 |
+| `/sdcard/Music` | 0 |
+| `/sdcard/Recordings` | 0 |
+| **`/sdcard/Download`** | **503** |
+| **`/sdcard/Pictures`** | **47** |
+
+So a depth-1 run returns nothing for four roots and a great deal for two. The trap is real and
+now worse than described, because it is *inconsistent*: a depth-limited configuration appears
+to work — `Download` and `Pictures` produce files — while silently archiving nothing from
+`DCIM`, which is the root that matters most. A uniformly empty result is at least noticeable.
+
+Any test that asserts a depth-1 listing of an arbitrary root is empty is asserting a property
+of one phone's file layout, not of this code, and will fail on a device where someone has
+saved a file to `Download`.
 
 **NDJSON on stdout, one record per regular file, streamed as discovered** — so a 20,000-file
 listing can be parsed incrementally rather than buffered:

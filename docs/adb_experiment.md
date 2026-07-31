@@ -845,14 +845,11 @@ Ranked by how much they alter the design rather than the code.
 - `RECV` on a path whose final component is a symlink pointing outside the root —
   the TOCTOU case. Needs a symlink that does not exist here, i.e. the Phase 7b
   fixture that was not needed for the following-behaviour question.
-- **The width of `RECV`'s terminating `DONE` argument.** `LIS2`'s `DONE` was
-  measured to carry a full 72-byte dirent body (Phase 5). `RECV`'s was not
-  measured, because the successful transfers in Phase 6 never needed to read past
-  it. `foundation/adbwire` assumes a 4-byte argument — an 8-byte packet — from
-  adb's own client (`sizeof(msg.data)`) and AOSP `SYNC.TXT`'s note that the length
-  is ignored. **This is the only unverified protocol assumption in the
-  implementation.** A test asserts that a command issued after a completed `RECV`
-  still succeeds on the same channel, so a device run surfaces it immediately if
-  the width is wrong — and the failure would look exactly like the Phase 5
-  desync: a confident wrong answer on the *following* command, not an error on
-  this one.
+- ~~**The width of `RECV`'s terminating `DONE` argument.**~~ **Measured 2026-07-31: it is 4
+  bytes, as assumed.** `foundation/adbwire` had inferred this from adb's own client
+  (`sizeof(msg.data)`) and AOSP `SYNC.TXT`'s note that the length is ignored, which made it the
+  only unverified protocol assumption in the implementation. Settled the only way available: a
+  completed `RECV` followed by another command on the same channel, which succeeded. A wrong
+  width would have left stray bytes and desynced the *next* operation rather than failing the
+  current one — the same shape as the Phase 5 desync, a confident wrong answer on the following
+  command. See `phase3_device_findings.md`.
