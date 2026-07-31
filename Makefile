@@ -26,9 +26,10 @@ build-fixture:
 	@mkdir -p $(BIN)
 	go build -tags=fixture -o $(FIXTURE) ./cmd/adb-broker
 
-## vet: quick compile-level check
+## vet: quick compile-level check, over both build configurations
 vet:
 	go vet ./...
+	go vet -tags=fixture ./...
 
 ## fmt: format all Go source
 fmt:

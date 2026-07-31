@@ -1,0 +1,104 @@
+# CI gate for pushes and pull requests.
+#
+# Scope is deliberately the two build configurations that need nothing but a Go
+# toolchain: the release build and the `fixture` tag. The `device` and
+# `integration` tags are left OUT on purpose — those tests need a real phone
+# (device) or a running adb server (integration), neither of which exists in
+# this runner. Do not "fix" that by adding `make test-device` or
+# `make test-integration` here; they will just hang or fail for lack of adb.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# The workflow only reads the repo; nothing here needs to write anywhere.
+permissions:
+  contents: read
+
+jobs:
+  # gofmt -l lists files that need formatting and exits 0 regardless, so the
+  # failure has to come from checking its output — `make fmt` runs `go fmt`,
+  # which rewrites files in place instead of failing, so it can't be reused
+  # here.
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          # Reads the `go` directive straight out of go.mod, so this can never
+          # drift from the toolchain the module actually declares. That's a
+          # pin, not a float: unlike "stable"/"oldstable" it resolves to the
+          # exact version this repo commits to, and bumping it is a go.mod
+          # change like any other.
+          go-version-file: go.mod
+      - run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt would reformat:"
+            echo "$unformatted"
+            echo "run 'make fmt' locally and commit the result"
+            exit 1
+          fi
+
+  # go vet and staticcheck, over both the release config and the fixture tag.
+  # All four combinations come from `make lint`, which depends on `vet` — and
+  # `vet` covers both tag configurations. Writing this CI file is what exposed
+  # that it used to cover only the release one, which is the whole argument for
+  # having CI: four configurations are easy to forget, and one had been.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - run: make lint
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - run: make test-unit
+      - run: make test-fixture
+
+  # Asserts the build graph is stdlib-only. Deliberately its own job so a
+  # dependency creeping in fails loudly and separately from lint/test/build.
+  deps-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - run: make deps-check
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - run: make build
+      - run: make build-fixture
+
+  # NOT part of the required gate. govulncheck runs against @latest (see
+  # Makefile), so a newly published advisory can flip this red with no code
+  # change on our side — that's a signal worth seeing, not a reason to block
+  # merges on a moving target outside this repo's control. Runs standalone
+  # (no `needs`) and keeps going on failure so it still reports without
+  # failing the workflow run.
+  vuln-check:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - run: make vuln-check
