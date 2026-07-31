@@ -1,6 +1,7 @@
 package audit
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"fmt"
@@ -529,6 +530,84 @@ func TestTailRecordPartialFinalLine(t *testing.T) {
 	}
 }
 
+// TestTailRecordMissingFinalNewline covers the single byte that separates a
+// healthy tail from a log that poisons every record appended after it.
+//
+// A final line that is complete, valid JSON but is missing its own trailing
+// newline used to be accepted as a healthy tail, hash and all: TailRecord
+// trimmed newlines off the window it read and only asked whether what survived
+// decoded, never whether the file had actually ended in one. Open therefore
+// succeeded, the fail-closed check did not engage, the broker ran normally, and
+// the next Append — which writes no leading separator — was concatenated onto
+// that line. VerifyChain then failed at that line with "trailing data after
+// record", making it and every record after it unreachable, because
+// bufio.Scanner splits on '\n' and there was none between them.
+//
+// So both the positive and the negative case are asserted here: the check has to
+// reject a tail that lost its last byte, and it must not reject one that did not.
+func TestTailRecordMissingFinalNewline(t *testing.T) {
+	path := installLog(t)
+
+	l, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	recs := appendSamples(t, l, 2)
+
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// The positive case, on the untouched file, so the fix cannot be "reject
+	// every tail".
+	tail, err := TailRecord(path)
+	if err != nil {
+		t.Fatalf("TailRecord on a complete log: %v", err)
+	}
+
+	if tail.Hash != recs[1].Hash {
+		t.Errorf("TailRecord Hash = %q, want the second record's %q", tail.Hash, recs[1].Hash)
+	}
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open on a complete log: %v", err)
+	}
+
+	if got := reopened.Seq(); got != 2 {
+		t.Errorf("reopened Seq() = %d, want 2", got)
+	}
+
+	if err := reopened.Close(); err != nil {
+		t.Fatalf("Close reopened: %v", err)
+	}
+
+	// Now drop exactly one byte: the newline that terminates record 2.
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+
+	if b[len(b)-1] != '\n' {
+		t.Fatalf("test setup: the log does not end in a newline, so there is nothing to drop")
+	}
+
+	if err := os.WriteFile(path, b[:len(b)-1], 0o600); err != nil {
+		t.Fatalf("write log: %v", err)
+	}
+
+	if _, err := TailRecord(path); err == nil {
+		t.Error("TailRecord accepted a final line missing its trailing newline; the next Append would be concatenated onto it")
+	}
+
+	// And Open must fail closed on it, wrapping ErrAuditUnavailable, which is
+	// the error callers match to decide not to proceed.
+	if _, err := Open(path); !errors.Is(err, ErrAuditUnavailable) {
+		t.Errorf("Open on a log whose final line lost its newline = %v, want ErrAuditUnavailable", err)
+	}
+}
+
 // TestTailRecordGrowsWindow exercises the backwards read for a record larger
 // than the initial tail window.
 func TestTailRecordGrowsWindow(t *testing.T) {
@@ -668,6 +747,93 @@ func TestChainErrorUnwrapSurvivesErrorsIs(t *testing.T) {
 	var got *ChainError
 	if !errors.As(wrapped, &got) || got != ce {
 		t.Error("errors.As did not recover the original *ChainError through the extra wrapping")
+	}
+}
+
+// TestAppendOutOfRangeTimestampIsAuditUnavailable covers the two Append failure
+// modes that used to return a bare error: hashing and encoding, both of which
+// fail only when Canonical cannot render TS in its fixed-width form (a year
+// outside 0000-9999). The package doc tells callers to fail closed on
+// ErrAuditUnavailable; a caller written against that contract would not have
+// recognised these two as the audit-unavailable condition, even though the
+// operation was just as unrecorded as after a failed write.
+func TestAppendOutOfRangeTimestampIsAuditUnavailable(t *testing.T) {
+	path := installLog(t)
+
+	l, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer l.Close()
+
+	r := sampleRecord("push", 1000)
+	r.TS = time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	if _, err := l.Append(r); !errors.Is(err, ErrAuditUnavailable) {
+		t.Errorf("Append with an unrepresentable timestamp = %v, want ErrAuditUnavailable", err)
+	}
+
+	// Nothing may have been written, and the chain must not have moved.
+	if got := l.Seq(); got != 0 {
+		t.Errorf("Seq() = %d after a rejected Append, want 0", got)
+	}
+
+	if b, err := os.ReadFile(path); err != nil || len(b) != 0 {
+		t.Errorf("log holds %d bytes (err %v) after a rejected Append, want it untouched", len(b), err)
+	}
+}
+
+// TestAppendSyncFailureIsAuditUnavailable is the point of syncing at all: a
+// record the kernel has not committed must not be reported to the caller as
+// recorded. The write below succeeds and the fsync fails, which is precisely the
+// case that would otherwise be indistinguishable from a durable append.
+//
+// The Log is constructed directly rather than through Open because Open
+// deliberately insists on a regular file, and a regular file's fsync cannot be
+// made to fail on demand. A pipe's can: Linux fails fsync(2) with EINVAL on a
+// descriptor that does not support synchronisation, while the write itself
+// succeeds. This is an in-package test, so that seam costs the production API
+// nothing — no exported hook and no injectable syncer were added to make it
+// testable.
+func TestAppendSyncFailureIsAuditUnavailable(t *testing.T) {
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+
+	t.Cleanup(func() {
+		pr.Close()
+		pw.Close()
+	})
+
+	l := &Log{f: pw, path: "pipe"}
+
+	_, err = l.Append(sampleRecord("push", 1000))
+	if !errors.Is(err, ErrAuditUnavailable) {
+		t.Fatalf("Append with a failing sync = %v, want ErrAuditUnavailable", err)
+	}
+
+	// Naming the sync matters: if the error came from the write, this test would
+	// be proving nothing about durability.
+	if !strings.Contains(err.Error(), "sync") {
+		t.Errorf("Append error = %v, want it to name the failing sync", err)
+	}
+
+	// The line really was written — the failure is durability, not the write.
+	line, err := bufio.NewReader(pr).ReadBytes('\n')
+	if err != nil {
+		t.Fatalf("read what Append wrote: %v", err)
+	}
+
+	if _, err := decodeLine(line[:len(line)-1]); err != nil {
+		t.Errorf("Append wrote %q, which does not decode: %v", line, err)
+	}
+
+	// The chain state advances with the write, not with the sync, so a later
+	// Append continues the chain instead of reissuing a sequence number that may
+	// already be in the file.
+	if got := l.Seq(); got != 1 {
+		t.Errorf("Seq() = %d after a written-but-unsynced record, want 1", got)
 	}
 }
 

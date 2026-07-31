@@ -210,9 +210,42 @@ func descriptorFlags(f *os.File) (int, error) {
 // because a field looked wrong would turn an audit log into a filter.
 //
 // Each record is written with a single Write of one complete line, and os.File
-// is unbuffered, so nothing is held back across calls: a crash part-way through
-// a twenty-thousand record run leaves a valid shorter chain rather than a
-// corrupt one.
+// is unbuffered, so nothing is held back across calls. A crash part-way through
+// a twenty-thousand record run therefore leaves at worst one incomplete final
+// line, and an incomplete final line — including one missing only its trailing
+// newline — is refused by TailRecord, so the next Open fails closed rather than
+// appending onto it. The chain is never silently continued over a write that did
+// not finish.
+//
+// Append fsyncs before returning. os.File.Write returning nil means the bytes
+// reached the page cache, not the platter, so without the sync a power loss
+// could lose a record whose operation the broker had already allowed to proceed.
+// The other two gaps this package lives with are detection-based: an edited tail
+// is caught at Open, a truncated tail by the anchor comparison in the verify
+// subcommand. This one has nothing to detect afterwards — the record and every
+// trace of it are simply gone — so it is prevented instead of documented.
+//
+// The cost is real and measured: roughly 1-5 ms per record. A first archiving
+// run on the measured device is 48,704 files, so on the order of a minute added
+// to a run that already pays about 329 s in protocol setup alone
+// (docs/phase3_device_findings.md §5). The trade is deliberate. The log's only
+// value is being believed, and a record reported durable that is not is worse
+// than a slow log.
+//
+// Every failure wraps ErrAuditUnavailable, including a sync failure: a record
+// that is not durable must not be reported as recorded. On any error the caller
+// must conclude that the operation is not audited and must not proceed. It must
+// NOT conclude anything about the file, because the write may have landed
+// whole, in part, or not at all; whether the log is still usable is decided by
+// the next Open, which re-verifies the tail.
+//
+// The chain state advances as soon as the write returns successfully, before the
+// sync, so that this Log's idea of the head matches the bytes already handed to
+// the kernel. A subsequent Append after a failed sync therefore continues the
+// chain rather than reissuing a sequence number that may already be in the
+// file, which would be a divergence of this package's own making. If the kernel
+// really did drop those pages, the gap surfaces as a chain divergence at verify
+// time — detectable, unlike a silently lost record.
 func (l *Log) Append(r Record) (Record, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -226,15 +259,19 @@ func (l *Log) Append(r Record) (Record, error) {
 	r.Prev = hex.EncodeToString(l.head[:])
 	r.Hash = ""
 
+	// Both of the next two failures trace to the same cause — a TS whose year
+	// falls outside 0000-9999, which Canonical cannot render in its fixed-width
+	// form — and both mean the record cannot be recorded at all, which is the
+	// condition ErrAuditUnavailable names.
 	sum, err := HashRecord(l.head, r)
 	if err != nil {
-		return Record{}, fmt.Errorf("audit: hash record %d: %w", r.Seq, err)
+		return Record{}, fmt.Errorf("audit: %w: hash record %d: %w", ErrAuditUnavailable, r.Seq, err)
 	}
 	r.Hash = hex.EncodeToString(sum[:])
 
 	line, err := encodeLine(r)
 	if err != nil {
-		return Record{}, fmt.Errorf("audit: encode record %d: %w", r.Seq, err)
+		return Record{}, fmt.Errorf("audit: %w: encode record %d: %w", ErrAuditUnavailable, r.Seq, err)
 	}
 
 	if _, err := l.f.Write(line); err != nil {
@@ -242,6 +279,10 @@ func (l *Log) Append(r Record) (Record, error) {
 	}
 
 	l.seq, l.head = r.Seq, sum
+
+	if err := l.f.Sync(); err != nil {
+		return Record{}, fmt.Errorf("audit: %w: sync record %d: %w", ErrAuditUnavailable, r.Seq, err)
+	}
 
 	return r, nil
 }
@@ -434,6 +475,21 @@ func verifyRecord(prev [32]byte, r Record) ([32]byte, error) {
 // empty, and that is a valid chain of length zero, not a fault. A partially
 // written final line — the residue of a crash mid-write — is an error, because
 // silently ignoring it would let a truncated write pass for a shorter chain.
+//
+// "Partially written" includes the case where the missing part is only the
+// trailing newline. A file that ends in complete, valid JSON but not in '\n' is
+// rejected exactly like one that ends mid-object, because the newline is the
+// last byte encodeLine writes and is what separates this record from the next
+// one: accepting such a tail would let Append concatenate the following record
+// onto the same line, and bufio.Scanner — VerifyChain's reader — would then see
+// one undecodable line instead of two records, making every record from that
+// point on unreachable. The tail decoding cleanly is not evidence the write
+// finished; only the terminating newline is.
+//
+// A file consisting of nothing but newlines is treated as empty, and trailing
+// blank lines after a complete record are skipped rather than refused. That is
+// deliberate and consistent with VerifyChain, which skips blank lines too, so
+// the two agree on which record is last.
 func TailRecord(path string) (Record, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -449,6 +505,19 @@ func TailRecord(path string) (Record, error) {
 	size := fi.Size()
 	if size == 0 {
 		return Record{}, nil
+	}
+
+	// The file has bytes, so it must end in the newline encodeLine writes last.
+	// This is checked on the raw byte rather than inferred from what survives
+	// the TrimRight below, because trimming cannot tell "the writer finished"
+	// from "the writer stopped one byte short".
+	var last [1]byte
+	if _, err := f.ReadAt(last[:], size-1); err != nil {
+		return Record{}, fmt.Errorf("read tail: %w", err)
+	}
+
+	if last[0] != '\n' {
+		return Record{}, errors.New("read tail: no complete final line")
 	}
 
 	// Read a window from the end, growing it until the start of the final line
