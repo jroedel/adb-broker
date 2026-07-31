@@ -489,16 +489,40 @@ resolver takes the constant directly, which is why `/sdcard` remains denied as a
 - Every directory the walk descends into is re-checked against both conditions, so
   confinement is re-established at each step rather than asserted once at the root.
 
-**Why the `dev` check is stronger than the string rule it replaces.** The old rule compared
-spellings; this compares filesystems. A symlink escaping the media tree lands on a
-different `dev` — the media volume is `dev=190`, `/data` is `dev=65088`, the root filesystem
-is `dev=65034` — and is therefore detectable *by where it actually leads* rather than by
-what it is named. It also catches a case the string rule never could: a **bind mount**
-inside the tree, which introduces a foreign filesystem with no symlink involved anywhere.
+**What each check actually catches, corrected.** An earlier draft of this section said a
+symlink escaping the media tree "lands on a different `dev`" and is therefore detectable by
+where it leads. **That is wrong, and this document's own measurements disprove it.**
 
-The kind check and the `dev` check are deliberately both present. The kind check refuses
-symlinks outright, including ones that stay on the same volume; the `dev` check catches
-anything that leads off-volume by any mechanism. Neither subsumes the other.
+A `LIST_V2` dirent carries `lstat` semantics, so for a symlink the `dev` reported is the
+filesystem holding the **symlink inode**, not its target. Measured, on `/sdcard` itself:
+
+```
+LST2 /sdcard  ->  SYMLINK  dev=65034      (the root filesystem, where the link lives)
+STA2 /sdcard  ->  dir      dev=190        (the media volume, where it points)
+```
+
+So a symlink planted at `/sdcard/Pictures/x` — inode on the media volume — reports
+`dev=190`, matching the pin, no matter where it points. **The `dev` check cannot see a
+symlink escape at all.** What refuses it is the kind check, on its own.
+
+The division of labour is therefore:
+
+| Check | Catches | Cannot catch |
+|---|---|---|
+| Kind (`mode` is not regular or directory) | **Every symlink**, wherever it points, including one that stays on the volume | A bind mount, which is a genuine directory |
+| `dev` equals the pin | A **bind mount** inside the tree, and any entry genuinely residing on another filesystem | A symlink, whose inode is on the pinned volume |
+
+Both are still required and neither subsumes the other — but they are not two independent
+defences against the *same* threat, which is what the earlier wording implied. Against an app
+planting a symlink there is exactly one control, the kind check, and it is adequate precisely
+because it refuses outright rather than reasoning about targets. Against a bind mount there is
+exactly one control, the `dev` check. Crediting the pair with mutual redundancy they do not
+have is the same species of overclaim as the single-spelling rule, and is corrected here for
+the same reason.
+
+A consequence worth stating: if the kind check were ever removed as "redundant with the `dev`
+check", symlink escapes would become reachable and nothing else in the design would stop
+them.
 
 **`dev` is not stable and must never be compiled in.** Device numbers are assigned at mount
 time and can differ across reboots or remounts. The pin is established at runtime, per run,

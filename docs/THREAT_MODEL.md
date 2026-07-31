@@ -161,9 +161,9 @@ device behaviour the threat depends on, `judgement` where the rule is retained o
 | T3 | Caller reaches the same bytes under `/storage/emulated/0/…` | Refused, and deliberately **not** resolved | measured (three spellings, one inode) | **This is not an authority boundary.** The bytes are reachable under the accepted spelling. It is a canonicalization rule; its value is in T11 |
 | T4 | Path-form tricks: `..`, relative paths, trailing/doubled slash, NUL | Rejected before anything else looks at the path | measured — each form tested against the device; `..` genuinely escapes upward, relative paths resolve with cwd `/` | None for the forms tested |
 | T5 | Prefix confusion: `/sdcard/Download-private` | Comparison is over path segments, never string prefixes | measured (`error=2`, so the device would have answered) | None |
-| T6 | An app plants a symlink in the media tree pointing at `/data` | Two independent checks: `LIST_V2` dirents carry `lstat` semantics and non-regular/non-directory entries are omitted; **and** every dirent's `dev` must equal the pinned volume | measured (`LST2` does not follow symlinks, `STA2` does; `/data` is `dev=65088`, media is `dev=190`) | TOCTOU — see T7 |
+| T6 | An app plants a symlink in the media tree pointing at `/data` | **One** control, not two: the kind check. `LIST_V2` dirents carry `lstat` semantics, so non-regular/non-directory entries are omitted and never followed | measured (`LST2` does not follow symlinks, `STA2` does) | TOCTOU — see T7. **The `dev` check does not help here** — see §5.7 |
 | T7 | The file is swapped for a symlink between `LST2` and `RECV` | None available. `RECV` follows symlinks and the protocol offers no `openat`-style handle | measured (`RECV` necessarily traverses two symlinks on every read) | **Accepted.** Requires code execution on the phone timed against the broker; such an adversary has better options |
-| T8 | A bind mount inside the tree introduces a foreign filesystem with no symlink anywhere | The `dev` pin catches it; a string rule never could | judgement (mechanism follows from the measured `dev` values) | None known |
+| T8 | A bind mount inside the tree introduces a foreign filesystem with no symlink anywhere | The `dev` pin catches it; a string rule never could | judgement (mechanism follows from the measured `dev` values) | None known. **This is the only threat the `dev` check uniquely answers** — see §5.7 |
 | T9 | The device returns a directory entry naming something outside the tree | Device-supplied paths are re-parsed through `ParseAuthorizedPath` **and** `dev`-checked on the return path | measured (`adbd` applies no confinement) | None known |
 | T10 | The broker is used as a general remote-execution channel to the phone | There is no shell. The outbound vocabulary is a compiled constant: six host services plus `LST2`, `STA2`, `LIS2`, `RECV`. `shell:`, `exec:`, `SEND`, `root:`, `tcpip:`, `reverse:` are never sent | judgement (design rule, enforced by construction) | A source edit and rebuild — again attributable |
 
@@ -275,6 +275,41 @@ on a log whose most recent records were removed. Closing it is `verify`'s job, w
 `verify` belongs in monitoring on a schedule rather than being reached for after something
 already looks wrong. A control that only runs when someone suspects a problem is not
 protecting the period nobody was suspicious.
+### 5.7 The kind check and the `dev` check answer different threats, not the same one twice
+
+Earlier revisions of this document and of the spec credited T6 to "two independent checks",
+implying the kind check and the `dev` check were redundant defences against a planted symlink.
+They are not, and the measurements already in `adb_experiment.md` show why.
+
+A `LIST_V2` dirent carries `lstat` semantics, so for a symlink the reported `dev` is the
+filesystem holding the **symlink inode**, not its target:
+
+```
+LST2 /sdcard  ->  SYMLINK  dev=65034      (root filesystem — where the link lives)
+STA2 /sdcard  ->  dir      dev=190        (media volume — where it points)
+```
+
+A symlink planted at `/sdcard/Pictures/x` therefore has its inode on the media volume and
+reports `dev=190`, matching the pin, regardless of where it points. The `dev` check passes it.
+
+| Threat | Control that catches it | Control that does not |
+|---|---|---|
+| T6, a planted symlink | The kind check, alone | The `dev` check |
+| T8, a bind mount | The `dev` check, alone | The kind check — a bind mount is a genuine directory |
+
+So each control is load bearing and unsubstitutable, and neither has a spare. The practical
+consequence: **removing the kind check as "redundant with the `dev` check" would make symlink
+escapes reachable**, and nothing else in the design would stop them. The reverse holds for
+bind mounts.
+
+This does not weaken T6 — a rule that refuses every symlink outright, without reasoning about
+where it points, is the strongest form the control could take. What was wrong was the claim of
+redundancy, which would have made either check look safe to drop.
+
+Found while writing fixture mode: a local tree has no bind mount constructible without root,
+so reproducing the wire store's Lstat-only `dev` check faithfully would have left that check
+with no reachable test — which is what prompted looking at what it actually catches.
+
 
 ---
 
