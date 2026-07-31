@@ -425,8 +425,16 @@ verify_binary() {
 	# accidental install of a dirty tree or of the wrong commit.
 	if command -v go >/dev/null 2>&1; then
 		local rev dirty
-		rev="$(go version -m "${target}" 2>/dev/null | awk '$2=="vcs.revision"{print substr($3,1,12)}')"
-		dirty="$(go version -m "${target}" 2>/dev/null | awk '$2=="vcs.modified"{print $3}')"
+		# The stamp lines are "\tbuild\tkey=value", so the key and value are ONE
+		# whitespace-separated field. Splitting on tab AND '=' is what separates them.
+		# An earlier version compared $2 to "vcs.revision" and therefore matched nothing,
+		# reporting "provenance is unknown" for a binary that was correctly stamped — a
+		# check that always says "unknown" is barely better than no check, and it said so
+		# without anything looking wrong.
+		local stamp
+		stamp="$(go version -m "${target}" 2>/dev/null)"
+		rev="$(printf '%s\n' "${stamp}" | awk -F'[\t=]' '$3=="vcs.revision"{print substr($4,1,12)}')"
+		dirty="$(printf '%s\n' "${stamp}" | awk -F'[\t=]' '$3=="vcs.modified"{print $4}')"
 
 		case "${rev}:${dirty}" in
 		:*) note "warn    ${target} carries no VCS stamp; provenance is unknown" ;;
