@@ -1,0 +1,78 @@
+package broker
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/jroedel/adb-broker/business/domain/device/devicebus"
+)
+
+// errStdout marks a failure to write the protocol to stdout, so a listing that stopped
+// because its output went away is not reported as a device condition — and so the code does
+// not then try to explain the failure on the stream that just failed.
+var errStdout = errors.New("write a record to stdout")
+
+// runList enumerates a tree, writing one NDJSON record per regular file AS IT IS DISCOVERED
+// and exactly one terminating object.
+//
+// Nothing buffers the listing. The record callback handed to the Business layer writes and
+// flushes immediately, because a twenty-thousand-file listing has to be parseable
+// incrementally: a consumer that must wait for the last record to see the first cannot
+// report progress, and a consumer that runs out of memory holding one cannot run at all.
+//
+// The stream is always terminated by exactly one object with no path member — a summary when
+// the walk finished (status ok or partial), an error object when it did not. Both are
+// distinguishable from a record by the absence of path, which is the documented
+// discriminator, and from each other by status.
+func runList(e env, args []string) int {
+	var req ListRequest
+
+	fs := newFlagSet("list", e.stderr)
+	fs.StringVar(&req.Root, "root", "", "the tree to enumerate; must lie within the compiled allowlist")
+	fs.IntVar(&req.MaxDepth, "max-depth", 0, "0 enumerates the whole tree, 1 immediate children only")
+	serialFlag(fs, &req.Serial)
+	clientFlag(fs, &req.Client)
+
+	if exit, ok := e.bindFlags(fs, args); !ok {
+		return exit
+	}
+
+	// A denied root fails here, with path_denied, before a bus exists and therefore before
+	// any transport connection is attempted. That ordering is the point: the allowlist is
+	// enforced against the caller, and a caller asking for a location this binary will not
+	// serve must not cause a phone to be touched at all.
+	in, err := toBusListRequest(req)
+	if err != nil {
+		return e.failCode(requestCode(err), displayBytes(req.Root), err)
+	}
+
+	emit := func(rec devicebus.FileRecord) error {
+		if werr := writeJSON(e.stdout, fromBusFileRecordResponse(rec)); werr != nil {
+			return fmt.Errorf("%w: %w", errStdout, werr)
+		}
+
+		return nil
+	}
+
+	summary, err := e.bus(in.client).List(context.Background(), in.list, emit)
+
+	switch {
+	case errors.Is(err, errStdout):
+		// stdout is gone. There is nowhere to put an error object, and the records already
+		// written are all the consumer will ever get; the operation is in the audit log
+		// either way.
+		fmt.Fprintf(e.stderr, "adb-broker: %v\n", err)
+
+		return exitError
+
+	case err != nil:
+		// A walk that failed part way has already written records. The error object
+		// terminates the stream in place of a summary, which is what tells a consumer that
+		// what it received is not the whole tree — the alternative, a summary that counted
+		// only what happened to arrive, would read as a complete listing of a smaller phone.
+		return e.fail(displayBytes(req.Root), err)
+	}
+
+	return e.emit(fromBusListSummaryResponse(summary))
+}
