@@ -260,6 +260,13 @@ Two related observations from the same data:
   operator path is a pipe: `journalctl` as root into a broker still at euid 995. The glob
   argument should say so rather than offering a path that cannot work.
 
+  > **Overtaken by events, 2026-08-01.** The setuid install was withdrawn, so `os.Geteuid()` is
+  > now the invoking user's own uid, and a user can read its own `user-<uid>.journal` by ACL —
+  > measured that day, with no `adm` and no `systemd-journal`. The glob form works. Both
+  > findings above stand as records of the install that shipped on 2026-07-31; the first one,
+  > the missing anchor, is part of why that install no longer does. See
+  > `ADB_BROKER.md` → **Installation**.
+
 ---
 
 ## 9. Two numbers this project recorded as unmeasured

@@ -7,6 +7,16 @@ append-only log, and the journald anchor path.
 Run 2026-07-31 on the target host. No device was attached and none was needed: nothing here
 touches the phone.
 
+> **Superseded in part, 2026-08-01 — read as a record, not as a description of the install.**
+> The service account, the caller group, the `4550` setuid binary, `/var/log/adb-broker/` and
+> `chattr +a` were all withdrawn the day after this run; see `ADB_BROKER.md` →
+> **Installation**. Nothing below is retracted — every measurement here was real and §1.3's
+> finding (`4750` is wrong, `4550` is correct) is exactly why the arrangement is worth
+> restoring if a privileged install ever returns. What no longer holds is the *present tense*:
+> §§1.1–1.3 and §3's first two conclusions describe a deployment that no longer exists. The
+> journald measurements in §2 are unaffected and are load-bearing for the current design —
+> more so than when they were taken, since the anchor is now the only audit control there is.
+
 **Why measure this at all.** The audit design rests on properties of the host that the broker
 cannot establish for itself and cannot check from inside: file ownership, an append-only
 attribute the kernel has to honour, and a journal sink written by another process. Every one

@@ -34,8 +34,10 @@ Nothing in this plan. The open items are the spec's own, plus what only hardware
 1. **Run `make test-device` with the phone attached.** Nineteen tests. The one that matters
    most is `TestDeviceRecvDoneArgumentWidthIsFourBytes` — the codebase's only unverified
    protocol assumption. A failure there is a finding, not a broken test.
-2. **`make install` with the built binary**, so the setuid install is exercised for the first
-   time. `zarf/install.sh --binary bin/adb-broker` does it; needs root.
+2. ~~**`make install` with the built binary**, so the setuid install is exercised.~~
+   Withdrawn 2026-08-01: there is no privileged install left to exercise. `make install` is
+   now an unprivileged copy to `~/.local/bin`, and what needs exercising in its place is
+   first-run log creation on a host that has never run the broker.
 3. **Spec-parked features**: `--prune`, `--fail-after`, `--inject-error`, `fetch-many`,
    persistent mode, off-box anchoring.
 4. **Known limitations, recorded rather than fixed** — see the commit messages for detail:
@@ -81,9 +83,10 @@ the frozen API, because they explain why the code looks the way it does.
 | `.../extensions/deviceaudit` | Audit decorator, one record per operation. |
 | `app/broker` + `cmd/adb-broker` | Four subcommands, the wire contract, fail-closed startup. |
 
-`zarf/install.sh` creates and verifies the audit identity. `make` targets: `build
-build-fixture vet fmt lint vuln-check deps-check test-unit test-integration test-fixture
-test-device test cover install verify-install clean`.
+`make` targets: `build build-fixture vet fmt lint vuln-check deps-check test-unit
+test-integration test-fixture test-device test cover install clean`. `install` is an
+unprivileged copy to `~/.local/bin`; `zarf/install.sh` and `verify-install` were withdrawn on
+2026-08-01 along with the privileged install (`ADB_BROKER.md` → **Installation**).
 
 ## 2. What "done" means for iteration 1
 
@@ -107,8 +110,9 @@ persistent mode, off-box anchoring. All are spec-parked.
    skipped. This is the single largest driver: fixture mode moves from "nice to have" (spec
    step 7) to load bearing, because it is the only way to test traversal and fetch end to end
    tonight.
-2. **No root.** Unit tests must not need `/var/log/adb-broker`. `foundation/audit` tests
-   operate on temp files; the installed log is exercised only by manual runs.
+2. **No root.** Unit tests must not need a privileged path. `foundation/audit` tests operate
+   on temp files. This was a testing constraint when written; since 2026-08-01 it is also the
+   production arrangement, which removes the gap between the two.
 3. **Stdlib only.** No agent may add a dependency. `deps-check` enforces it.
 4. **Agents get one page.** So the *interfaces* must be decided before any agent starts, not
    negotiated between them. That is §4, and it is the load-bearing part of this plan.
@@ -330,8 +334,15 @@ func HashRecord(prev [32]byte, r Record) ([32]byte, error)
 type Log struct{ /* unexported */ }
 
 // Open fails closed: it opens O_WRONLY|O_APPEND, confirms appendability, reads the tail and
-// recomputes its hash. It does NOT consult the journal — see THREAT_MODEL.md 5.6.
+// recomputes its hash. Not O_CREATE, and it does NOT consult the journal — see
+// THREAT_MODEL.md 5.6.
 func Open(path string) (*Log, error)
+
+// Create makes the parent 0700 and the file 0600, and fails rather than truncating if
+// anything is already at the path. Added 2026-08-01, when the privileged installer that used
+// to be the only thing permitted to create a log was withdrawn; app/broker reaches it only
+// on ErrNotExist from Open, and anchors the empty chain immediately after.
+func Create(path string) (*Log, error)
 func (l *Log) Append(r Record) (Record, error) // assigns Seq, Prev, Hash; returns the stored record
 func (l *Log) Close() error
 
@@ -588,7 +599,10 @@ Three test techniques worth naming, because they are what make the phone-free co
 - **A synthetic journal file writer for `foundation/journal`.** Construct headers with each
   flag combination — including `COMPACT` on and off — so both entry layouts are covered without
   needing a host that produces both. Then a read-only pass over the real
-  `/var/log/journal/*.journal` files, tagged `integration` since it needs group membership.
+  `/var/log/journal/*.journal` files, tagged `integration`. It was tagged because it was
+  thought to need `systemd-journal` membership; measured 2026-08-01, an unprivileged user can
+  read its own `user-<uid>.journal` by ACL and only `system.journal` is denied, so the tag now
+  marks it as host-dependent rather than privileged.
 - **Fixture symlink escapes.** One symlink inside the fixture tree pointing at `/tmp`
   (different filesystem on most hosts, so the `dev` check fires) and one pointing within the
   same filesystem (so the kind check fires, and only the kind check can). The spec already
@@ -670,4 +684,4 @@ than assumed silently.
 | The journal reader is the deepest unknown | Self-contained, validated against real files, and `verify` is the only consumer — a failure there does not block `probe`/`list`/`fetch`. If it overruns, it is the one piece that can land in iteration 2 without holding anything up. |
 | Fixture mode carrying more weight than the spec intended | It is the only end-to-end coverage available without a phone, so its own tests must exercise real confinement code against virtual paths, never a bypass. Called out in the `fixture` brief. |
 | Device tests written blind against hardware that disagrees | They are written from `adb_experiment.md`'s recorded values, so a disagreement is a real finding rather than a broken test. Expect at least one to fail for an interesting reason. |
-| `chattr +a` and the real log absent in CI | Unit tests use temp files. The installed log is exercised only by manual runs and by `verify-install`. |
+| ~~`chattr +a` and the real log absent in CI~~ | Retired 2026-08-01 with the privileged install. The production log is now an ordinary user-owned file, so what the tests exercise and what ships are the same thing. |

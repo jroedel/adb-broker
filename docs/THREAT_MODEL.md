@@ -19,6 +19,16 @@ forged anchors via a world-writable journal socket). §8.1 is answered and close
 the broker requires neither root nor any particular uid. Anything still resting on
 architecture rather than a run says so in place.
 
+**Revised 2026-08-01: the privileged install was withdrawn, and this document is weaker for
+it by design.** The broker no longer runs as a service account, the audit log is an ordinary
+file owned by the account that writes it, and `chattr +a` is gone. Two of the four boundaries
+in §2 collapse into one; A2 splits into A2a and A2b; §5.5 becomes the only audit control and
+loses half its filter; §8.2 reopens; §8.6 is declined. Each is amended in place with the
+measurement behind it, and the trade is argued once, at `ADB_BROKER.md` → **Installation**.
+The short version: the withdrawn controls protected the audit log rather than the phone, and
+they cost a root-run step on every host rebuild — which is a way for the archive to stop being
+made at all.
+
 ---
 
 ## 1. What is being protected
@@ -50,13 +60,13 @@ Availability is deliberately **not** on this list. See §7.1.
 ```
    ┌─ host ──────────────────────────────────────────────────────────┐
    │                                                                 │
-   │  consumer (uid A) ─exec─▶ adb-broker (uid B, setuid 4550)       │
+   │  consumer (uid A) ─exec─▶ adb-broker (uid A, no setuid)         │
    │        │                        │        │                      │
    │        │                        │        └─append─▶ audit.log   │
-   │        │                        │                   (owner B,   │
-   │        │                        │                    +a, in a   │
-   │        │                        │                    root:root  │
-   │        │                        │                    directory) │
+   │        │                        │                   (owner A,   │
+   │        │                        │                    0600, in   │
+   │        │                        │                    ~/.local/  │
+   │        │                        │                    state)     │
    │        │                        │                               │
    │        │                        └─anchor─▶ systemd journal      │
    │        │                                         ▲              │
@@ -79,8 +89,14 @@ Four boundaries, and it is worth being explicit about which are enforced by what
 |---|---|---|
 | Caller → broker | `AuthorizedPath` / `Volume` types; compiled allowlist and service vocabulary | Compile-time; a caller cannot express a denied operation |
 | Broker → phone | The adb sync service vocabulary the broker will emit | Compiled constant, not convention |
-| Broker → audit log | Separate uid, `chattr +a`, root-owned parent directory | Two independent kernel-enforced controls |
-| Audit log → tamper detection | Hash chain + journald anchor | Detection, not prevention |
+| Broker → audit log | Nothing, since 2026-08-01. The broker and the log's owner are the same account | **Not a boundary.** Was two independent kernel-enforced controls; see §5.5 |
+| Audit log → tamper detection | Hash chain + journald anchor | Detection, not prevention — and not against the backup account itself |
+
+The third row used to read *separate uid, `chattr +a`, root-owned parent directory*. That
+install was withdrawn (`ADB_BROKER.md` → **Installation**), and the row is left in place
+reading "nothing" rather than deleted, because a boundary that used to exist and no longer does
+is worth more to a reader than a table that never mentions it. Everything that row carried has
+moved into the fourth, which is detection and was always only detection.
 
 `adbd` is **inside** the trust boundary in the sense that the broker believes what it
 says — and outside it in the sense that everything it says is re-validated. It applies no
@@ -100,10 +116,16 @@ and whether it reads stdout at all.
 **Assumed capable of:** asking for any path in any spelling, supplying malformed or
 adversarial path forms, discarding stdout and stderr, invoking the broker in a loop.
 
-**Not assumed capable of:** modifying the installed binary, or writing to the audit log
-(owned by a different uid). Note the binary is owned by the *broker's* uid rather than root —
-setuid takes its uid from the file owner — and carries mode `4550` with no owner write bit
-precisely so that ownership does not imply the ability to rewrite it.
+**Not assumed capable of:** nothing structural, since 2026-08-01. This line previously read
+*modifying the installed binary, or writing to the audit log (owned by a different uid)*, and
+both of those exclusions came from the setuid install. With the broker running as its caller,
+a caller that is the backup account **can** rewrite the binary and **can** write the log. What
+it still cannot do is express a denied operation *through* the broker — that is compile-time
+and untouched — or produce a false record and have it survive `verify` alongside anchors it
+did not publish.
+
+The distinction that now matters for this adversary is which account it runs as, and A2 is
+where that is split.
 
 This is the adversary most of the confinement design answers, and it is the one where the
 controls are strongest — a denied operation is not a check that was skipped, it is a
@@ -114,13 +136,26 @@ program that does not compile.
 Can write files and execute code as an ordinary user, can read this repository and rebuild
 the binary from modified source.
 
-**What it cannot do** is the interesting part: it cannot install over the deployed binary
-(`adb-broker:adb-broker-clients 4550`, in a root-owned directory), cannot open the audit log
-for writing (owned by the broker's uid), and cannot unlink it (root-owned parent). Unless it
-is a member of `adb-broker-clients` it cannot even execute the installed broker. It can build
-and run *its own* copy — and that copy is a different program, whose reads are unlogged. See
-§6.2 for what the audit guarantee actually reduces to under this adversary, and §8.1 for why
-this adversary is stronger than `ADB_BROKER.md` currently admits.
+**Since 2026-08-01 this adversary must be split in two, and the split is the whole of what the
+withdrawn install used to buy.**
+
+**A2a — running as any uid other than the backup account.** It cannot write the binary
+(`0755`, owned by the backup user, in that user's `~/.local/bin`), cannot open or unlink the
+audit log (`0600` in a `0700` directory owned by that user), and cannot publish an anchor that
+`verify` will accept, because journald derives `_UID` from the socket's own credentials and a
+sender cannot set it. This is very nearly what the whole of A2 used to be, and against it
+essentially nothing has changed.
+
+**A2b — running as the backup account itself.** Every one of those falls. It owns the binary,
+owns the log, and publishes anchors under the uid the trust filter selects on. Against A2b the
+audit log is not evidence, and no control in this document makes it so. This is a real
+enlargement of the adversary's reach and it is accepted deliberately — see §5.5 for the
+argument, which rests on the fact that A2b can already read the phone directly (§8.1) without
+touching any of this.
+
+Under either split it can build and run *its own* copy of the broker, and that copy is a
+different program whose reads are unlogged. See §6.2 for what the audit guarantee reduces to,
+and §8.1 for the measurement that reframed this adversary.
 
 **What it can do that this document originally missed:** write to
 `/run/systemd/journal/socket`, which is mode `0666`. That makes it able to publish forged
@@ -179,9 +214,9 @@ allowlist plus the volume pin — carrying more than it was credited with.
 |---|---|---|---|---|
 | T11 | The log describes an operation other than the one performed | NUL rejection (the device truncates at the NUL and would act on a shorter path than the one validated and logged); one accepted spelling per directory; `path_b64` as the authoritative path field | measured — `/sdcard/DCIM\x00x` returns the inode for `/sdcard/DCIM` | None for the forms tested |
 | T12 | A record is edited, reordered, or removed from the middle | `hash_n = SHA-256(hash_{n-1} ‖ canonical(record_n))`, with byte-exact specified serialization | judgement | Detection only, not prevention |
-| T13 | The tail is truncated, or the whole file deleted and a shorter valid chain recomputed | The chain head is anchored to the systemd journal under a stable `MESSAGE_ID`, written by a process the broker does not run as | measured — anchor round-tripped with its custom fields intact, 2026-07-31 | Local root can rewrite both sinks — §5.1. **Detected by `verify`, not at startup** — see §5.5, and note the horizon set by journald retention (spec, open question 9) |
-| T31 | A forged anchor is published to make a truncated chain verify | `verify` accepts only anchors whose journald-stamped `_UID` is the broker's uid and whose `_EXE` is the installed path; everything else is discarded | **measured — a well-formed anchor carrying the real `MESSAGE_ID` with a fabricated seq and hash was published from an ordinary uid, and is now permanently in this host's journal** | None from A2 once the filter is in place. `_UID` is set by journald from socket credentials and the sender cannot influence it |
-| T14 | The caller suppresses the record by discarding stdout/stderr | Neither stream is the audit trail. The record is written where the caller cannot influence it | judgement | None from A1 |
+| T13 | The tail is truncated, or the whole file deleted and a shorter valid chain recomputed | The chain head is anchored to the systemd journal, under a stable `MESSAGE_ID`, in a sink the broker cannot rewrite. A log recreated from nothing anchors its empty chain at seq 0 before any device contact, so even a reset that is never appended to leaves a mark | measured — anchor round-tripped with its custom fields intact, 2026-07-31; seq-0 creation anchor added 2026-08-01 | Local root can rewrite both sinks — §5.1. **Detected by `verify`, not at startup** — see §5.6, and note the horizon set by journald retention (spec, open question 9). Since the log is now owned by the account that writes it, deletion is cheap for A2b and the anchor is the only thing that notices |
+| T31 | A forged anchor is published to make a truncated chain verify | `verify` accepts only anchors whose journald-stamped `_UID` is the uid it runs as and whose `_EXE` is the running binary's path; everything else is discarded | **measured — a well-formed anchor carrying the real `MESSAGE_ID` with a fabricated seq and hash was published from an ordinary uid, and is now permanently in this host's journal** | **None from A2a; the control is defeated outright by A2b.** `_UID` still cannot be influenced by the sender, but since 2026-08-01 it names the backup account rather than a service account, so on this host it discards nothing (measured: all 3,652 anchor entries carry `_UID=1003`) and `_EXE` carries the filter alone — see §5.5 |
+| T14 | The caller suppresses the record by discarding stdout/stderr | Neither stream is the audit trail. The record's contents come from the operation, not the invocation | judgement | None from A1 *as a caller*. A1 that is also A2b can write the log file directly, which is a different threat (T12/T13) rather than suppression |
 | T15 | A denial goes unrecorded | Denials are logged with the same weight as successes, no sampling | judgement | None |
 | T16 | The audit extension is not wired, so nothing is written | The log is opened and its head verified in `main`, **before** the bus is constructed. Wiring the extension is not what makes the log exist | judgement | None from a wiring mistake; see §5.2 |
 | T17 | The log cannot be opened, or its head does not verify | `audit_unavailable`, exit, no device contact | judgement | Availability — deliberately, §7.1 |
@@ -212,11 +247,16 @@ Stated plainly, because a control credited with more than it does is worse than 
 
 ### 5.1 Local root defeats every control here
 
-Root can rewrite the audit log and the journal, replace the installed binary, remove
-`chattr +a` (it has `CAP_LINUX_IMMUTABLE`), and read the phone with its own copy of `adb`
-without involving this binary at all. The anchor raises the bar from *"any local user with
-a text editor"* to *"root, tampering with two independent sinks consistently"* — which is
-the entire claim, and it is not a claim of resistance.
+Root can rewrite the audit log and the journal, replace the installed binary, and read the
+phone with its own copy of `adb` without involving this binary at all. The anchor raises the
+bar from *"any local user with a text editor"* to *"tampering with two independent sinks
+consistently"* — which is the entire claim, and it is not a claim of resistance.
+
+Since the setuid install was withdrawn, the account that runs the backups clears that bar too,
+without being root: it owns both the log and the binary whose `_EXE` the anchor filter selects
+on. §5.5 splits A2 accordingly. This section is still about root, which additionally reaches
+*every other* account's chains and the journal itself; it is simply no longer the only
+adversary the audit log fails against.
 
 The honest answer against a root adversary is an off-box sink. It is deferred (spec, open
 question 3) because it would put network access into a binary that currently has none, and
@@ -247,28 +287,84 @@ re-pointed at another Android user's storage — which requires privilege on the
 compromised phone is out of scope. It is recorded in the audit log because the log's job is
 to answer *what did this binary read*, and nothing branches on it.
 
-### 5.5 The anchor's whole weight rests on one journald-stamped field
+### 5.5 The anchor is now the only audit control, and half its filter stopped working
 
-The journal socket is world-writable, so `MESSAGE_ID` proves nothing about who wrote an
-anchor — anyone can write one, and one forged during the experiment is in this host's journal
-permanently. What cannot be forged is `_UID`, which journald derives from the sending socket's
-credentials.
+This section was already the most load-bearing in the document. Since 2026-08-01 it is the
+whole of §4.2's protection, and its own basis has narrowed. Both changes are stated here
+together because reading either one alone gives the wrong impression.
 
-So the anchor is trustworthy exactly insofar as the `_UID` filter is applied. Drop that filter
-and the control inverts: it accepts every anchor, including the adversary's, which is worse
-than having no anchor at all because it produces a confident pass. This is the same failure
-shape as the `host:host-features` trap in T21 — a check that cannot fail — and it deserves the
-same treatment: a test whose fixture is the forged anchor itself.
+**The anchor is now the only control.** The withdrawn install put two kernel-enforced controls
+in front of the log — an owner the caller was not, and `chattr +a` the caller could not remove.
+Both are gone (`ADB_BROKER.md` → **Installation**). The log is an ordinary file owned by the
+account that writes it. Prevention is not narrower than it was; it is absent. Everything in
+§4.2 rests on detection, and detection rests here.
 
-`_EXE` and `_AUDIT_LOGINUID` are also stamped by journald and are recorded, but only `_UID`
-is load bearing. `_AUDIT_LOGINUID` is the more interesting of the two for forensics, since it
-survives a setuid exec and names the login session behind it.
+**Half the filter stopped discriminating.** The journal socket is world-writable, so
+`MESSAGE_ID` proves nothing about who wrote an anchor — anyone can write one, and one forged
+during the experiment is in this host's journal permanently. `_UID` cannot be forged: journald
+derives it from the sending socket's credentials. But it is now the *backup account's* uid
+rather than a service account's, and the measurement is blunt about what that costs. Every
+anchor-carrying entry on this host, counted 2026-08-01:
+
+```
+3,652 entries with the broker's MESSAGE_ID
+  _UID=1003 on all 3,652 — including the forged one
+  _EXE across ~100 paths: broker.test, deviceaudit.test, adb-broker-fixture,
+       /usr/bin/python3.12, /usr/local/bin/adb-broker
+```
+
+`_UID` discards none of them. `_EXE` discards all of them. The filter has two halves and one
+of them is doing all the work — and it is the half an adversary running as the backup account
+defeats by overwriting a binary it owns.
+
+So state it by adversary:
+
+- **A2a** (any other uid): unchanged. It cannot set `_UID`, so it cannot publish an anchor
+  this filter accepts. The control holds exactly as it did.
+- **A2b** (the backup account): defeated. Right `_UID` for free, right `_EXE` by writing to
+  its own `~/.local/bin`. Against A2b an anchor is not evidence, and nothing here pretends
+  otherwise.
+
+**One thing the retreat improves, which belongs next to what it costs.** Under the setuid
+install the anchor was not merely narrower — it was, as far as anyone measured, absent. Stage 2
+ran the installed binary end to end and found no anchor had ever been published by the service
+account (`phase3_device_findings.md` §8; undiagnosed, one candidate being that `SOCK_DGRAM`
+sends from a setuid process are dropped). T13 and T31 were therefore documented controls with
+no observed instance behind them. Running as the invoking user is the configuration in which
+anchoring is measured working, thousands of times over. A control whose filter is half as
+discriminating but which actually fires is worth more than one that does not.
+
+**Why the rest is accepted.** A2b can already read the phone directly — §8.1, measured, ten
+lines of socket code — and can delete the log outright. There is no version of this design in which
+A2b is held off by anything short of the privileged install, and the privileged install is what
+the archive could not afford to depend on. The trade is stated in full at
+`ADB_BROKER.md` → **Installation**: an audit control that survives a laptop rebuild and detects
+tampering by everyone else beats one that also resists the backup account but stops being
+installed.
+
+**What still holds, and must keep holding.** The anchor remains trustworthy exactly insofar as
+the filter is applied. Drop it and the control inverts — it accepts every anchor, including the
+adversary's, which is worse than no anchor at all because it produces a confident pass. That is
+the `host:host-features` failure shape from T21, a check that cannot fail, and it gets the same
+treatment: a test whose fixture is the forged anchor itself. That test is now more important
+than it was, not less, because `_EXE` is the only half of the filter it can still exercise.
+
+`_AUDIT_LOGINUID` is also stamped by journald and recorded. It is the most interesting field
+for forensics — it names the login session behind an invocation — and with `_UID` no longer
+discriminating, it is the one that most often distinguishes a real run from a same-uid forgery
+after the fact. It is not a control: nothing branches on it.
 
 ### 5.6 Startup detects a rewritten tail; only `verify` detects a removed one
 
-The fail-closed startup check re-hashes the tail record. It does not consult the journal,
-because doing so would require granting the broker read access to every service's logs on the
-host — an authority expansion paid for a read-only check on a hot path.
+The fail-closed startup check re-hashes the tail record. It does not consult the journal.
+
+The reason changed on 2026-08-01 and the conclusion did not. It used to be an authority
+question: consulting the journal meant granting the broker's service account
+`systemd-journal`, read access to every service's logs on the host, bought for a read-only
+check on a hot path. Running as the invoking user removes that entirely — the user can read
+its own anchors by ACL, measured. What remains is cost: `foundation/journal` walks the entry
+array linearly, `O(all journal files)` per read, and a first-ever run performs roughly 20,000
+operations. A startup check that slow is one that gets turned off.
 
 The consequence is a real, named gap: a truncated chain recomputes cleanly, so startup passes
 on a log whose most recent records were removed. Closing it is `verify`'s job, which is why
@@ -419,11 +515,17 @@ rewritable. It is not that the phone is unreachable from the host. A separate co
 or a rebuilt copy of the broker with its checks removed, reads whatever the device will
 serve.
 
-What the controls still buy under that adversary is narrower and worth naming: such a copy
-**cannot open the audit log** (wrong uid) and **cannot unlink it** (root-owned directory),
-so it cannot forge entries or erase existing ones. Its own reads are simply unrecorded. The
-log therefore remains truthful about what the deployed broker did; it was never a complete
-record of what happened to the phone.
+What the controls still buy under that adversary is narrower than it was, and the wording has
+to change with it. This paragraph used to say such a copy **cannot open the audit log** (wrong
+uid) and **cannot unlink it** (root-owned directory). Since 2026-08-01 that is true only of
+A2a. A rebuilt copy run by the backup account can do both.
+
+What survives for every adversary is weaker and still worth having: an unrecorded read stays
+unrecorded — no copy can make the log claim it did *not* happen, because the log never claimed
+completeness — and an erased or shortened log is detectable against the anchors by anyone the
+`_UID`/`_EXE` filter does not admit. The log remains truthful about what the deployed broker
+did, for as long as the deployed broker's own account is not the adversary. It was never a
+complete record of what happened to the phone.
 
 **This exclusion was mis-scoped as root-only; corrected in `ADB_BROKER.md`.** It is reachable
 by A2 with a socket call and no privilege whatsoever — measured, §8.1. That makes this the
@@ -467,11 +569,18 @@ not a goal of this design. Worth knowing before it is shipped anywhere.
 
 ### 7.1 Availability is sacrificed for auditability
 
-A misconfigured install cannot back up photos. That is the intended behaviour: an
-unauditable read of the phone is exactly the thing being prevented, and a control that
-disengages under pressure is not a control. `audit_unavailable`, `volume_unresolved` and
-`unsupported` all abort rather than degrade, and asset 3 — archive correctness — outranks
-getting a run to finish.
+A broken audit path cannot back up photos. That is the intended behaviour: an unauditable read
+of the phone is exactly the thing being prevented, and a control that disengages under pressure
+is not a control. `audit_unavailable`, `volume_unresolved` and `unsupported` all abort rather
+than degrade, and asset 3 — archive correctness — outranks getting a run to finish.
+
+The 2026-08-01 retreat pays down one case of this that was never a good trade. "Misconfigured
+install" used to include *no install performed yet*, so a rebuilt host aborted every run until
+someone ran a root script. Availability was being spent there on nothing: an absent log is not
+an unauditable read, it is a first run. The broker now creates the log and anchors its empty
+chain (`ADB_BROKER.md` → **Fail closed**). Every other abort in this section stands unchanged —
+what is refused is a log that cannot be opened, appended to, or recomputed, which is a real
+failure to record rather than an absence of history.
 
 ### 7.2 Refusing to resolve, rather than resolving carefully
 
@@ -536,11 +645,14 @@ Three consequences worth separating, because they pull in different directions:
 1. **No control in this document changes.** None of them was protecting the phone from the
    host; §1's first asset is explicitly *unreachable through this binary*, not unreachable.
    The claim to make is the weakest honest one: the broker confines itself, not the phone.
-2. **The caller group buys less than its name suggests.** Restricting execution to
-   `adb-broker-clients` does not restrict who can read the phone — nothing does. It restricts
-   who can produce a *broker-attributed* read and who can append to the audit log at all.
-   That is worth having: it keeps the log's contents meaningful and stops arbitrary local
-   processes writing to it. It is not phone confinement and should not be credited as any.
+2. **The caller group bought less than its name suggested — and was withdrawn for it.**
+   Restricting execution to `adb-broker-clients` never restricted who could read the phone;
+   nothing does. It restricted who could produce a *broker-attributed* read and who could
+   append to the audit log at all, which was worth having but was not phone confinement and
+   should never have been credited as any. On 2026-08-01 the whole privileged install went,
+   this measurement being the main reason: a control that costs a root-run step on every host
+   rebuild has to be buying more than log hygiene to be worth the ritual. See
+   `ADB_BROKER.md` → **Installation**, and §5.5 for what is left.
 3. **The bypass is closable, but not by this binary.** adb can be made to listen on a unix
    socket instead (`ADB_SERVER_SOCKET=unix:…`), at which point file permissions gate access
    and the bypass becomes a group membership rather than a socket call. That is host
@@ -549,8 +661,10 @@ Three consequences worth separating, because they pull in different directions:
    it. Recorded as §8.6 rather than decided here.
 
 The corollary relied on elsewhere still holds and is now measured: because the socket needs no
-group membership, the broker's uid needs none either, which is why `install.sh` grants it
-nothing for adb access.
+group membership, the broker needs none either — which is why the withdrawn `install.sh`
+granted it nothing for adb access, and why the current install can grant nothing at all and
+lose no capability. The broker reaching the adb server has never depended on privilege, and
+that is precisely what made the privileged install droppable.
 
 ### 8.2 What makes "edit the source and rebuild" attributable?
 
@@ -560,12 +674,27 @@ run it. If the answer is *"the repository is reviewed and only root installs"*, 
 fine answer, but it is an assumption about the operating environment and it belongs written
 down next to the controls that lean on it.
 
-**Partially narrowed since.** `zarf/install.sh` now makes two parts of the environment
-explicit rather than assumed: root is required (it escalates and every write needs it), and
-the set of uids permitted to execute the broker is an enumerated group, `adb-broker-clients`,
-which `verify-install` reports. So *who may run it* is now written down and checkable. *What
-was built* still is not — there is no signature and no provenance, so a rebuilt binary
-installed by root is indistinguishable from a reviewed one. That half of the question stands.
+**Narrowed 2026-07-31, then widened again 2026-08-01.** `zarf/install.sh` briefly made two
+parts of the environment explicit rather than assumed: root was required, and the set of uids
+permitted to execute the broker was an enumerated group that `verify-install` reported. Both
+went with the install.
+
+So the question is now open at full width: *who may install* is whoever owns the account, and
+*what was built* is unestablished. The only attribution left for T2 and T10 is `_EXE` on the
+anchors, which says which path published a chain head and nothing whatsoever about what was
+compiled into it.
+
+One qualification, because the loss here is smaller than it looks and the fix is cheap. Stage 2
+added a provenance check: `verify-install` read Go's VCS stamp and failed on a binary built
+from a modified tree (`phase3_device_findings.md` §8). The *stamp* is still there — the Go
+toolchain embeds it, and nothing about the retreat removes it. What went is the thing that read
+it. Restoring that costs a subcommand or a line in `probe`, needs no privilege, and would
+answer more of this question than the service account ever did.
+
+This is the sharpest cost of the retreat that is *not* offset by §8.1's measurement, and it is
+recorded as an open question rather than dressed up. If it ever needs answering, the answer is
+build provenance, not the reinstatement of a service account — the two were never the same
+control, and pairing them is what made the old install look like it addressed this.
 
 ### 8.3 Off-box anchoring
 
@@ -586,20 +715,38 @@ reader, any non-UTF-8 filename (none exists here to find), a mid-transfer `RECV`
 after `DATA` has flowed, and `RECV` on a final component that is a symlink pointing outside
 the root — the T7 TOCTOU case, which needs a fixture that does not exist on this device.
 
-### 8.6 Should the adb server be moved to a unix socket?
+### 8.6 ~~Should the adb server be moved to a unix socket?~~ Declined 2026-08-01
 
 Following from §8.1: `ADB_SERVER_SOCKET=unix:<path>` would put file permissions in front of the
 server, turning the bypass from a socket call into a group membership. It would be the single
 largest reduction in A2's capability available on this host, and it is entirely outside this
 binary.
 
-It is not free. The spec compiles `127.0.0.1:5037` in and refuses to make it configurable,
-precisely so that no runtime input can point the broker somewhere else — so hardening the
-server this way would require the broker to compile in a unix socket path instead, and the
-"one address, not configurable" property would need re-deriving rather than merely edited. It
-also affects every other adb consumer on the host.
+**Declined, on the same grounds that withdrew the privileged install**, and recorded as a
+decision rather than left open, because leaving it open is what this section warned against.
 
-Worth doing or worth explicitly declining; not worth leaving unnoticed.
+The reasoning is not that it would fail. It would work. It is that it is the same shape of
+control as the one just abandoned, and it fails the same test:
+
+- **It is host configuration that must be re-applied on every rebuild.** A `journald.conf`-era
+  ritual, and one that also reaches every other adb consumer on the machine, so re-applying it
+  is not a private act with private consequences.
+- **It would drag the broker along with it.** The spec compiles `127.0.0.1:5037` in and refuses
+  to make it configurable, so the broker would have to compile in a unix socket path instead
+  and the "one address, not configurable" property would need re-deriving. A control outside
+  the binary that forces a change inside it is not outside the binary.
+- **It buys nothing for the assets in §1.** It narrows who can read the phone *without* the
+  broker, which §1 explicitly does not claim to protect — asset 1 is *unreachable through this
+  binary*, not unreachable. Adopting it would improve a property this document has twice said
+  it does not have.
+
+The honest summary is the one at the top of `ADB_BROKER.md`'s **Why a broker at all**: this
+project is a controlled, auditable path to the phone, not an attempt to be the only path. adb
+is not lockable-down from here, the attempts to do so cost more than they returned, and the
+value is in the narrow interface and the record it leaves.
+
+Revisit only if §9's first bullet lands — local root entering scope — at which point this
+becomes one line item in a much larger rethink.
 
 ---
 
@@ -615,9 +762,18 @@ Worth doing or worth explicitly declining; not worth leaving unnoticed.
   shape.
 - `adbd` gains device-side confinement — §2's premise changes, and several §4.1 controls
   stop being the only boundary.
-- The adb server is moved behind a unix socket (§8.6) — A2's bypass becomes a group
-  membership, several claims here can be *strengthened* rather than weakened, and the spec's
-  compiled-in `127.0.0.1:5037` has to change with them.
+- The adb server is moved behind a unix socket — A2's bypass becomes a group membership,
+  several claims here can be *strengthened* rather than weakened, and the spec's compiled-in
+  `127.0.0.1:5037` has to change with them. Declined 2026-08-01 (§8.6); it stays on this list
+  because if someone else on the host does it, this document is affected whether or not it was
+  our decision.
+- **A privileged install is reinstated** — §5.5 and the §2 boundary table go back to two
+  controls at the log, A2 stops needing its a/b split, and §8.2 narrows again. This is the
+  reverse of the 2026-08-01 retreat and the parts to restore are enumerated at
+  `ADB_BROKER.md` → **Installation**.
+- **The broker runs as an account other than the one that owns the archive** — the reasoning
+  in §5.5 for accepting A2b assumes those are the same account and that it can already reach
+  the phone unaided. Separate them and the acceptance has to be re-argued, not inherited.
 - systemd changes the journal file format incompatibly — `verify` stops being able to read
   anchors, and must fail loudly rather than report "no anchors found", which is
   indistinguishable from tampering. Measured flags on this host are
