@@ -1095,9 +1095,17 @@ unarchived file, and because the folders most likely to contain such a name (mes
 download caches) are exactly the ones not fully walked. But it should not be cited as
 something the measurements confirmed, because they did not.
 
-`devicepath.DevicePath` holds the raw bytes in a `string`, which in Go is byte-safe. The
+`devicepath.AuthorizedPath` holds the raw bytes in a `string`, which in Go is byte-safe. The
 lossy UTF-8 coercion happens once, in `fromBusFileRecordResponse`, and only for the `path`
 field.
+
+An earlier draft specified a second type, `devicepath.DevicePath`, for unvalidated raw bytes.
+**It does not exist and should not.** A second path type whose whole purpose is to hold a path
+that has not been through `ParseAuthorizedPath` is precisely the thing the confinement design
+exists to make unrepresentable — it would reintroduce, as a named type, the "path that skipped
+validation" that `AuthorizedPath` was built to prevent. Device-supplied names enter through
+`AuthorizedPath.Child`, which revalidates, so there is nowhere an unvalidated path needs to
+live.
 
 ---
 
@@ -1150,7 +1158,7 @@ business/domain/device/stores/adbsyncdb/
   reconnect.go                              re-establish transport after a terminal RECV FAIL
   convert.go                                toSync* / toBusFileRecord
 business/types/devicepath/
-  path.go                                   DevicePath, AuthorizedPath, the allowlist
+  path.go                                   AuthorizedPath, the allowlist, Child traversal
   volume.go                                 Volume — pinned dev (enforced) + ino (recorded)
 business/types/serial/                      Serial
 business/types/mtime/                       Mtime

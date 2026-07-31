@@ -373,6 +373,41 @@ Three things the broker has to handle that the spec doesn't mention:
 `sync:` without a transport fails cleanly with `device offline (no transport)`,
 confirming the sync service is transport-gated.
 
+### Phase 0c — two host-layer facts found while implementing (2026-07-31)
+
+These were not part of the original discovery run. They surfaced while building
+`foundation/adbwire`, were probed against the same live server, and are recorded
+here because both would otherwise be rediscovered painfully.
+
+**`OKAY` has two shapes.** The host layer's `OKAY` is *not* uniformly followed by
+a `%04x`-length-prefixed payload:
+
+| Service | Reply |
+|---|---|
+| `host:version`, `host:devices`, `host-serial:<s>:features` | `OKAY` + length-prefixed payload |
+| `host:transport:<serial>`, `host:transport-any`, `sync:` | **bare `OKAY`, no payload** — the socket then becomes a stream |
+
+A client that reads a payload after a transport switch blocks until its own
+deadline expires, on the primary happy path. `FAIL` still carries a payload in
+both cases, so the asymmetry is only on success — which is the direction least
+likely to be caught by a test written against the failure paths first.
+
+**The server closes the socket after answering a value query.** After
+`host:version` returns its payload, a second request on the same connection reads
+zero bytes:
+
+```
+--> 000chost:version    <-- OKAY 0004 0029
+--> 000chost:version    <-- (zero bytes, socket closed)
+```
+
+So a host connection is single-use for value queries and the client must redial.
+This is distinct from the sync channel, which genuinely carries many commands on
+one socket (Phase 3). Note the interaction with Phase 0b: a spent socket and a
+malformed request both present as "closed with an empty reply", so a client that
+maps EOF-with-zero-bytes to a protocol error will report a framing bug where the
+real answer is "dial again".
+
 ### Error strings observed so far
 
 Four distinct messages, all prose, none machine-readable:
@@ -810,3 +845,14 @@ Ranked by how much they alter the design rather than the code.
 - `RECV` on a path whose final component is a symlink pointing outside the root —
   the TOCTOU case. Needs a symlink that does not exist here, i.e. the Phase 7b
   fixture that was not needed for the following-behaviour question.
+- **The width of `RECV`'s terminating `DONE` argument.** `LIS2`'s `DONE` was
+  measured to carry a full 72-byte dirent body (Phase 5). `RECV`'s was not
+  measured, because the successful transfers in Phase 6 never needed to read past
+  it. `foundation/adbwire` assumes a 4-byte argument — an 8-byte packet — from
+  adb's own client (`sizeof(msg.data)`) and AOSP `SYNC.TXT`'s note that the length
+  is ignored. **This is the only unverified protocol assumption in the
+  implementation.** A test asserts that a command issued after a completed `RECV`
+  still succeeds on the same channel, so a device run surfaces it immediately if
+  the width is wrong — and the failure would look exactly like the Phase 5
+  desync: a confident wrong answer on the *following* command, not an error on
+  this one.
