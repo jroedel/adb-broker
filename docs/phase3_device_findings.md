@@ -191,3 +191,71 @@ should say what "running" actually requires.
 - **A non-UTF-8 filename.** None found among 48,704, up from the discovery run's sample. The
   `path_b64` rule stays justified by prudence, and this is now a much stronger negative result.
 - **The `partial` listing path** on real hardware: zero per-path errors occurred.
+
+---
+
+## 8. Stage 2: the two audit controls work, and the anchor silently does not
+
+The binary was installed setuid for the first time and the audit design exercised end to end.
+
+**Both controls hold.** The installed binary, run as uid 1003, appended to a log owned by uid
+995; uid 1003 is refused writing that log directly, and cannot read it either (mode 0640,
+wrong group). `verify` — running at euid 995 through setuid — read the log its caller cannot,
+and the chain verified. Ownership and `chattr +a` had never before been exercised by anything
+but a temp file.
+
+**Build provenance is now reported.** `verify-install` reads Go's VCS stamp and fails on a
+binary built from a modified tree. The first version of that check was broken — it compared the
+wrong awk field and reported "provenance is unknown" for a correctly stamped binary, while the
+install still said "all checks passed". A verification step that silently degrades to "cannot
+tell" is the failure mode this repository keeps correcting, and it reached production here.
+
+### The finding: no anchor was published
+
+`verify --anchors -` against every journal entry carrying the broker's `MESSAGE_ID`:
+
+```
+/var/log/adb-broker/audit.log verified 1 record(s), but no anchor published by uid 995
+from /usr/local/bin/adb-broker was found, so a truncated tail could not be ruled out
+```
+
+3,365 entries carry that `MESSAGE_ID`. Every one is from uid 1003:
+
+| `_UID` | `_EXE` | Count |
+|---|---|---|
+| 1003 | `broker.test` | 2,649 |
+| 1003 | `deviceaudit.test` | 672 |
+| 1003 | *(absent)* | 43 |
+| 1003 | `python3.12` | 1 |
+
+**Not one from uid 995.** The broker ran, wrote its record, and published no anchor — and
+`WriteAnchor`'s failure is deliberately ignored, so nothing reported it. The design decision
+that an anchor failure must not fail an operation is right; the consequence, that a
+permanently broken anchor path is invisible, was not thought through.
+
+This matters because the anchor is the *only* control against tail truncation (§5.6). Without
+it, a truncated log recomputes cleanly and `verify` can only say "could not be ruled out" —
+which is exactly what it said, honestly, and which is the whole guarantee going unenforced.
+
+Note what the filter did do correctly: it discarded all 3,365 non-matching anchors, including
+the deliberate forgery from `python3.12`. The `_UID` discrimination works. There was simply
+nothing genuine to find.
+
+**Not yet diagnosed.** Candidates, in order of suspicion: the anchor is written after the audit
+record but the process exits before the datagram is flushed; `AF_UNIX`/`SOCK_DGRAM` sends from a
+setuid process are rejected or dropped somewhere; or the code path is not reached at all under
+the installed binary's wiring. Distinguishing them needs the socket exercised directly as uid
+995, which needs root.
+
+Two related observations from the same data:
+
+- **The test suite publishes 3,321 real anchors into the host's journal.** This was recorded as
+  a known limitation — `deviceaudit`'s `writeAnchor` seam is unexported, so app-layer tests hit
+  the real socket. Seeing the volume makes the case for fixing it: the journal now holds
+  thousands of entries claiming to anchor an audit log, all of them from test binaries.
+- **`verify --anchors <glob>` cannot succeed on this host**, and that is structural rather than
+  a bug. The filter correctly uses `os.Geteuid()` — 995 under setuid — but 995 is deliberately
+  not in `systemd-journal` (§5.6 declined that grant), so the files are unreadable; and running
+  `verify` as root to read them would filter for `_UID=0` and match nothing. The only workable
+  operator path is a pipe: `journalctl` as root into a broker still at euid 995. The glob
+  argument should say so rather than offering a path that cannot work.
