@@ -74,4 +74,15 @@ type FetchResult struct {
 	// supplies. See Storer and ExtBusiness for why the volume travels on the port but
 	// not on the seam.
 	Volume devicepath.Volume
+
+	// Serial is the device the bytes were actually read from, carried outward for the
+	// same reason as Volume.
+	//
+	// It is here because ExtBusiness.Fetch takes no serial — Probe and List do, but a
+	// fetch identifies only a path — so without this field every fetch record in the
+	// audit log would have an empty Serial. That is the majority of records on a first
+	// run, and "20,000 files were read from some phone" is not evidence of anything.
+	// Unlike Volume, Business does NOT overwrite this: the Storer is the only layer
+	// that knows which transport it selected.
+	Serial serial.Serial
 }

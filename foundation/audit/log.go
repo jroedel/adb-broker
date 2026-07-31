@@ -269,6 +269,16 @@ func (l *Log) Seq() uint64 {
 	return l.seq
 }
 
+// Path returns the file this log was opened on.
+//
+// It exists so a caller publishing an anchor can populate Anchor.LogPath without
+// having to carry the path alongside the *Log it was already given. An anchor
+// that does not say which log it describes is weaker evidence than one that does:
+// the whole point of the anchor is to be comparable against a specific file
+// later, and on a host with more than one broker install "some log had this head"
+// answers nothing.
+func (l *Log) Path() string { return l.path }
+
 // Head returns the current chain head: the raw hash of the last record, or 32
 // zero bytes for an empty log. This is the value an anchor publishes.
 func (l *Log) Head() [32]byte {
