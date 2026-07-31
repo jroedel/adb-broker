@@ -197,6 +197,13 @@ type PathErrorResponse struct {
 //
 // Errors is always present, as [] when there were none, so a consumer never has to
 // distinguish an absent member from an empty one.
+//
+// Files is exactly the number of records that preceded this summary on the same stream —
+// contract, not an implementation detail. It is what a consumer that counted records as it
+// decoded them compares against, and the specification left it unstated until the first
+// consumer performed that comparison and had to treat any disagreement as unactionable. It is
+// not a count of files on the device and not a count of what a consumer's own policy kept: the
+// broker applies no content filtering, so the only sound comparison is against this stream.
 type ListSummaryResponse struct {
 	Proto  int                 `json:"proto"`
 	Status string              `json:"status"`
@@ -207,6 +214,14 @@ type ListSummaryResponse struct {
 // FetchHeader is the line that precedes a fetch payload. It is framing rather than a
 // converted Business value: Size states exactly how many raw bytes follow, which is what
 // lets a consumer read that many and then require a trailer.
+//
+// It carries no status member, and that absence is load bearing: a fetch that fails BEFORE the
+// header writes an ErrorResponse in its place (see runFetch), so the first line of a fetch is
+// either this struct or that one, discriminated exactly as a list terminator is — by the
+// presence of status. A consumer that assumes a header unconditionally decodes an error object
+// into this struct, reads Size as 0, and cannot then tell a failed fetch from the zero-byte file
+// that exists on the target device. Requiring the trailer even for a zero-size header is the
+// second half of what closes that; both halves are in the specification.
 type FetchHeader struct {
 	Proto int    `json:"proto"`
 	Op    string `json:"op"`

@@ -70,6 +70,7 @@ func TestFromRoundTripsEveryCode(t *testing.T) {
 		errcode.CodeMultipleDevices, errcode.CodeNoADBServer, errcode.CodePathDenied,
 		errcode.CodeAuditUnavailable, errcode.CodeVolumeUnresolved,
 		errcode.CodeRootNotFound, errcode.CodeNotADirectory,
+		errcode.CodeNotARegularFile,
 		errcode.CodePermissionDenied, errcode.CodePathNotFound,
 		errcode.CodeTransferFailed, errcode.CodeDeviceDisconnected,
 		errcode.CodeUnsupported, errcode.CodeInternal,

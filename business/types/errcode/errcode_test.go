@@ -6,7 +6,7 @@ import (
 	"github.com/jroedel/adb-broker/business/types/errcode"
 )
 
-func TestParseCodeRoundTripsAllSixteen(t *testing.T) {
+func TestParseCodeRoundTripsAllSeventeen(t *testing.T) {
 	codes := []errcode.Code{
 		errcode.CodeNoDevice,
 		errcode.CodeUnauthorized,
@@ -18,6 +18,7 @@ func TestParseCodeRoundTripsAllSixteen(t *testing.T) {
 		errcode.CodeVolumeUnresolved,
 		errcode.CodeRootNotFound,
 		errcode.CodeNotADirectory,
+		errcode.CodeNotARegularFile,
 		errcode.CodePermissionDenied,
 		errcode.CodePathNotFound,
 		errcode.CodeTransferFailed,
@@ -26,8 +27,8 @@ func TestParseCodeRoundTripsAllSixteen(t *testing.T) {
 		errcode.CodeInternal,
 	}
 
-	if len(codes) != 16 {
-		t.Fatalf("test lists %d codes, want 16", len(codes))
+	if len(codes) != 17 {
+		t.Fatalf("test lists %d codes, want 17", len(codes))
 	}
 
 	for _, c := range codes {
@@ -53,8 +54,9 @@ func TestParseCodeUnknownDegradesToInternal(t *testing.T) {
 }
 
 // TestFatalMatchesTheTable is deliberately exhaustive and explicit: listing
-// every one of the sixteen codes means adding a seventeenth without deciding
-// its fatality fails this test, rather than silently defaulting one way.
+// every one of the seventeen codes means adding an eighteenth without deciding
+// its fatality fails this test, rather than silently defaulting one way. That
+// is what it did for not_a_regular_file, which is the code the count records.
 func TestFatalMatchesTheTable(t *testing.T) {
 	tests := []struct {
 		code  errcode.Code
@@ -73,13 +75,14 @@ func TestFatalMatchesTheTable(t *testing.T) {
 		{errcode.CodePathDenied, false},
 		{errcode.CodeRootNotFound, false},
 		{errcode.CodeNotADirectory, false},
+		{errcode.CodeNotARegularFile, false},
 		{errcode.CodePermissionDenied, false},
 		{errcode.CodePathNotFound, false},
 		{errcode.CodeTransferFailed, false},
 	}
 
-	if len(tests) != 16 {
-		t.Fatalf("test table lists %d codes, want 16", len(tests))
+	if len(tests) != 17 {
+		t.Fatalf("test table lists %d codes, want 17", len(tests))
 	}
 
 	for _, tt := range tests {

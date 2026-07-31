@@ -531,7 +531,12 @@ resolver takes the constant directly, which is why `/sdcard` remains denied as a
   An entry is omitted unless it is a regular file or a directory. Symlinks, sockets, FIFOs,
   block and character devices never appear in a listing and are never followed.
 - **Every dirent's `dev` must equal the pinned `dev`.** An entry on any other filesystem is
-  refused with `path_denied` regardless of its name or kind.
+  refused regardless of its name or kind. It is not reported as `path_denied`, and the wording
+  here used to say it was: during a walk such an entry is omitted with no `errors[]` entry at all,
+  exactly as a symlink is — see *A refused entry is omitted silently* under **`list`** — and if
+  the mismatch turns out to be the volume itself having moved, the whole listing fails with
+  `volume_unresolved` rather than per entry. `path_denied` is what the string rules and a
+  caller-named path decide, not what a dirent's `dev` decides.
 - `fetch` issues `LST2` (which does *not* follow symlinks — confirmed, see below) and
   requires both `S_ISREG` **and** a matching `dev` before issuing `RECV`.
 - Every directory the walk descends into is re-checked against both conditions, so
@@ -818,6 +823,18 @@ production. **The safe discriminator is the presence of a `status` member.** Eve
 summary or error alike, carries one; no `FileRecordResponse` ever does. Check for `status`
 first, then tell the two terminator kinds apart from each other by its value.
 
+**That rule is scoped to a `list` stream, and the scope has to be stated, because the
+paragraph above reads as a rule about every object this binary writes and it is not one.**
+Inside a `list` stream it is exactly right: presence separates a *record* from a *terminator*,
+because a record never carries `status` and a terminator always does. It carries over to
+`fetch`, whose first stdout line is either a header (no `status`) or an error object (one) —
+see *A failure before the header* below, where that is the whole subject, and it is worth
+pointing out that the two subcommands therefore discriminate identically. It does **not**
+carry over to `probe`, which has no records at all: a successful probe response carries
+`"status":"ok"`, so there is nothing for presence to tell apart and a consumer branches on the
+*value*. Read as a general rule, "a `status` member means this object is a failure" is wrong
+on every successful probe.
+
 ```json
 {"proto":1,"status":"partial","files":20397,"errors":[{"code":"permission_denied","path":"/sdcard/DCIM/Camera/locked","path_b64":"L3NkY2FyZC9EQ0lNL0NhbWVyYS9sb2NrZWQ="}]}
 ```
@@ -829,6 +846,16 @@ first, then tell the two terminator kinds apart from each other by its value.
 | `size` | MUST | Exact bytes, `int64`, from `LIST_V2`. |
 | `mtime` | MUST | Unix **seconds**. See *Timestamps are not to be corrected*. |
 | `mtime_nsec` | MUST NOT | **The transport cannot provide it.** See below. |
+
+**`files` is exactly the number of records that preceded the summary on this stream.** It was
+left unspecified, which is worse than it sounds: it is the obvious integrity check for a
+consumer that counted records as it decoded them, and a consumer that performed the check
+against an unspecified field was relying on an accident of the implementation rather than on
+anything promised. So it is promised. It is not a count of files on the device, and it is not a
+count of what survived a consumer's own extension or hidden-file policy — the broker applies
+none — so the only sound comparison is against the records this one stream emitted. A
+disagreement is evidence of a defect in this binary and should be reported as one, not treated
+as a device condition.
 
 Each entry in the summary's `errors[]` above pairs a `code` with the path it names, and
 carries a `path_b64` alongside them — MUST, the same rule as the record's own field, and its
@@ -849,6 +876,21 @@ and gets the interesting ones wrong.
 
 **Only regular files.** Directories, symlinks, devices and sockets must be omitted — now
 a confinement requirement rather than a preference.
+
+**A refused entry is omitted silently, with no `errors[]` entry, so a consumer cannot tell
+"refused" from "absent".** This is the intended design and not an oversight — the walk counts
+refusals internally and does not itemise them — but it was undocumented, which is the part that
+was wrong: a consumer looking for a file it *knows* is on the phone has to be able to find the
+reason it is not in the listing, and the reason was written down nowhere. A symlink, a socket, a
+FIFO, a block or character device, and any entry whose `dev` is not the pinned volume's, are all
+dropped without a record and without an error, and a listing full of them still terminates
+`"status":"ok"`. They are not reported as failures because they are not failures: they are
+confinement decisions about entries that were never going to be served, and a consumer warned
+about each one would be warned about a phone behaving exactly as designed. The consequence a
+consumer must hold is the flat one — **absence from a listing means "not a regular file on the
+pinned volume, or not there at all", and this contract does not distinguish the two.** A
+`--max-depth 1` listing adds a third reason for the same silence, which is the trap the
+depth table above is about.
 
 **No content filtering.** Do not filter by extension, and do not skip hidden files or
 directories. Extension and hidden-file policy lives in `source.Accept`, shared by both
@@ -898,12 +940,54 @@ on stdout when that happens partway through.
 - **A `RECV` failure kills the sync channel** and the next operation must reconnect. See
   *Connection lifecycle* under **Transport**. The three observed failures were `open failed:
   No such file or directory`, `open failed: Permission denied`, and `read failed: Is a
-  directory`.
+  directory`. Only the first two are reachable through this binary: the preflight `LST2` refuses
+  a directory by kind before any `RECV` is issued, so the third was observed against the raw
+  protocol and cannot be produced through the broker. That matters below, where this document
+  used to give it as an example of a failure after the header.
+
+#### A failure before the header: an ordinary error object where the header would have been
+
+The framing above documents success and the section below documents a failure part way through
+the payload. Between them sits the case this document never mentioned at all, and it is the most
+dangerous omission in it: **a `fetch` that fails before the header writes an ordinary
+`ErrorResponse` to stdout and nothing else.** Measured against the built binary:
+
+```json
+{"proto":1,"status":"error","code":"not_a_regular_file","path":"/sdcard/DCIM/Camera","path_b64":"L3NkY2FyZC9EQ0lNL0NhbWVyYQ==","message":"…"}
+```
+
+Nothing has committed to a byte count yet, so this is safe here in a way it provably is not one
+line later — the whole argument of the next section. Every classified failure a `fetch` can reach
+before its first byte is reported this way: `path_not_found` for a file that vanished between
+`list` and `fetch`, `not_a_regular_file` for a target whose kind changed, `permission_denied`,
+`path_denied` for a path outside the allowlist, and every fatal device code. The exit status is
+non-zero.
+
+**So a fetch's first stdout line is one of two things: a header, which carries no `status`
+member, or an error object, which does.** That is the same discriminator a `list` stream uses,
+and the consistency is worth stating rather than leaving to be rediscovered: a consumer that
+already checks for `status` before decoding a `list` object applies the identical check to the
+first line of a `fetch`, and needs no second rule.
+
+The reason for spelling this out is what happens to a consumer that assumes the first line is
+always a header. It unmarshals the error object into its header struct, finds no `size` member,
+and gets **zero** — and this contract's own zero-byte rule then says a legitimate empty file
+also reports `size: 0` with no bytes following it. There is a zero-byte file on the target
+device, so this is not a hypothetical shape. What separates the two is that a real empty file is
+still followed by a trailer carrying the empty-input digest `e3b0c442…`, while a failed fetch is
+followed by nothing, so a consumer that requires a trailer **even when the header says zero**
+notices. That qualification is the honest version of the danger, and it does not make it
+smaller: the empty-file rule is exactly the thing that invites the special case — "no bytes to
+read, so no need to look for a trailer" — and a consumer that takes that shortcut reports a
+failed transfer as a successful one, with an empty staging file and the digest of nothing to
+agree with it. Two rules together close it, and both are contract: **discriminate the first line
+on `status`, and require the trailer even for a zero-byte payload.**
 
 #### A failure after the header: no trailer, not a corrupted one
 
 The framing above documents success. A `RECV` can also fail after the header has already gone
-out — one of the three failures just above, or the device disappearing mid-transfer — and what
+out — either of the two failures just above that this binary can reach, or the device
+disappearing mid-transfer — and what
 happens then has to be specified as precisely as the success path, because getting it wrong
 does not merely fail the transfer, it corrupts it.
 
@@ -937,12 +1021,61 @@ how the broker happens to log:
 
 ```
 adb-broker: transfer failed after the header was sent; the stream ends without a trailer
-adb-broker: code=transfer_failed path=/sdcard/DCIM/Camera/IMG_0182.JPG: read failed: Is a directory
+adb-broker: code=transfer_failed path=/sdcard/DCIM/Camera/IMG_0182.JPG: transfer_failed: recv "/sdcard/DCIM/Camera/IMG_0182.JPG" stopped after 0 bytes: adbwire: RECV failed: open failed: No such file or directory…
 ```
+
+**That example replaces one this document previously gave that cannot occur.** It read
+`code=transfer_failed path=… read failed: Is a directory`, and that combination is impossible:
+a directory is refused by the kind check on the preflight `LST2`, before the header is written,
+so it produces the pre-header error object of the section above — now with `not_a_regular_file`
+— and never a mid-stream failure. An example that cannot be produced is worse than no example,
+because a consumer building a fixture from it builds a shape the binary never emits.
+
+The replacement is a failure that genuinely lands here, and it is worth seeing why the timing
+works out: the header is written between the preflight `LST2` and the `RECV`, so **both of the
+`RECV` failures this binary can reach arrive after the header**, even though neither transfers a
+single byte. `open failed: No such file or directory` is the file having been deleted in the
+`LST2`→`RECV` window, `open failed: Permission denied` is a file `adbd` can stat but not read,
+and both are post-header by construction. Note also that they report `transfer_failed` rather than `path_not_found` or
+`permission_denied`: a sync `FAIL` carries prose and no errno, and the broker will not classify
+by matching adb's English outside the one table in `foundation/adbwire`, so the errno-derived
+codes are unavailable on this path. A consumer that wants to know whether the file is still
+there runs `list` or `probe`; it will not learn it from this line.
 
 A consumer that needs the code has nowhere else to look for it, which is why that second line
 is guaranteed rather than left to whatever a log statement happened to say. The exit code is
 non-zero, as for any other failure that produced no usable output on stdout.
+
+**Only the `code=` token on that line is parseable, and a consumer must not attempt the rest of
+it.** The line's shape is `code=<code> path=<path>: <message>`, and everything after the code is
+for a human:
+
+- The path is **not quoted and not escaped**. A device filename may contain spaces, which on a
+  phone is ordinary rather than exotic, so there is no token boundary between the path and the
+  `: <message>` that follows it, and no amount of care recovers one.
+- The path has already been **coerced to valid UTF-8**, the same lossy rendering the `path`
+  member of an error object carries, so even a path that did parse would not be the bytes that
+  failed.
+- A device filename may contain a newline, which means the path can **forge additional lines on
+  stderr**, including a plausible-looking second `code=` line claiming a fatal code. A consumer
+  must therefore take the **first** `code=` match in the buffer. Forged text can only appear
+  inside the genuine line's own `path=` value, which is by construction after the genuine
+  `code=` token, so the first match is always the real one.
+- The `code=` token is safe against all of that. A code is drawn from a closed set of
+  `[a-z_]` values, cannot contain a space, and is the first token after the prefix. It also
+  appears a second time at the start of `<message>`, because the broker's classified error
+  renders its own code before its prose; that is cosmetic, and a consumer taking the first
+  `code=` match is unaffected by it.
+
+**A `path_b64=` token was considered and deliberately not added.** It would make the line fully
+machine-readable, and it would still be answering a question nobody has: a `fetch` names exactly
+one path, `--path`, supplied by the caller, so the path on this line is never news to the process
+reading it. The one thing a consumer cannot obtain anywhere else is the classification, and that
+is precisely what the line exists to carry — stdout cannot hold it, because its length is already
+committed. Adding a second authoritative rendering of a value the consumer already holds in its
+own variable would invite parsing a line whose tail is device-controlled prose, for no
+information gained. If a future subcommand ever writes this line for an operation whose path the
+caller did not name, that trade changes and `path_b64=` is the right way to change it.
 
 A truncated transfer's practical next question is whether the device is still there at all.
 `probe` answers exactly that in one further invocation, and it is the documented recovery step:
@@ -992,11 +1125,12 @@ below, which now applies here rather than only to a list record.
 | `offline` | Attached but not usable | Aborts. |
 | `multiple_devices` | Ambiguous without `--serial` | Aborts. Never guesses. |
 | `no_adb_server` | Nothing listening on `127.0.0.1:5037` | Aborts. The host must start it. |
-| `path_denied` | Outside the allowlist, wrong spelling, a symlink, or off the pinned volume | **Aborts that source.** A configuration error, not a device condition. |
+| `path_denied` | Outside the allowlist, a rejected spelling, or off the pinned volume | **Aborts that source.** A configuration error, not a device condition. |
 | `audit_unavailable` | The audit log cannot be opened or its head does not verify | Aborts the run before any device contact. |
 | `volume_unresolved` | `/sdcard` does not `STA2` to a directory, or stopped resolving to the pinned `dev` mid-listing | **Aborts the run**, whether reported by `probe` or by a `list`. A remount that invalidates the pin invalidates it for every other configured source too, so treating this as a per-source failure would reproduce, one level up, the exact "thousand misleading symptoms" problem the pin's own re-stat exists to prevent at the per-file level. |
 | `root_not_found` | The named tree does not exist | **Skips that source, continues.** One of eleven folders having been removed says nothing about the other ten. |
 | `not_a_directory` | Root is a file | Skips that source. |
+| `not_a_regular_file` | A `fetch` target exists and is not a regular file — a directory, a symlink, a socket, a FIFO, a device node | Per-file failure, run continues. **Not** a configuration error: a listing emits regular files only, so the kind changed after the listing. |
 | `permission_denied` | A path could not be read | Per-path: warn, continue. Never ends a run. |
 | `path_not_found` | A file vanished between `list` and `fetch` | Per-file failure, run continues. |
 | `transfer_failed` | Stream ended early or was corrupt | Per-file failure, run continues. |
@@ -1007,6 +1141,33 @@ below, which now applies here rather than only to a list record.
 `message` is free-form and for humans only; the archiver logs it and never branches on
 it. New codes may be added — an unrecognized code is treated as `internal`, which is the
 safe direction.
+
+**The action column describes handling at the scope the code appears, and this document did not
+say so.** The same code means two different things depending on where it is read, and a consumer
+that took the column literally regardless was measured getting it badly wrong. `--inject-error
+permission_denied` on a `list` produces an error *terminator* with zero records and exit 1 — but
+`permission_denied`'s column reads "per-path: warn, continue; never ends a run", so a consumer
+following that archives nothing from the source and reports success. The rule is:
+
+- **As an entry in a summary's `errors[]`**, the code describes one path inside a listing that
+  otherwise succeeded. The column applies as written: `permission_denied` there means warn and
+  carry on, and the records that did arrive are a usable, if incomplete, enumeration.
+- **As the `code` of a terminating error object, or of a failed `probe` or `fetch`**, the same
+  value means *this operation failed and produced no usable output*. Whatever the column says
+  about continuing applies to the run, never to the operation: there is nothing to continue with
+  here, because no enumeration was produced. A `list` that ends this way must have its records
+  discarded — a partial tree presented as a whole is the failure this tool exists to prevent —
+  and the source must be reported as failed. "Warn and continue" is correct only for a per-path
+  entry, never for a terminator.
+
+`--inject-error` is how that was measured, and it is worth saying that the shape is not an
+artifact of fixture mode: `permission_denied` reaches a real `list` terminator whenever the
+listing **root** answers `EACCES`, since the errno mapping reports `permission_denied` for that
+errno wherever it is read, including on the root. A root nobody may read ends the listing exactly
+as the injected error does.
+
+So the column answers "how far does this failure reach", and the scope answers "what is the
+thing that failed". Both are needed, and only one of them was written down.
 
 ### Where the codes come from
 
@@ -1037,14 +1198,55 @@ something this broker will not read. Continuing quietly would produce a backup t
 silently missing a whole tree, which is the failure mode the entire tool exists to
 prevent. It does not abort the *run*, because the other ten sources are still valid.
 
+`not_a_regular_file` is the taxonomy's seventeenth code, and it was added because that
+`path_denied` argument was being applied to a case it does not fit. A `fetch` of a path that is
+not a regular file is refused by the kind check on the preflight `LST2`, before any header, and
+it used to report `path_denied` — so the first consumer to read this contract loudly abandoned an
+entire source over one file. The two causes are genuinely different and were sharing one code:
+*"you asked for something outside the allowlist or spelled wrongly"*, which is a statement about
+a configuration file, versus *"this path exists and is not something I will transfer"*, which is
+a statement about one path at one moment.
+
+The second is a **race**, and that is the whole argument. A consumer fetches the paths a listing
+gave it, and a listing emits regular files only — so a fetch target that is not a regular file is
+a path whose kind changed between the two calls. Refusing a source over that is a misdiagnosis of
+the same shape the volume re-stat exists to prevent one level up: a per-file event reported with
+source-level authority. So the new code is per-file, the run continues, and nothing about **what**
+is refused changed — a symlink is still refused before any `RECV`, which is the entire reason the
+preflight uses `LST2` rather than `STA2`. Only the scope a consumer reads off the classification
+changed, and per-file is the scope consistent with the rest of this contract: the listing side
+already omits a symlink as a refused entry rather than as a failure of the tree containing it.
+
+One consequence of the split is that **`path_denied` no longer names a symlink**, and its row
+above dropped the word. That row had been wrong for longer than this change: a symlink is refused
+in three places and none of them reported `path_denied` even before it. A symlink at a listing
+root is `not_a_directory`, a symlink encountered while walking is omitted as a refused entry with
+no error at all, and a symlink named as a fetch target is now `not_a_regular_file`. `path_denied`
+is what a *string* rule or the volume pin decides, and a symlink is caught by neither.
+
+It is kept distinct from `not_a_directory`, its closest sibling, rather than merged into one
+"wrong kind" code. Both report a path whose kind is wrong for what was attempted, and they differ
+in exactly the thing a consumer acts on: `not_a_directory` is a listing **root**, and a root that
+is a file ends that source, while `not_a_regular_file` is one **fetch target** and ends one file.
+A single code for both would hide a per-source and a per-file failure behind one value and force
+a consumer to recover the difference from which subcommand it happened to be running — which is
+precisely the guessing this taxonomy exists to abolish.
+
 `no_device`'s gloss above is deliberately wider than "nothing attached," because that
 narrower wording is untrue of one case the code covers: a named `--serial` that is not among
 the attached devices maps to `no_device` too (`adbwire.ErrDeviceNotFound`, classified in
 `adbsyncdb.go`), and three other phones can be sitting on the same USB hub when it fires. The
 archiver aborts either way — a device it can't find is a device it can't find, and a run that
 otherwise treats the two causes differently would need to explain the difference to a human,
-not act on it — so the fix here is a wider gloss on the one code, not a seventeenth code that
+not act on it — so the fix here is a wider gloss on the one code, not a code of its own that
 would only restate the abort behaviour it already has.
+
+The test that paragraph applies is the same one `not_a_regular_file` passes, and it is worth
+noting that they reach opposite conclusions for a consistent reason. A new code is worth having
+when a consumer would **act** differently on it, and not when it would only give a second name to
+an identical action. Two causes of "abort the run" do not need two codes; "abandon this source"
+and "skip this one file" are not the same action, and a taxonomy that reports them with one value
+is not classifying anything.
 
 The partial case matters and deserves stating explicitly: a `list` that reads most of a
 tree and fails on one subdirectory must emit every record it *did* read, then a summary
@@ -1691,9 +1893,21 @@ a member of the caller group. Both controls verified independently before any Go
   values are compatible, since unknown codes degrade to `internal`.
 
 `proto` stays at `1`. The removal of `--verify-device`, and the addition of `path_denied`,
-`no_adb_server`, `audit_unavailable`, `volume_unresolved`, `path_b64` on a per-path list error
-and on the top-level error object, and `probe`'s `attached_devices` and `allowlist`, are all
-compatible under the rules above, and nothing consumes the interface yet.
+`no_adb_server`, `audit_unavailable`, `volume_unresolved`, `not_a_regular_file`, `path_b64` on a
+per-path list error and on the top-level error object, and `probe`'s `attached_devices` and
+`allowlist`, are all compatible under the rules above.
+
+`not_a_regular_file` is the first of those additions made with a consumer in existence, so it is
+worth confirming the reading rather than inheriting "nothing consumes this yet". It is a new
+`code` value, which the rule above calls compatible, and the reason holds under inspection: an
+unrecognized code degrades to `internal`, which is fatal, so a consumer built against the
+sixteen-code taxonomy that meets this one aborts the run. That is a worse outcome than the
+per-file skip the code asks for and a better one than any silent success, which is what
+"compatible" has to mean here — a consumer cannot be broken by a value it fails safe on. No
+member was added, removed or repurposed. The paths this code is reported on previously reported
+`path_denied`, so a consumer that has not been updated changes behaviour on them, from
+"abandon this source" to "abort the run"; both are refusals a human sees, neither archives
+anything under a false success, and updating the consumer's table is one row. `proto` stays 1.
 
 The removal of `probe`'s `model` member is the one exception, and it does not fold into
 "compatible under the rules above" — removing a member is exactly what a major bump exists to
@@ -1703,7 +1917,9 @@ at: nothing has ever consumed this contract — the first consumer is being writ
 `proto` 1 has no installed base to protect and no reader who ever depended on `model`, and a
 version number recording the removal of a member no consumer ever read would be noise every
 future reader has to decode. This is a **one-time exception, not a precedent**: the next member
-removed from this contract, once a consumer exists, gets the ordinary bump.
+removed from this contract, once a consumer exists, gets the ordinary bump. **That consumer now
+exists**, so the exception is spent, and the paragraph below is what the rules look like applied
+with a reader on the other side of them.
 
 The rename from `photos-adb-broker` to `adb-broker`, the new `--client` flag, and the
 `caller_uid`/`client_asserted` audit fields are all likewise compatible: the flag is

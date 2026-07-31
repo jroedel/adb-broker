@@ -1,7 +1,7 @@
 // Package errcode is the broker's complete error taxonomy.
 //
 // Every failure the broker reports to a consumer is classified into one of
-// these sixteen codes. The taxonomy exists so a consumer can decide, from the
+// these seventeen codes. The taxonomy exists so a consumer can decide, from the
 // code alone, whether a failure ends the whole run, ends one source, or is a
 // per-path warning to log and continue past — without parsing an error
 // message to guess.
@@ -65,6 +65,45 @@ const (
 	// directory. Not fatal: the consumer skips that source.
 	CodeNotADirectory Code = "not_a_directory"
 
+	// CodeNotARegularFile means a fetch target exists and is not a regular file
+	// — a directory, a symlink, a socket, a FIFO or a device node — so it is
+	// refused before any transfer is attempted. Not fatal: a per-file failure,
+	// the run continues.
+	//
+	// It exists because it was measured being confused with CodePathDenied, which
+	// is where every non-regular fetch target used to be reported. The two are
+	// genuinely different causes that shared one code. CodePathDenied means the
+	// caller asked for a location this broker will not serve — outside the
+	// allowlist, spelled in a rejected form, off the pinned volume — which is a
+	// configuration error, so it ends that whole source: continuing would produce
+	// a backup silently missing a tree. This code means the caller asked for
+	// something it is entirely entitled to ask for and that is not a thing to
+	// transfer, which ends one file.
+	//
+	// The distinction is not academic, because of where the case comes from. A
+	// consumer fetches the paths a listing gave it, and a listing emits regular
+	// files only — so a fetch target that is not a regular file is a path whose
+	// kind CHANGED between the listing and the transfer. That is a per-file race,
+	// and reporting it as a configuration error made the first consumer to read
+	// this contract abort an entire source over one racing file.
+	//
+	// Nothing about what is refused changed, including for a symlink: the kind
+	// check still refuses one before any RECV, which is the whole reason the
+	// preflight uses LST2 rather than STA2. What changed is the scope a consumer
+	// reads off it, and a per-file scope is the consistent answer — the listing
+	// side already omits a symlink as a refused entry rather than as a failure of
+	// the source containing it.
+	//
+	// It is distinguished from CodeNotADirectory by which operation asked. Both
+	// report a path whose kind is wrong for what was attempted, and they are
+	// deliberately kept apart rather than merged into one "wrong kind" code:
+	// not_a_directory is a listing ROOT, and a root that is a file ends that
+	// source, while this is one FETCH target and ends one file. One code for both
+	// would put a per-source and a per-file failure behind a single value and
+	// force a consumer to recover the difference from which subcommand it
+	// happened to be running.
+	CodeNotARegularFile Code = "not_a_regular_file"
+
 	// CodePermissionDenied means one path under a root could not be read.
 	// Not fatal: the consumer warns and continues; this never ends a run.
 	CodePermissionDenied Code = "permission_denied"
@@ -101,8 +140,8 @@ func ParseCode(s string) Code {
 	case CodeNoDevice, CodeUnauthorized, CodeOffline, CodeMultipleDevices,
 		CodeNoADBServer, CodePathDenied, CodeAuditUnavailable,
 		CodeVolumeUnresolved, CodeRootNotFound, CodeNotADirectory,
-		CodePermissionDenied, CodePathNotFound, CodeTransferFailed,
-		CodeDeviceDisconnected, CodeUnsupported, CodeInternal:
+		CodeNotARegularFile, CodePermissionDenied, CodePathNotFound,
+		CodeTransferFailed, CodeDeviceDisconnected, CodeUnsupported, CodeInternal:
 		return Code(s)
 	default:
 		return CodeInternal

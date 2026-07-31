@@ -230,6 +230,51 @@ func TestFetchThatFailsMidStreamWritesNoJSONIntoThePayload(t *testing.T) {
 	}
 }
 
+// A fetch that fails BEFORE the header writes one ordinary error object and nothing else, and
+// the object is discriminated from a header exactly as a list terminator is: by carrying a
+// status member, which a header never does.
+//
+// This is the contract's most dangerous shape if a consumer gets it wrong, which is why it is
+// asserted rather than left implied. A consumer that assumes the first line of a fetch is always
+// a header decodes this object into its header struct, finds no size member, and reads zero —
+// and a zero-size header is exactly what a legitimate empty file produces, one of which exists
+// on the target device. What separates them is the trailer, which a real empty file still has
+// and this failure does not, so the two assertions below are the two halves a consumer needs:
+// the status member is present, and no framing member is.
+func TestFetchThatFailsBeforeTheHeaderWritesAnErrorObject(t *testing.T) {
+	store := newFakeStore()
+	store.fetchErr = newCodedError(errcode.CodeNotARegularFile)
+
+	got := run(t, store, "fetch", "--path", "/sdcard/DCIM/Camera")
+
+	if got.exit == 0 {
+		t.Fatal("a fetch that failed before the header exited 0")
+	}
+
+	out := lines(t, got.stdout)
+	if len(out) != 1 {
+		t.Fatalf("got %d stdout lines, want exactly one error object:\n%s", len(out), got.stdout)
+	}
+
+	obj := decode(t, out[0])
+
+	switch {
+	case obj["status"] != statusError:
+		t.Errorf("status = %v, want %q; presence of status is the only discriminator a consumer has here", obj["status"], statusError)
+
+	case obj["code"] != errcode.CodeNotARegularFile.String():
+		t.Errorf("code = %v, want %s", obj["code"], errcode.CodeNotARegularFile)
+	}
+
+	// Not a header wearing an error's clothes: neither framing member may appear, or a consumer
+	// that checked for them instead of for status would find one and read a size of zero.
+	for _, member := range []string{"op", "size"} {
+		if _, ok := obj[member]; ok {
+			t.Errorf("the error object carries the header's %q member: %s", member, out[0])
+		}
+	}
+}
+
 // An unclassified mid-stream failure must degrade to internal, which is Fatal, rather than to
 // transfer_failed, which is per-file. A consumer told "one file failed" when the real state is
 // unknown would carry on through a broken run; the safe direction is to abort.

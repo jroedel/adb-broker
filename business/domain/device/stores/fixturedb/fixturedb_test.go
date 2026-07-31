@@ -497,8 +497,35 @@ func TestFetchRefusesASymlinkBeforeAnyRead(t *testing.T) {
 	vol := pinVolume(t, st)
 
 	_, err := st.Fetch(t.Context(), devicepath.MustParseAuthorizedPath("/sdcard/DCIM/a.jpg"), vol, io.Discard, nil)
-	if got := errcode.From(err); got != errcode.CodePathDenied {
-		t.Fatalf("code = %s, want %s", got, errcode.CodePathDenied)
+	if got := errcode.From(err); got != errcode.CodeNotARegularFile {
+		t.Fatalf("code = %s, want %s", got, errcode.CodeNotARegularFile)
+	}
+}
+
+// A fetch whose target is a directory reports not_a_regular_file, matching adbsyncdb's
+// TestFetchRefusesNonRegularKinds. This is the case that was measured against the built
+// fixture binary and misread: it reported path_denied, whose action is to abandon the whole
+// source, for what is really one racing path — a listing emits regular files only, so a
+// directory arriving at a fetch means the kind changed since it was listed. Nothing about
+// what is refused changed; the two checks below assert both halves of that.
+func TestFetchRefusesADirectory(t *testing.T) {
+	dir := t.TempDir()
+
+	mustMkdirAll(t, filepath.Join(dir, "sdcard/DCIM/Camera"))
+
+	st := NewStore(dir, testBrokerVer)
+	vol := pinVolume(t, st)
+
+	_, err := st.Fetch(t.Context(), devicepath.MustParseAuthorizedPath("/sdcard/DCIM/Camera"), vol, io.Discard, nil)
+
+	code := errcode.From(err)
+
+	switch {
+	case code != errcode.CodeNotARegularFile:
+		t.Fatalf("code = %s, want %s", code, errcode.CodeNotARegularFile)
+
+	case code.Fatal():
+		t.Errorf("%s is fatal; a directory at fetch time is one file's failure and must not end a run", code)
 	}
 }
 

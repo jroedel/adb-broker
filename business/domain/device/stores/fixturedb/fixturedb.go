@@ -144,7 +144,7 @@ func WithFailAfter(n int64) Option {
 
 // WithInjectError makes every operation fail with code instead of doing anything.
 //
-// A consumer's branching on the sixteen codes is safety-critical — the difference between
+// A consumer's branching on the taxonomy's codes is safety-critical — the difference between
 // skipping one file and aborting a run — and is otherwise reachable only by contriving a
 // real device fault for each one. Injection makes each branch reachable on demand.
 func WithInjectError(code errcode.Code) Option {
@@ -480,7 +480,11 @@ func (s *Store) Fetch(_ context.Context, p devicepath.AuthorizedPath, vol device
 
 	switch {
 	case !info.Mode().IsRegular():
-		return devicebus.FetchResult{}, codeErr(errcode.CodePathDenied, nil, "%q is not a regular file, and only regular files are transferred", p.String())
+		// CodeNotARegularFile, matching adbsyncdb exactly — a fixture whose kind check
+		// classified differently from the real store would make a fixture-mode test prove
+		// something about the fixture. Nothing about what is refused changed, including
+		// for a symlink; see errcode.CodeNotARegularFile for why the scope is per-file.
+		return devicebus.FetchResult{}, codeErr(errcode.CodeNotARegularFile, nil, "%q is not a regular file, and only regular files are transferred", p.String())
 
 	case !vol.Contains(dev):
 		return devicebus.FetchResult{}, codeErr(errcode.CodePathDenied, nil, "%q is on dev=%d, not the pinned volume dev=%d", p.String(), dev, vol.Dev())

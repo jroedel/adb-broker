@@ -381,7 +381,15 @@ func (s *Store) Fetch(ctx context.Context, p devicepath.AuthorizedPath, vol devi
 
 	case !filekind.ParseKind(st.Mode).IsRegular():
 		// Refused before RECV, and RECV is what would have followed the symlink.
-		return devicebus.FetchResult{}, codeErr(errcode.CodePathDenied, nil, "%q is a %s (mode 0o%o), and only regular files are transferred", p.String(), filekind.ParseKind(st.Mode), st.Mode)
+		//
+		// CodeNotARegularFile, not CodePathDenied. What is refused here is unchanged;
+		// only the scope a consumer reads off the classification is. path_denied means
+		// the caller named a location this broker will not serve, which ends that whole
+		// source — and a listing emits regular files only, so a fetch target that is not
+		// one is a path whose kind changed between the listing and this call. That is one
+		// racing file, and reporting it as a configuration error had the first consumer of
+		// this contract refuse an entire source over it. See errcode.CodeNotARegularFile.
+		return devicebus.FetchResult{}, codeErr(errcode.CodeNotARegularFile, nil, "%q is a %s (mode 0o%o), and only regular files are transferred", p.String(), filekind.ParseKind(st.Mode), st.Mode)
 
 	case !vol.Contains(st.Dev):
 		return devicebus.FetchResult{}, codeErr(errcode.CodePathDenied, nil, "%q is on dev=%d, not the pinned volume dev=%d, so it is off shared storage", p.String(), st.Dev, vol.Dev())

@@ -115,9 +115,14 @@ func runFetch(e env, args []string) int {
 
 	case err != nil:
 		// Nothing has been written to stdout yet, so a normal error object is safe and is
-		// what a consumer can branch on. The RAW path goes to fail: the error object now
-		// carries path_b64 as well as path, and only the raw bytes can produce an
-		// authoritative one — see fromBusErrorResponse.
+		// what a consumer can branch on: no byte count has been committed to, which is the
+		// one condition that makes an object on stdout unreadable as payload. This is the
+		// contract's pre-header failure, and a consumer tells it from a header by the
+		// presence of a status member — the same discriminator a list terminator uses. See
+		// FetchHeader, where the trap for a consumer that assumes a header is recorded.
+		//
+		// The RAW path goes to fail: the error object now carries path_b64 as well as path,
+		// and only the raw bytes can produce an authoritative one — see fromBusErrorResponse.
 		return e.fail(req.Path, err)
 	}
 
@@ -153,6 +158,14 @@ func (e env) writeFailed(err error) int {
 // because a consumer that wants it has nowhere else to look: the code cannot go into a stream
 // whose length is already promised. A consumer's practical question after a truncated transfer
 // is "is the device still there", and `probe` answers that in one further invocation.
+//
+// ONLY the code= token on that line is parseable, and the specification says so rather than
+// pretending otherwise. The path is unquoted, may contain spaces, is already coerced to valid
+// UTF-8 by displayBytes, and — since a device filename may contain a newline — can even forge
+// what looks like a second code= line, which is why a consumer must take the FIRST match. A
+// path_b64= token was considered and deliberately not added: a fetch names exactly one path,
+// supplied by the caller as --path, so the path here is never news to the process reading it,
+// while the classification is the one thing it cannot learn anywhere else.
 func (e env) transferFailedMidStream(path string, err error) int {
 	code := errcode.From(err)
 	if code == "" {

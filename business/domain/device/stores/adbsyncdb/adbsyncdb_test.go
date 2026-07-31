@@ -851,6 +851,11 @@ func TestFetchZeroByteFile(t *testing.T) {
 
 // LST2 does not follow symlinks, which is the entire reason it is used here: RECV would
 // have followed it, device-side, wherever it led.
+//
+// The refusal is what matters and it is unchanged; the code it carries is
+// not_a_regular_file rather than path_denied, so a consumer skips this one file instead of
+// abandoning the source that contains it. A listing never emits a symlink, so a symlink
+// arriving at a fetch is a path whose kind changed since it was listed — one racing file.
 func TestFetchRefusesASymlinkBeforeAnyRecv(t *testing.T) {
 	st, tr := newTestStore()
 	vol := pinVolume(t, st)
@@ -861,8 +866,8 @@ func TestFetchRefusesASymlinkBeforeAnyRecv(t *testing.T) {
 	tr.fs.files[path] = []byte("this must never be read")
 
 	_, err := st.Fetch(t.Context(), devicepath.MustParseAuthorizedPath(path), vol, io.Discard, nil)
-	if got := codeOf(t, err); got != errcode.CodePathDenied {
-		t.Fatalf("code = %s, want %s", got, errcode.CodePathDenied)
+	if got := codeOf(t, err); got != errcode.CodeNotARegularFile {
+		t.Fatalf("code = %s, want %s", got, errcode.CodeNotARegularFile)
 	}
 
 	if ops := tr.opsWith("RECV"); len(ops) != 0 {
@@ -895,6 +900,11 @@ func TestFetchRefusesAnOffVolumePathBeforeAnyRecv(t *testing.T) {
 	}
 }
 
+// Every non-regular kind is refused before RECV and every one of them reports
+// not_a_regular_file. The directory case is the one that was measured against the built
+// binary and misread: it used to report path_denied, whose documented action is to abandon
+// the whole source, so a file that was regular at list time and a directory at fetch time —
+// one racing path — cost a consumer an entire tree. What is refused is unchanged.
 func TestFetchRefusesNonRegularKinds(t *testing.T) {
 	for name, mode := range map[string]uint32{
 		"directory": modeDir,
@@ -912,8 +922,8 @@ func TestFetchRefusesNonRegularKinds(t *testing.T) {
 			tr.fs.lstat[path] = statWith(mode, devMedia)
 
 			_, err := st.Fetch(t.Context(), devicepath.MustParseAuthorizedPath(path), vol, io.Discard, nil)
-			if got := codeOf(t, err); got != errcode.CodePathDenied {
-				t.Fatalf("code = %s, want %s", got, errcode.CodePathDenied)
+			if got := codeOf(t, err); got != errcode.CodeNotARegularFile {
+				t.Fatalf("code = %s, want %s", got, errcode.CodeNotARegularFile)
 			}
 
 			if ops := tr.opsWith("RECV"); len(ops) != 0 {

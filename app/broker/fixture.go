@@ -66,7 +66,7 @@ func init() {
 // The fixture build's global flags.
 //
 // These exist so a CONSUMER's error handling can be tested against the real binary rather
-// than against its own fakes. A consumer's branching on the sixteen codes is the difference
+// than against its own fakes. A consumer's branching on the taxonomy's codes is the difference
 // between skipping one file and aborting a run, and without injection each branch is
 // reachable only by contriving a matching device fault. The spec asks for both hooks for
 // exactly that reason.

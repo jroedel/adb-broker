@@ -515,6 +515,14 @@ func TestListEmitsRecordsThenExactlyOneSummaryWithoutAPathMember(t *testing.T) {
 		t.Errorf("summary = %s, want proto 1, status ok and files 2", out[2])
 	}
 
+	// files is contract rather than incidental: it is exactly the number of records that
+	// preceded the summary on this stream, which is what makes it usable as an integrity check
+	// by a consumer that counted them itself. It was unspecified until the first consumer
+	// checked it anyway and had to treat a disagreement as unactionable.
+	if want := float64(len(out) - 1); summary["files"] != want {
+		t.Errorf("files = %v, want %v, the number of records that preceded the summary", summary["files"], want)
+	}
+
 	if got.exit != 0 {
 		t.Errorf("exit = %d, want 0", got.exit)
 	}
