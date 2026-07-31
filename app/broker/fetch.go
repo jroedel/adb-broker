@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/jroedel/adb-broker/business/domain/device/devicebus"
+	"github.com/jroedel/adb-broker/business/types/errcode"
 )
 
 // runFetch streams one file to stdout, framed as a header line, the raw bytes, and a trailer
@@ -71,7 +72,10 @@ func runFetch(e env, args []string) int {
 	//
 	// A write failure inside the callback aborts the transfer before any byte moves, which
 	// is why the error is returned rather than recorded and ignored.
-	var headerErr error
+	var (
+		headerErr     error
+		headerWritten bool
+	)
 
 	writeHeader := func(info devicebus.FetchInfo) error {
 		header := FetchHeader{Proto: proto, Op: "fetch", Size: info.Size}
@@ -80,6 +84,7 @@ func runFetch(e env, args []string) int {
 
 			return err
 		}
+		headerWritten = true
 
 		return nil
 	}
@@ -89,10 +94,28 @@ func runFetch(e env, args []string) int {
 	case headerErr != nil:
 		return e.writeFailed(headerErr)
 
+	// Once the header is on stdout, NOTHING further may be written there except a
+	// trailer. An earlier version wrote a full error object here, and it corrupted the
+	// transfer rather than merely failing it: the header promises `size` bytes, so a
+	// consumer reads exactly that many — and if the transfer stopped short, those bytes
+	// are the payload's prefix followed by the first bytes of the JSON error object.
+	// Measured with `--fail-after 5` on a 42-byte file, a consumer would have written
+	// `hello` plus 37 bytes of `{"proto":1,"status":"error",…` into its staging file.
+	//
+	// So the stream simply ends. A missing trailer is already the contract's signal for a
+	// failed transfer — "a stream that ends without one is a failure whatever the byte
+	// count said" — and it is the only signal that cannot be confused with content.
+	//
+	// The classification goes to stderr and the exit code, not to stdout. A consumer that
+	// needs to know whether the device is still there runs `probe`, which answers exactly
+	// that; the alternative, encoding a code into a stream whose length is already
+	// committed, cannot be done without a framing change.
+	case err != nil && headerWritten:
+		return e.transferFailedMidStream(displayBytes(req.Path), err)
+
 	case err != nil:
-		// The header may already be on stdout with no payload behind it. That is exactly
-		// the shape a consumer is required to treat as a failed transfer: it reads fewer
-		// than size bytes, or finds no trailer, and rejects the stream.
+		// Nothing has been written to stdout yet, so a normal error object is safe and is
+		// what a consumer can branch on.
 		return e.fail(displayBytes(req.Path), err)
 	}
 
@@ -114,6 +137,28 @@ func runFetch(e env, args []string) int {
 // failed.
 func (e env) writeFailed(err error) int {
 	fmt.Fprintf(e.stderr, "adb-broker: write the transfer to stdout: %v\n", err)
+
+	return exitError
+}
+
+// transferFailedMidStream reports a fetch that failed after its header reached stdout.
+//
+// It writes NOTHING to stdout. The header has already committed to a byte count, so any
+// further object there would be read as content by a consumer counting bytes — see the
+// comment at the call site for the measured shape of that corruption.
+//
+// The classification is put on stderr in a single machine-greppable line as well as in prose,
+// because a consumer that wants it has nowhere else to look: the code cannot go into a stream
+// whose length is already promised. A consumer's practical question after a truncated transfer
+// is "is the device still there", and `probe` answers that in one further invocation.
+func (e env) transferFailedMidStream(path string, err error) int {
+	code := errcode.From(err)
+	if code == "" {
+		code = errcode.CodeTransferFailed
+	}
+
+	fmt.Fprintf(e.stderr, "adb-broker: transfer failed after the header was sent; the stream ends without a trailer\n")
+	fmt.Fprintf(e.stderr, "adb-broker: code=%s path=%s: %v\n", code, path, err)
 
 	return exitError
 }

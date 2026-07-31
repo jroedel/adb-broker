@@ -117,6 +117,38 @@ type Store struct {
 	dir           string
 	brokerVersion string
 	serial        serial.Serial
+
+	// failAfter truncates a fetch after this many bytes, or -1 to transfer whole files.
+	// Zero is meaningful — truncate before the first byte — so the disabled value cannot
+	// be zero.
+	failAfter int64
+
+	// injectError, when non-empty, is returned by every operation instead of doing it.
+	injectError errcode.Code
+}
+
+// An Option configures a fixture Store. These exist only under the fixture build tag, so
+// none of this reaches the release binary.
+type Option func(*Store)
+
+// WithFailAfter truncates a fetch after n bytes, so a consumer's truncated-transfer path can
+// be tested deliberately rather than hoped about.
+//
+// The truncation happens AFTER the size has been handed to the caller's framing callback and
+// after the header is therefore already on stdout. That is the point: it reproduces the one
+// failure shape a consumer cannot otherwise produce — a stream that promised n bytes and
+// delivered fewer — which is what makes the required-trailer rule testable at all.
+func WithFailAfter(n int64) Option {
+	return func(st *Store) { st.failAfter = n }
+}
+
+// WithInjectError makes every operation fail with code instead of doing anything.
+//
+// A consumer's branching on the sixteen codes is safety-critical — the difference between
+// skipping one file and aborting a run — and is otherwise reachable only by contriving a
+// real device fault for each one. Injection makes each branch reachable on demand.
+func WithInjectError(code errcode.Code) Option {
+	return func(st *Store) { st.injectError = code }
 }
 
 // Compile-time proof this store is usable as the Business layer's port.
@@ -124,12 +156,30 @@ var _ devicebus.Storer = (*Store)(nil)
 
 // NewStore constructs a Store serving dir as the device's filesystem. brokerVersion is
 // reported on Probe with fixtureVersionSuffix appended.
-func NewStore(dir, brokerVersion string) *Store {
-	return &Store{
+func NewStore(dir, brokerVersion string, opts ...Option) *Store {
+	st := &Store{
 		dir:           dir,
 		brokerVersion: brokerVersion,
 		serial:        serial.MustParseSerial(fixtureSerial),
+		failAfter:     -1,
 	}
+
+	for _, opt := range opts {
+		if opt != nil {
+			opt(st)
+		}
+	}
+
+	return st
+}
+
+// injected reports the error to return instead of performing an operation, or nil.
+func (s *Store) injected(op string) error {
+	if s.injectError == "" {
+		return nil
+	}
+
+	return codeErr(s.injectError, nil, "%s: error injected by fixture mode", op)
 }
 
 // mapRaw maps a raw device path string onto dir. It is used directly only for
@@ -151,6 +201,10 @@ func (s *Store) localPath(p devicepath.AuthorizedPath) string {
 // version with fixtureVersionSuffix appended, and the V2 feature set the capability gate
 // requires. Model is left empty, matching adbsyncdb, since a fixture has no shell either.
 func (s *Store) Probe(_ context.Context, ser serial.Serial) (devicebus.Device, error) {
+	if err := s.injected("probe"); err != nil {
+		return devicebus.Device{}, err
+	}
+
 	if !ser.IsZero() && ser != s.serial {
 		return devicebus.Device{}, codeErr(errcode.CodeNoDevice, nil, "the fixture serves only %q, not %q", s.serial.String(), ser.String())
 	}
@@ -211,6 +265,10 @@ func devOf(info fs.FileInfo) (int64, bool) {
 
 // List walks in.Root, emitting one FileRecord per regular file as it is discovered.
 func (s *Store) List(ctx context.Context, in devicebus.ListInput, vol devicepath.Volume, fn func(devicebus.FileRecord) error) (devicebus.ListSummary, error) {
+	if err := s.injected("list"); err != nil {
+		return devicebus.ListSummary{}, err
+	}
+
 	switch {
 	case fn == nil:
 		return devicebus.ListSummary{}, codeErr(errcode.CodeInternal, nil, "List needs a record callback")
@@ -387,6 +445,10 @@ func (s *Store) childOf(dir devicepath.AuthorizedPath, name string, summary *dev
 // the Open in which the entry could be replaced; that race is accepted rather than closed,
 // for the same reason: nothing this store's caller can do would close it either.
 func (s *Store) Fetch(_ context.Context, p devicepath.AuthorizedPath, vol devicepath.Volume, w io.Writer, before func(devicebus.FetchInfo) error) (devicebus.FetchResult, error) {
+	if err := s.injected("fetch"); err != nil {
+		return devicebus.FetchResult{}, err
+	}
+
 	switch {
 	case w == nil:
 		return devicebus.FetchResult{}, codeErr(errcode.CodeInternal, nil, "Fetch needs a destination writer")
@@ -433,6 +495,20 @@ func (s *Store) Fetch(_ context.Context, p devicepath.AuthorizedPath, vol device
 	}
 
 	digest := sha256.New()
+
+	// A truncated transfer, on demand. The header is already on stdout promising
+	// info.Size() bytes, so stopping short here produces the one shape a consumer cannot
+	// otherwise be made to face: fewer bytes than promised, followed by whatever the
+	// framing does next. That is what makes the required-trailer rule testable.
+	if s.failAfter >= 0 {
+		n, err := io.Copy(io.MultiWriter(w, digest), io.LimitReader(f, s.failAfter))
+		if err != nil {
+			return devicebus.FetchResult{}, codeErr(errcode.CodeTransferFailed, err, "read %q stopped after %d bytes", p.String(), n)
+		}
+
+		return devicebus.FetchResult{}, codeErr(errcode.CodeTransferFailed, nil,
+			"fixture mode truncated %q after %d of %d bytes", p.String(), n, info.Size())
+	}
 
 	n, err := io.Copy(io.MultiWriter(w, digest), f)
 	if err != nil {

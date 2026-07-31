@@ -2,12 +2,14 @@ package broker
 
 import (
 	"context"
+	"errors"
 	"io"
 	"strings"
 	"testing"
 
 	"github.com/jroedel/adb-broker/business/domain/device/devicebus"
 	"github.com/jroedel/adb-broker/business/types/devicepath"
+	"github.com/jroedel/adb-broker/business/types/errcode"
 	"github.com/jroedel/adb-broker/business/types/serial"
 	"github.com/jroedel/adb-broker/foundation/audit"
 )
@@ -143,4 +145,115 @@ func (c *countingWriter) Write(p []byte) (int, error) {
 	c.n += int64(len(p))
 
 	return len(p), nil
+}
+
+// truncatingStore promises a size, writes fewer bytes, then fails — the shape a real device
+// produces when storage goes away mid-transfer.
+type truncatingStore struct {
+	streamingStore
+	writeBytes int64
+	failWith   error
+}
+
+func (s *truncatingStore) Fetch(_ context.Context, _ devicepath.AuthorizedPath, _ devicepath.Volume, w io.Writer, before func(devicebus.FetchInfo) error) (devicebus.FetchResult, error) {
+	if before != nil {
+		if err := before(devicebus.FetchInfo{Size: s.size}); err != nil {
+			return devicebus.FetchResult{}, err
+		}
+	}
+
+	if _, err := io.WriteString(w, strings.Repeat("x", int(s.writeBytes))); err != nil {
+		return devicebus.FetchResult{}, err
+	}
+
+	if s.failWith != nil {
+		return devicebus.FetchResult{}, s.failWith
+	}
+
+	return devicebus.FetchResult{}, errTruncated
+}
+
+// errTruncated carries a classification, as every error a real Storer returns does — the
+// errcode.Coder contract. A fake that returned a bare error would be testing the broker's
+// fallback rather than its behaviour.
+var errTruncated error = codedTestErr{code: errcode.CodeTransferFailed}
+
+type codedTestErr struct{ code errcode.Code }
+
+func (c codedTestErr) Error() string      { return "storage went away mid-transfer" }
+func (c codedTestErr) Code() errcode.Code { return c.code }
+
+// After the header is on stdout, no further object may be written there. The header commits
+// to a byte count, so a consumer reads exactly that many bytes — and an error object appended
+// to a short payload is read as CONTENT, not as an error. Measured before this was fixed: a
+// consumer would have written 37 bytes of `{"proto":1,"status":"error",…` into its staging
+// file after a 5-byte payload.
+//
+// The stream simply ends instead. A missing trailer is already the contract's signal for a
+// failed transfer, and it is the only signal that cannot be mistaken for content.
+func TestFetchThatFailsMidStreamWritesNoJSONIntoThePayload(t *testing.T) {
+	store := &truncatingStore{
+		streamingStore: streamingStore{size: 42},
+		writeBytes:     5,
+	}
+
+	var out strings.Builder
+	var errBuf strings.Builder
+
+	logPath := newAuditLog(t)
+	swap(t, &openAuditLog, func() (*audit.Log, error) { return audit.Open(logPath) })
+	swap(t, &newStorer, func(string) devicebus.Storer { return store })
+
+	code := Main([]string{"fetch", "--path", "/sdcard/DCIM/Camera/big.mp4"}, &out, &errBuf)
+
+	if code == 0 {
+		t.Fatal("a truncated transfer exited 0")
+	}
+
+	got := out.String()
+
+	// Exactly the header line plus the five payload bytes, and nothing else.
+	const wantHeader = `{"proto":1,"op":"fetch","size":42}` + "\n"
+	if got != wantHeader+"xxxxx" {
+		t.Fatalf("stdout = %q, want the header plus exactly 5 payload bytes and nothing more", got)
+	}
+
+	// The failure must not be describable as JSON anywhere after the header.
+	if strings.Contains(got[len(wantHeader):], "{") {
+		t.Fatalf("a JSON object was written into the payload region: %q", got[len(wantHeader):])
+	}
+
+	// The classification is on stderr, greppable, since it cannot go into a stream whose
+	// length is already committed.
+	if !strings.Contains(errBuf.String(), "code=transfer_failed") {
+		t.Fatalf("stderr does not carry a machine-readable code: %q", errBuf.String())
+	}
+}
+
+// An unclassified mid-stream failure must degrade to internal, which is Fatal, rather than to
+// transfer_failed, which is per-file. A consumer told "one file failed" when the real state is
+// unknown would carry on through a broken run; the safe direction is to abort.
+func TestUnclassifiedMidStreamFailureIsFatalNotPerFile(t *testing.T) {
+	store := &truncatingStore{
+		streamingStore: streamingStore{size: 42},
+		writeBytes:     5,
+	}
+	store.failWith = errors.New("something nobody classified")
+
+	var out, errBuf strings.Builder
+
+	logPath := newAuditLog(t)
+	swap(t, &openAuditLog, func() (*audit.Log, error) { return audit.Open(logPath) })
+	swap(t, &newStorer, func(string) devicebus.Storer { return store })
+
+	if code := Main([]string{"fetch", "--path", "/sdcard/DCIM/Camera/big.mp4"}, &out, &errBuf); code == 0 {
+		t.Fatal("an unclassified truncated transfer exited 0")
+	}
+
+	if !strings.Contains(errBuf.String(), "code=internal") {
+		t.Fatalf("an unclassified failure was not reported as internal: %q", errBuf.String())
+	}
+	if !errcode.Code("internal").Fatal() {
+		t.Fatal("internal is no longer Fatal; the safe direction has changed")
+	}
 }

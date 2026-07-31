@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 
 	"github.com/jroedel/adb-broker/business/domain/device/devicebus"
 	"github.com/jroedel/adb-broker/business/domain/device/stores/fixturedb"
+	"github.com/jroedel/adb-broker/business/types/errcode"
 	"github.com/jroedel/adb-broker/foundation/audit"
 )
 
@@ -43,16 +45,42 @@ func init() {
 	// every audit record. Adding it in both places produced "0.1.0+fixture+fixture".
 	globalFlags = parseFixtureFlag
 
-	// Both read fixtureDir at call time, because it is not known until the flag is parsed.
+	// All three read their package vars at call time, because none is known until the
+	// flags are parsed.
 	newStorer = func(brokerVersion string) devicebus.Storer {
-		return fixturedb.NewStore(fixtureDir, brokerVersion)
+		var opts []fixturedb.Option
+
+		if failAfter >= 0 {
+			opts = append(opts, fixturedb.WithFailAfter(failAfter))
+		}
+		if injectError != "" {
+			opts = append(opts, fixturedb.WithInjectError(injectError))
+		}
+
+		return fixturedb.NewStore(fixtureDir, brokerVersion, opts...)
 	}
 
 	openAuditLog = func() (*audit.Log, error) { return openFixtureAuditLog() }
 }
 
-// fixtureDir is the directory served as the device, set by --fixture.
-var fixtureDir string
+// The fixture build's global flags.
+//
+// These exist so a CONSUMER's error handling can be tested against the real binary rather
+// than against its own fakes. A consumer's branching on the sixteen codes is the difference
+// between skipping one file and aborting a run, and without injection each branch is
+// reachable only by contriving a matching device fault. The spec asks for both hooks for
+// exactly that reason.
+var (
+	// fixtureDir is the directory served as the device, set by --fixture.
+	fixtureDir string
+
+	// failAfter truncates a fetch after n bytes; -1 disables it. Zero is meaningful —
+	// truncate before the first byte — so the disabled value cannot be zero.
+	failAfter int64 = -1
+
+	// injectError makes every operation fail with this code.
+	injectError errcode.Code
+)
 
 // parseFixtureFlag consumes a leading --fixture DIR (or --fixture=DIR) and returns the rest
 // of the arguments.
@@ -74,6 +102,32 @@ func parseFixtureFlag(args []string) ([]string, error) {
 		case len(arg) > 10 && arg[:10] == "--fixture=":
 			fixtureDir = arg[10:]
 			args = args[1:]
+
+		case arg == "--fail-after", arg == "-fail-after":
+			if len(args) < 2 {
+				return nil, errors.New("--fail-after needs a byte count")
+			}
+
+			n, err := strconv.ParseInt(args[1], 10, 64)
+			if err != nil || n < 0 {
+				return nil, fmt.Errorf("--fail-after wants a non-negative byte count, got %q", args[1])
+			}
+			failAfter = n
+			args = args[2:]
+
+		case arg == "--inject-error", arg == "-inject-error":
+			if len(args) < 2 {
+				return nil, errors.New("--inject-error needs an error code")
+			}
+
+			// ParseCode degrades an unknown string to internal, which would silently
+			// inject the wrong code. A typo here must be an error, not a surprise.
+			code := errcode.ParseCode(args[1])
+			if code == errcode.CodeInternal && args[1] != errcode.CodeInternal.String() {
+				return nil, fmt.Errorf("--inject-error does not recognize the code %q", args[1])
+			}
+			injectError = code
+			args = args[2:]
 
 		default:
 			// Not a global flag, so the subcommand starts here.
