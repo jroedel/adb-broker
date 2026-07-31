@@ -275,9 +275,11 @@ func captureAnchors(t *testing.T) *[]capturedAnchor {
 
 // newAuditLog creates an empty audit log in a temporary directory and returns its path.
 //
-// It is created here rather than by the broker on purpose: audit.Open does NOT pass O_CREATE,
-// because a process that can create its own audit log can also delete the real one and start a
-// fresh chain. An empty file is a valid chain of length zero.
+// It is created here rather than by the broker on purpose, and the purpose changed on
+// 2026-08-01. It used to be the only way to get one, since audit.Open does not pass O_CREATE
+// and only the installer could create a log. The broker creates its own now, so what this
+// helper provides is the EXISTING-log case specifically — see firstrun_test.go for the other
+// one. An empty file is a valid chain of length zero.
 func newAuditLog(t *testing.T) string {
 	t.Helper()
 

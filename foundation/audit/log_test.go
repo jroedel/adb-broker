@@ -3,6 +3,7 @@ package audit
 import (
 	"bufio"
 	"bytes"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -391,12 +392,123 @@ func TestOpenRejectsEditedTail(t *testing.T) {
 func TestOpenMissingFileDoesNotCreateIt(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "audit.log")
 
-	if _, err := Open(path); !errors.Is(err, ErrAuditUnavailable) {
+	_, err := Open(path)
+	if !errors.Is(err, ErrAuditUnavailable) {
 		t.Errorf("Open on a missing file = %v, want ErrAuditUnavailable", err)
 	}
 
+	// app/broker branches on exactly this to decide whether to reach Create, so the
+	// unwrapping is part of the contract rather than an implementation detail: an Open that
+	// buried os.ErrNotExist would turn every first run into audit_unavailable.
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("Open on a missing file does not unwrap to os.ErrNotExist: %v", err)
+	}
+
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("Open created %s; it must never create the audit log", path)
+		t.Errorf("Open created %s; creating one is Create's job", path)
+	}
+}
+
+func TestCreateMakesAnEmptyChainAndTheDirectoryToHoldIt(t *testing.T) {
+	// Nested and absent, which is the first-run case: no installer has been anywhere near
+	// this host, so Create makes the whole path or the broker cannot start.
+	path := filepath.Join(t.TempDir(), ".local", "state", "adb-broker", "audit.log")
+
+	l, err := Create(path)
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	defer func() { _ = l.Close() }()
+
+	if l.Seq() != 0 {
+		t.Errorf("Seq() = %d on a created log, want 0", l.Seq())
+	}
+
+	if head := l.Head(); head != ([32]byte{}) {
+		t.Errorf("Head() = %x on a created log, want 32 zero bytes", head)
+	}
+
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat the created log: %v", err)
+	}
+
+	if got := fi.Mode().Perm(); got != 0o600 {
+		t.Errorf("log mode = %o, want 600", got)
+	}
+
+	di, err := os.Stat(filepath.Dir(path))
+	if err != nil {
+		t.Fatalf("stat the created directory: %v", err)
+	}
+
+	if got := di.Mode().Perm(); got != 0o700 {
+		t.Errorf("directory mode = %o, want 700", got)
+	}
+
+	// A created log is a usable one, not merely a file: the first record chains from the
+	// zero head exactly as it would on a log the withdrawn installer had placed.
+	rec, err := l.Append(sampleRecord("probe", 1000))
+	if err != nil {
+		t.Fatalf("append to a created log: %v", err)
+	}
+
+	if rec.Seq != 1 {
+		t.Errorf("first record Seq = %d, want 1", rec.Seq)
+	}
+
+	if want := hex.EncodeToString(make([]byte, 32)); rec.Prev != want {
+		t.Errorf("first record Prev = %s, want the zero head %s", rec.Prev, want)
+	}
+}
+
+func TestCreateRefusesWhatIsAlreadyThereRatherThanTruncatingIt(t *testing.T) {
+	// The whole point of O_EXCL. A Create that adopted or truncated an existing file would
+	// be a way to lose a chain, which is the failure the append-only attribute used to make
+	// impossible and which nothing but this now prevents.
+	path := installLog(t)
+
+	l, err := Open(path)
+	if err != nil {
+		t.Fatalf("open the seeded log: %v", err)
+	}
+
+	appendSamples(t, l, 3)
+
+	if err := l.Close(); err != nil {
+		t.Fatalf("close the seeded log: %v", err)
+	}
+
+	before := readLines(t, path)
+
+	_, err = Create(path)
+	if err == nil {
+		t.Fatal("Create on an existing log succeeded; it must never adopt or truncate one")
+	}
+
+	if !errors.Is(err, os.ErrExist) {
+		// app/broker distinguishes this case to retry Open, so it must survive wrapping:
+		// two brokers starting together on a first run is an ordinary race, not a fault.
+		t.Errorf("Create on an existing log does not unwrap to os.ErrExist: %v", err)
+	}
+
+	if !errors.Is(err, ErrAuditUnavailable) {
+		t.Errorf("Create failure does not wrap ErrAuditUnavailable: %v", err)
+	}
+
+	if after := readLines(t, path); len(after) != len(before) {
+		t.Errorf("the existing log now has %d records, want its original %d", len(after), len(before))
+	}
+}
+
+func TestCreateRefusesADirectoryInTheLogsPlace(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.log")
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatalf("plant a directory: %v", err)
+	}
+
+	if _, err := Create(path); !errors.Is(err, ErrAuditUnavailable) {
+		t.Errorf("Create over a directory = %v, want ErrAuditUnavailable", err)
 	}
 }
 
