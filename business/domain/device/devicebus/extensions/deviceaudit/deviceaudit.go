@@ -123,8 +123,11 @@ func (ext *Extension) List(ctx context.Context, in devicebus.ListInput, fn func(
 // populates for exactly this purpose. Fetches are the majority of records on a
 // first run, and a record that cannot say which phone the bytes came from is not
 // evidence of much.
-func (ext *Extension) Fetch(ctx context.Context, p devicepath.AuthorizedPath, w io.Writer) (devicebus.FetchResult, error) {
-	result, err := ext.bus.Fetch(ctx, p, w)
+func (ext *Extension) Fetch(ctx context.Context, p devicepath.AuthorizedPath, w io.Writer, before func(devicebus.FetchInfo) error) (devicebus.FetchResult, error) {
+	// before is passed through untouched: it is the caller's framing hook and this
+	// extension must not observe or delay it, or the header would no longer precede
+	// the bytes it describes.
+	result, err := ext.bus.Fetch(ctx, p, w, before)
 
 	ext.append(entry{
 		op:      "fetch",

@@ -50,7 +50,7 @@ func (f *fakeStorer) List(ctx context.Context, in devicebus.ListInput, vol devic
 	return devicebus.ListSummary{}, nil
 }
 
-func (f *fakeStorer) Fetch(ctx context.Context, p devicepath.AuthorizedPath, vol devicepath.Volume, w io.Writer) (devicebus.FetchResult, error) {
+func (f *fakeStorer) Fetch(ctx context.Context, p devicepath.AuthorizedPath, vol devicepath.Volume, w io.Writer, before func(devicebus.FetchInfo) error) (devicebus.FetchResult, error) {
 	f.fetchCalledWithVol = vol
 	if f.fetchFn != nil {
 		return f.fetchFn(ctx, p, vol, w)
@@ -113,9 +113,9 @@ func (e *orderExt) List(ctx context.Context, in devicebus.ListInput, fn func(dev
 	return e.bus.List(ctx, in, fn)
 }
 
-func (e *orderExt) Fetch(ctx context.Context, p devicepath.AuthorizedPath, w io.Writer) (devicebus.FetchResult, error) {
+func (e *orderExt) Fetch(ctx context.Context, p devicepath.AuthorizedPath, w io.Writer, before func(devicebus.FetchInfo) error) (devicebus.FetchResult, error) {
 	*e.order = append(*e.order, e.name)
-	return e.bus.Fetch(ctx, p, w)
+	return e.bus.Fetch(ctx, p, w, before)
 }
 
 func newOrderExt(name string, order *[]string) devicebus.Extension {
@@ -223,7 +223,7 @@ func TestFetch_ThreadsVolume(t *testing.T) {
 
 	biz := devicebus.NewBusiness(store)
 
-	result, err := biz.Fetch(t.Context(), path, io.Discard)
+	result, err := biz.Fetch(t.Context(), path, io.Discard, nil)
 	if err != nil {
 		t.Fatalf("Fetch: unexpected error: %v", err)
 	}
@@ -259,7 +259,7 @@ func TestResolveVolume_CachedAcrossCalls(t *testing.T) {
 	if _, err := biz.List(t.Context(), devicebus.ListInput{}, func(devicebus.FileRecord) error { return nil }); err != nil {
 		t.Fatalf("List: unexpected error: %v", err)
 	}
-	if _, err := biz.Fetch(t.Context(), path, io.Discard); err != nil {
+	if _, err := biz.Fetch(t.Context(), path, io.Discard, nil); err != nil {
 		t.Fatalf("Fetch: unexpected error: %v", err)
 	}
 
@@ -334,7 +334,7 @@ func TestNewBusiness_ExtensionOrder(t *testing.T) {
 	}
 
 	order = nil
-	if _, err := biz.Fetch(t.Context(), path, io.Discard); err != nil {
+	if _, err := biz.Fetch(t.Context(), path, io.Discard, nil); err != nil {
 		t.Fatalf("Fetch: unexpected error: %v", err)
 	}
 	if want := []string{"A", "B"}; !slices.Equal(order, want) {
@@ -463,7 +463,7 @@ func TestStorerErrors_PropagateUnchanged(t *testing.T) {
 	if _, err := biz.List(t.Context(), devicebus.ListInput{}, func(devicebus.FileRecord) error { return nil }); !errors.Is(err, listErr) {
 		t.Errorf("List: err = %v, want wrapping %v", err, listErr)
 	}
-	if _, err := biz.Fetch(t.Context(), path, io.Discard); !errors.Is(err, fetchErr) {
+	if _, err := biz.Fetch(t.Context(), path, io.Discard, nil); !errors.Is(err, fetchErr) {
 		t.Errorf("Fetch: err = %v, want wrapping %v", err, fetchErr)
 	}
 }

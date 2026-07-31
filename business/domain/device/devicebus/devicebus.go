@@ -35,7 +35,7 @@ type Storer interface {
 	Probe(ctx context.Context, s serial.Serial) (Device, error)
 	ResolveVolume(ctx context.Context) (devicepath.Volume, error)
 	List(ctx context.Context, in ListInput, vol devicepath.Volume, fn func(FileRecord) error) (ListSummary, error)
-	Fetch(ctx context.Context, p devicepath.AuthorizedPath, vol devicepath.Volume, w io.Writer) (FetchResult, error)
+	Fetch(ctx context.Context, p devicepath.AuthorizedPath, vol devicepath.Volume, w io.Writer, before func(FetchInfo) error) (FetchResult, error)
 }
 
 // ExtBusiness lists every public method an extension can wrap.
@@ -51,7 +51,7 @@ type Storer interface {
 type ExtBusiness interface {
 	Probe(ctx context.Context, s serial.Serial) (Device, error)
 	List(ctx context.Context, in ListInput, fn func(FileRecord) error) (ListSummary, error)
-	Fetch(ctx context.Context, p devicepath.AuthorizedPath, w io.Writer) (FetchResult, error)
+	Fetch(ctx context.Context, p devicepath.AuthorizedPath, w io.Writer, before func(FetchInfo) error) (FetchResult, error)
 }
 
 // Extension wraps a new layer of business logic around the existing logic.
@@ -151,13 +151,17 @@ func (b *Business) List(ctx context.Context, in ListInput, fn func(FileRecord) e
 }
 
 // Fetch resolves the pinned volume and streams p's contents to w via the Storer.
-func (b *Business) Fetch(ctx context.Context, p devicepath.AuthorizedPath, w io.Writer) (FetchResult, error) {
+//
+// before is invoked with the file's size after it is stat'd and before any bytes
+// are read, so a caller can frame the stream without buffering it. Returning an
+// error from before abandons the transfer.
+func (b *Business) Fetch(ctx context.Context, p devicepath.AuthorizedPath, w io.Writer, before func(FetchInfo) error) (FetchResult, error) {
 	vol, err := b.resolveVolume(ctx)
 	if err != nil {
 		return FetchResult{}, err
 	}
 
-	result, err := b.store.Fetch(ctx, p, vol, w)
+	result, err := b.store.Fetch(ctx, p, vol, w, before)
 	if err != nil {
 		return result, err
 	}

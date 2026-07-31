@@ -1,10 +1,10 @@
 package broker
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"io"
+
+	"github.com/jroedel/adb-broker/business/domain/device/devicebus"
 )
 
 // runFetch streams one file to stdout, framed as a header line, the raw bytes, and a trailer
@@ -55,35 +55,44 @@ func runFetch(e env, args []string) int {
 		}
 	}
 
-	// The header must state the exact size BEFORE the first byte, and the Business seam
-	// offers no way to learn a file's size without transferring it: ExtBusiness has Probe,
-	// List and Fetch, FetchResult reports the byte count only after the fact, and List
-	// refuses a regular file as a listing root. So the payload is held in memory for the
-	// length of one transfer.
+	// The payload streams straight to stdout and is never held in memory. The header has
+	// to state the exact size before the first byte — that is what makes a truncated
+	// transfer detectable, since a consumer reads exactly that many bytes and then requires
+	// a trailer — so the size arrives through the seam's FetchInfo callback, which the
+	// Storer invokes after its LST2 and before its RECV.
 	//
-	// This is the one place in the package that is worse than it reads. It is not a
-	// filesystem write, so the "never write to the local filesystem" rule is intact, but the
-	// peak memory of a fetch is the size of the file — and this device holds video files
-	// large enough for that to matter. The fix is a size on the seam (a Stat on Storer and
-	// ExtBusiness, or a Size on FetchResult populated before the RECV, which the store
-	// already learns from its LST2), at which point this becomes an io.Copy straight to
-	// stdout. Do not "fix" it by writing a temp file, and do not fix it by transferring
-	// twice: a second read could see a different file, and the header would then be a
-	// measurement of something the trailer does not describe.
-	var payload bytes.Buffer
+	// Buffering instead would make the peak memory of a fetch the size of the file, on a
+	// device whose >4 GiB videos are the entire reason STAT_V2 is mandatory. The two
+	// alternatives are worse and are deliberately not taken: a temp file would break the
+	// "never write to the local filesystem" rule, and transferring twice to measure first
+	// could see a different file the second time, leaving the header describing something
+	// the trailer does not.
+	//
+	// A write failure inside the callback aborts the transfer before any byte moves, which
+	// is why the error is returned rather than recorded and ignored.
+	var headerErr error
 
-	result, err := bus.Fetch(ctx, in.path, &payload)
-	if err != nil {
+	writeHeader := func(info devicebus.FetchInfo) error {
+		header := FetchHeader{Proto: proto, Op: "fetch", Size: info.Size}
+		if err := writeJSON(e.stdout, header); err != nil {
+			headerErr = err
+
+			return err
+		}
+
+		return nil
+	}
+
+	result, err := bus.Fetch(ctx, in.path, e.stdout, writeHeader)
+	switch {
+	case headerErr != nil:
+		return e.writeFailed(headerErr)
+
+	case err != nil:
+		// The header may already be on stdout with no payload behind it. That is exactly
+		// the shape a consumer is required to treat as a failed transfer: it reads fewer
+		// than size bytes, or finds no trailer, and rejects the stream.
 		return e.fail(displayBytes(req.Path), err)
-	}
-
-	header := FetchHeader{Proto: proto, Op: "fetch", Size: result.Bytes}
-	if werr := writeJSON(e.stdout, header); werr != nil {
-		return e.writeFailed(werr)
-	}
-
-	if _, werr := io.Copy(e.stdout, &payload); werr != nil {
-		return e.writeFailed(werr)
 	}
 
 	if werr := flush(e.stdout); werr != nil {

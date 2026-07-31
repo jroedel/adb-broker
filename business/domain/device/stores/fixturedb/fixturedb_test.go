@@ -439,7 +439,7 @@ func TestFetchRegularFile(t *testing.T) {
 
 	var buf bytes.Buffer
 
-	res, err := st.Fetch(t.Context(), devicepath.MustParseAuthorizedPath("/sdcard/DCIM/a.jpg"), vol, &buf)
+	res, err := st.Fetch(t.Context(), devicepath.MustParseAuthorizedPath("/sdcard/DCIM/a.jpg"), vol, &buf, nil)
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
@@ -469,7 +469,7 @@ func TestFetchZeroByteFile(t *testing.T) {
 
 	var buf bytes.Buffer
 
-	res, err := st.Fetch(t.Context(), devicepath.MustParseAuthorizedPath("/sdcard/DCIM/empty.jpg"), vol, &buf)
+	res, err := st.Fetch(t.Context(), devicepath.MustParseAuthorizedPath("/sdcard/DCIM/empty.jpg"), vol, &buf, nil)
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
@@ -496,7 +496,7 @@ func TestFetchRefusesASymlinkBeforeAnyRead(t *testing.T) {
 	st := NewStore(dir, testBrokerVer)
 	vol := pinVolume(t, st)
 
-	_, err := st.Fetch(t.Context(), devicepath.MustParseAuthorizedPath("/sdcard/DCIM/a.jpg"), vol, io.Discard)
+	_, err := st.Fetch(t.Context(), devicepath.MustParseAuthorizedPath("/sdcard/DCIM/a.jpg"), vol, io.Discard, nil)
 	if got := errcode.From(err); got != errcode.CodePathDenied {
 		t.Fatalf("code = %s, want %s", got, errcode.CodePathDenied)
 	}
@@ -511,7 +511,7 @@ func TestFetchOfAVanishedFile(t *testing.T) {
 	st := NewStore(dir, testBrokerVer)
 	vol := pinVolume(t, st)
 
-	_, err := st.Fetch(t.Context(), devicepath.MustParseAuthorizedPath("/sdcard/DCIM/gone.jpg"), vol, io.Discard)
+	_, err := st.Fetch(t.Context(), devicepath.MustParseAuthorizedPath("/sdcard/DCIM/gone.jpg"), vol, io.Discard, nil)
 	if got := errcode.From(err); got != errcode.CodePathNotFound {
 		t.Fatalf("code = %s, want %s", got, errcode.CodePathNotFound)
 	}
@@ -805,14 +805,14 @@ func TestFetchPreconditions(t *testing.T) {
 	t.Run("nil writer", func(t *testing.T) {
 		vol := pinVolume(t, st)
 
-		_, err := st.Fetch(t.Context(), p, vol, nil)
+		_, err := st.Fetch(t.Context(), p, vol, nil, nil)
 		if got := errcode.From(err); got != errcode.CodeInternal {
 			t.Errorf("code = %s, want %s", got, errcode.CodeInternal)
 		}
 	})
 
 	t.Run("unpinned volume", func(t *testing.T) {
-		_, err := st.Fetch(t.Context(), p, devicepath.Volume{}, io.Discard)
+		_, err := st.Fetch(t.Context(), p, devicepath.Volume{}, io.Discard, nil)
 		if got := errcode.From(err); got != errcode.CodeVolumeUnresolved {
 			t.Errorf("code = %s, want %s", got, errcode.CodeVolumeUnresolved)
 		}
@@ -821,7 +821,7 @@ func TestFetchPreconditions(t *testing.T) {
 	t.Run("zero path", func(t *testing.T) {
 		vol := pinVolume(t, st)
 
-		_, err := st.Fetch(t.Context(), devicepath.AuthorizedPath{}, vol, io.Discard)
+		_, err := st.Fetch(t.Context(), devicepath.AuthorizedPath{}, vol, io.Discard, nil)
 		if got := errcode.From(err); got != errcode.CodePathDenied {
 			t.Errorf("code = %s, want %s", got, errcode.CodePathDenied)
 		}

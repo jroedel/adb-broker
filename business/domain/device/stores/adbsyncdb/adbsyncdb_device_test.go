@@ -365,14 +365,14 @@ func TestDeviceStoreFetchDigestMatchesReRead(t *testing.T) {
 
 	var buf1 bytes.Buffer
 
-	res1, err := store.Fetch(ctx, target, vol, &buf1)
+	res1, err := store.Fetch(ctx, target, vol, &buf1, nil)
 	if err != nil {
 		t.Fatalf("first Fetch(%q): %v", target.String(), err)
 	}
 
 	var buf2 bytes.Buffer
 
-	res2, err := store.Fetch(ctx, target, vol, &buf2)
+	res2, err := store.Fetch(ctx, target, vol, &buf2, nil)
 	if err != nil {
 		t.Fatalf("second Fetch(%q): %v", target.String(), err)
 	}

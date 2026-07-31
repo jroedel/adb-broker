@@ -165,7 +165,7 @@ func (f *fakeExtBusiness) List(_ context.Context, in devicebus.ListInput, fn fun
 	return devicebus.ListSummary{}, nil
 }
 
-func (f *fakeExtBusiness) Fetch(_ context.Context, p devicepath.AuthorizedPath, w io.Writer) (devicebus.FetchResult, error) {
+func (f *fakeExtBusiness) Fetch(_ context.Context, p devicepath.AuthorizedPath, w io.Writer, _ func(devicebus.FetchInfo) error) (devicebus.FetchResult, error) {
 	if f.fetchFn != nil {
 		return f.fetchFn(p, w)
 	}
@@ -231,7 +231,7 @@ func TestFetch_Success_RecordsBytesAndSHA256(t *testing.T) {
 
 	ext := NewExtension(log, 1000, "user@example.com")(fake)
 
-	if _, err := ext.Fetch(t.Context(), p, io.Discard); err != nil {
+	if _, err := ext.Fetch(t.Context(), p, io.Discard, nil); err != nil {
 		t.Fatalf("Fetch: unexpected error: %v", err)
 	}
 
@@ -365,7 +365,7 @@ func TestFailedOperations_StillAppendAndReturnErrorUnchanged(t *testing.T) {
 
 		ext := NewExtension(log, 1, "x")(fake)
 
-		_, err := ext.Fetch(t.Context(), p, io.Discard)
+		_, err := ext.Fetch(t.Context(), p, io.Discard, nil)
 		if !errors.Is(err, sentinel) {
 			t.Fatalf("Fetch: err = %v, want wrapping %v", err, sentinel)
 		}
@@ -455,7 +455,7 @@ func TestChain_ValidAfterMixedOperations(t *testing.T) {
 	if _, err := ext.List(t.Context(), devicebus.ListInput{Root: root}, func(devicebus.FileRecord) error { return nil }); !errors.Is(err, sentinel) {
 		t.Fatalf("List: err = %v, want wrapping %v", err, sentinel)
 	}
-	if _, err := ext.Fetch(t.Context(), fetchPath, io.Discard); err != nil {
+	if _, err := ext.Fetch(t.Context(), fetchPath, io.Discard, nil); err != nil {
 		t.Fatalf("Fetch: unexpected error: %v", err)
 	}
 
@@ -500,7 +500,7 @@ func TestPathB64_RoundTripsInvalidUTF8(t *testing.T) {
 
 	ext := NewExtension(log, 1, "x")(fake)
 
-	if _, err := ext.Fetch(t.Context(), p, io.Discard); err != nil {
+	if _, err := ext.Fetch(t.Context(), p, io.Discard, nil); err != nil {
 		t.Fatalf("Fetch: unexpected error: %v", err)
 	}
 
@@ -603,10 +603,10 @@ func (e *passThroughExt) List(ctx context.Context, in devicebus.ListInput, fn fu
 	return e.bus.List(ctx, in, fn)
 }
 
-func (e *passThroughExt) Fetch(ctx context.Context, p devicepath.AuthorizedPath, w io.Writer) (devicebus.FetchResult, error) {
+func (e *passThroughExt) Fetch(ctx context.Context, p devicepath.AuthorizedPath, w io.Writer, before func(devicebus.FetchInfo) error) (devicebus.FetchResult, error) {
 	*e.calls = append(*e.calls, e.name)
 
-	return e.bus.Fetch(ctx, p, w)
+	return e.bus.Fetch(ctx, p, w, before)
 }
 
 func newPassThroughExt(name string, calls *[]string) devicebus.Extension {
@@ -633,7 +633,7 @@ func (f *fakeStorer) List(_ context.Context, _ devicebus.ListInput, _ devicepath
 	return devicebus.ListSummary{}, nil
 }
 
-func (f *fakeStorer) Fetch(_ context.Context, _ devicepath.AuthorizedPath, _ devicepath.Volume, _ io.Writer) (devicebus.FetchResult, error) {
+func (f *fakeStorer) Fetch(_ context.Context, _ devicepath.AuthorizedPath, _ devicepath.Volume, _ io.Writer, _ func(devicebus.FetchInfo) error) (devicebus.FetchResult, error) {
 	return devicebus.FetchResult{}, nil
 }
 

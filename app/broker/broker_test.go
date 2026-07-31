@@ -143,7 +143,7 @@ func (f *fakeStore) List(_ context.Context, in devicebus.ListInput, _ devicepath
 	return summary, f.listErr
 }
 
-func (f *fakeStore) Fetch(_ context.Context, p devicepath.AuthorizedPath, _ devicepath.Volume, w io.Writer) (devicebus.FetchResult, error) {
+func (f *fakeStore) Fetch(_ context.Context, p devicepath.AuthorizedPath, _ devicepath.Volume, w io.Writer, before func(devicebus.FetchInfo) error) (devicebus.FetchResult, error) {
 	f.touched = true
 	f.fetchPath = p.String()
 
@@ -152,6 +152,16 @@ func (f *fakeStore) Fetch(_ context.Context, p devicepath.AuthorizedPath, _ devi
 	}
 
 	digest := sha256.Sum256(f.payload)
+
+	// A real Storer stats the file and hands the size over before reading a byte, which
+	// is how the caller frames the stream without buffering it. A fake that skipped this
+	// would let a regression in the framing pass unnoticed, so it mirrors the real order:
+	// size first, then bytes, and a refusal here transfers nothing.
+	if before != nil {
+		if err := before(devicebus.FetchInfo{Size: int64(len(f.payload))}); err != nil {
+			return devicebus.FetchResult{}, err
+		}
+	}
 
 	n, err := w.Write(f.payload)
 	if err != nil {

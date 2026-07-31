@@ -328,7 +328,7 @@ func (s *Store) List(ctx context.Context, in devicebus.ListInput, vol devicepath
 // closed here, and it is accepted rather than papered over: an adversary already running
 // code on the device has better options than racing this broker. Do not read the check
 // below as stronger than it is.
-func (s *Store) Fetch(ctx context.Context, p devicepath.AuthorizedPath, vol devicepath.Volume, w io.Writer) (devicebus.FetchResult, error) {
+func (s *Store) Fetch(ctx context.Context, p devicepath.AuthorizedPath, vol devicepath.Volume, w io.Writer, before func(devicebus.FetchInfo) error) (devicebus.FetchResult, error) {
 	switch {
 	case w == nil:
 		return devicebus.FetchResult{}, codeErr(errcode.CodeInternal, nil, "Fetch needs a destination writer")
@@ -367,6 +367,15 @@ func (s *Store) Fetch(ctx context.Context, p devicepath.AuthorizedPath, vol devi
 
 	case !vol.Contains(st.Dev):
 		return devicebus.FetchResult{}, codeErr(errcode.CodePathDenied, nil, "%q is on dev=%d, not the pinned volume dev=%d, so it is off shared storage", p.String(), st.Dev, vol.Dev())
+	}
+
+	// The size is known from the LST2 above and is handed over before a single byte
+	// moves, so a caller can frame the stream instead of buffering it. Refusing here
+	// abandons the transfer, which is why this runs before RECV rather than after.
+	if before != nil {
+		if err := before(devicebus.FetchInfo{Size: st.Size}); err != nil {
+			return devicebus.FetchResult{}, err
+		}
 	}
 
 	digest := sha256.New()

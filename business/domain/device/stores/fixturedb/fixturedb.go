@@ -386,7 +386,7 @@ func (s *Store) childOf(dir devicepath.AuthorizedPath, name string, summary *dev
 // using Lstat rather than Stat. As in adbsyncdb, there is a window between the Lstat and
 // the Open in which the entry could be replaced; that race is accepted rather than closed,
 // for the same reason: nothing this store's caller can do would close it either.
-func (s *Store) Fetch(_ context.Context, p devicepath.AuthorizedPath, vol devicepath.Volume, w io.Writer) (devicebus.FetchResult, error) {
+func (s *Store) Fetch(_ context.Context, p devicepath.AuthorizedPath, vol devicepath.Volume, w io.Writer, before func(devicebus.FetchInfo) error) (devicebus.FetchResult, error) {
 	switch {
 	case w == nil:
 		return devicebus.FetchResult{}, codeErr(errcode.CodeInternal, nil, "Fetch needs a destination writer")
@@ -423,6 +423,14 @@ func (s *Store) Fetch(_ context.Context, p devicepath.AuthorizedPath, vol device
 		return devicebus.FetchResult{}, codeErr(codeForFetchStatErr(err), err, "open %q", p.String())
 	}
 	defer f.Close()
+
+	// Handed over before a byte moves, from the same Lstat the confinement checks used,
+	// so a caller frames the stream rather than buffering it. Mirrors adbsyncdb.
+	if before != nil {
+		if err := before(devicebus.FetchInfo{Size: info.Size()}); err != nil {
+			return devicebus.FetchResult{}, err
+		}
+	}
 
 	digest := sha256.New()
 

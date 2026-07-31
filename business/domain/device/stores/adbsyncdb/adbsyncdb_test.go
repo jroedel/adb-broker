@@ -737,7 +737,7 @@ func TestFetchRegularFile(t *testing.T) {
 
 	var buf bytes.Buffer
 
-	res, err := st.Fetch(t.Context(), devicepath.MustParseAuthorizedPath(path), vol, &buf)
+	res, err := st.Fetch(t.Context(), devicepath.MustParseAuthorizedPath(path), vol, &buf, nil)
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
@@ -765,7 +765,7 @@ func TestFetchZeroByteFile(t *testing.T) {
 
 	var buf bytes.Buffer
 
-	res, err := st.Fetch(t.Context(), devicepath.MustParseAuthorizedPath(path), vol, &buf)
+	res, err := st.Fetch(t.Context(), devicepath.MustParseAuthorizedPath(path), vol, &buf, nil)
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
@@ -789,7 +789,7 @@ func TestFetchRefusesASymlinkBeforeAnyRecv(t *testing.T) {
 	tr.fs.lstat[path] = statWith(modeSymlink, devMedia)
 	tr.fs.files[path] = []byte("this must never be read")
 
-	_, err := st.Fetch(t.Context(), devicepath.MustParseAuthorizedPath(path), vol, io.Discard)
+	_, err := st.Fetch(t.Context(), devicepath.MustParseAuthorizedPath(path), vol, io.Discard, nil)
 	if got := codeOf(t, err); got != errcode.CodePathDenied {
 		t.Fatalf("code = %s, want %s", got, errcode.CodePathDenied)
 	}
@@ -810,7 +810,7 @@ func TestFetchRefusesAnOffVolumePathBeforeAnyRecv(t *testing.T) {
 	tr.fs.lstat[path] = regularStat(10, devData)
 	tr.fs.files[path] = []byte("this must never be read")
 
-	_, err := st.Fetch(t.Context(), devicepath.MustParseAuthorizedPath(path), vol, io.Discard)
+	_, err := st.Fetch(t.Context(), devicepath.MustParseAuthorizedPath(path), vol, io.Discard, nil)
 	if got := codeOf(t, err); got != errcode.CodePathDenied {
 		t.Fatalf("code = %s, want %s", got, errcode.CodePathDenied)
 	}
@@ -840,7 +840,7 @@ func TestFetchRefusesNonRegularKinds(t *testing.T) {
 
 			tr.fs.lstat[path] = statWith(mode, devMedia)
 
-			_, err := st.Fetch(t.Context(), devicepath.MustParseAuthorizedPath(path), vol, io.Discard)
+			_, err := st.Fetch(t.Context(), devicepath.MustParseAuthorizedPath(path), vol, io.Discard, nil)
 			if got := codeOf(t, err); got != errcode.CodePathDenied {
 				t.Fatalf("code = %s, want %s", got, errcode.CodePathDenied)
 			}
@@ -872,7 +872,7 @@ func TestFetchMapsInBandErrnos(t *testing.T) {
 
 			tr.fs.lstat[path] = adbwire.Stat{Errno: tc.errno}
 
-			_, err := st.Fetch(t.Context(), devicepath.MustParseAuthorizedPath(path), vol, io.Discard)
+			_, err := st.Fetch(t.Context(), devicepath.MustParseAuthorizedPath(path), vol, io.Discard, nil)
 			if got := codeOf(t, err); got != tc.want {
 				t.Errorf("code = %s, want %s", got, tc.want)
 			}
@@ -901,7 +901,7 @@ func TestFetchRecvFailureReconnectsOnce(t *testing.T) {
 
 	dialsBefore := tr.dials
 
-	_, err := st.Fetch(t.Context(), devicepath.MustParseAuthorizedPath(bad), vol, io.Discard)
+	_, err := st.Fetch(t.Context(), devicepath.MustParseAuthorizedPath(bad), vol, io.Discard, nil)
 	if got := codeOf(t, err); got != errcode.CodeTransferFailed {
 		t.Fatalf("code = %s, want %s", got, errcode.CodeTransferFailed)
 	}
@@ -916,7 +916,7 @@ func TestFetchRecvFailureReconnectsOnce(t *testing.T) {
 	// The whole point of the rebuild: the next operation works.
 	var buf bytes.Buffer
 
-	res, err := st.Fetch(t.Context(), devicepath.MustParseAuthorizedPath(good), vol, &buf)
+	res, err := st.Fetch(t.Context(), devicepath.MustParseAuthorizedPath(good), vol, &buf, nil)
 	if err != nil {
 		t.Fatalf("Fetch after reconnect: %v", err)
 	}
@@ -940,7 +940,7 @@ func TestFetchDestinationFailure(t *testing.T) {
 	tr.fs.lstat[path] = regularStat(4, devMedia)
 	tr.fs.files[path] = []byte("body")
 
-	_, err := st.Fetch(t.Context(), devicepath.MustParseAuthorizedPath(path), vol, failWriter{})
+	_, err := st.Fetch(t.Context(), devicepath.MustParseAuthorizedPath(path), vol, failWriter{}, nil)
 	if got := codeOf(t, err); got != errcode.CodeTransferFailed {
 		t.Errorf("code = %s, want %s", got, errcode.CodeTransferFailed)
 	}
@@ -953,7 +953,7 @@ func (failWriter) Write([]byte) (int, error) { return 0, errors.New("destination
 func TestFetchRequiresAPinnedVolume(t *testing.T) {
 	st, _ := newTestStore()
 
-	_, err := st.Fetch(t.Context(), devicepath.MustParseAuthorizedPath(testRoot+"/a.jpg"), devicepath.Volume{}, io.Discard)
+	_, err := st.Fetch(t.Context(), devicepath.MustParseAuthorizedPath(testRoot+"/a.jpg"), devicepath.Volume{}, io.Discard, nil)
 	if got := codeOf(t, err); got != errcode.CodeVolumeUnresolved {
 		t.Errorf("code = %s, want %s", got, errcode.CodeVolumeUnresolved)
 	}
@@ -963,7 +963,7 @@ func TestFetchRefusesTheZeroPath(t *testing.T) {
 	st, _ := newTestStore()
 	vol := pinVolume(t, st)
 
-	_, err := st.Fetch(t.Context(), devicepath.AuthorizedPath{}, vol, io.Discard)
+	_, err := st.Fetch(t.Context(), devicepath.AuthorizedPath{}, vol, io.Discard, nil)
 	if got := codeOf(t, err); got != errcode.CodePathDenied {
 		t.Errorf("code = %s, want %s", got, errcode.CodePathDenied)
 	}
@@ -1000,7 +1000,7 @@ func TestOutboundVocabularyIsClosed(t *testing.T) {
 		t.Fatalf("List: %v", err)
 	}
 
-	if _, err := st.Fetch(t.Context(), devicepath.MustParseAuthorizedPath(testRoot+"/Camera/IMG_0001.jpg"), vol, io.Discard); err != nil {
+	if _, err := st.Fetch(t.Context(), devicepath.MustParseAuthorizedPath(testRoot+"/Camera/IMG_0001.jpg"), vol, io.Discard, nil); err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}
 

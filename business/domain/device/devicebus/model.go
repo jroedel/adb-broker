@@ -64,6 +64,24 @@ type ListSummary struct {
 	Volume devicepath.Volume
 }
 
+// FetchInfo is what a Fetch knows about a file BEFORE any of its bytes move.
+//
+// It exists so a caller can frame a stream without buffering it. The wire format
+// requires the exact size to be stated ahead of the first byte, and a consumer
+// reads exactly that many bytes and then requires a trailer -- which is how a
+// truncated transfer is detectable at all. Without a size up front the only ways
+// to satisfy that are to buffer the whole payload in memory or to transfer twice,
+// and this device holds videos over 4 GiB. The size being 64-bit is the entire
+// reason STAT_V2 is mandatory, so buffering one in memory to learn it would be a
+// poor joke.
+//
+// The Storer calls the callback after it has stat'd the file and before it reads
+// any data. If the callback returns an error the transfer is abandoned, so a
+// caller that cannot accept the size never receives bytes it cannot frame.
+type FetchInfo struct {
+	Size int64
+}
+
 // FetchResult reports what was transferred by one Fetch call.
 type FetchResult struct {
 	Bytes  int64
