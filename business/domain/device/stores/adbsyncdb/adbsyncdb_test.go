@@ -652,6 +652,79 @@ func TestProbeCarriesTheStateTokenIntoTheFailure(t *testing.T) {
 	}
 }
 
+// The attached-device count comes from the host:devices reply the session already parsed to
+// select a device, and from nowhere else.
+//
+// The point of the test is the two negatives. It must not be the number of devices that
+// matched the requested serial — a consumer reading it that way would see 1 with two phones
+// plugged in and then omit --serial on every fetch, which is exactly the ambiguity the count
+// exists to reveal. And it must not cost a second request: the whole reason this is reported
+// at probe time rather than asked for is that the reply was already in hand.
+func TestProbeCountsTheDeviceListItAlreadyRead(t *testing.T) {
+	third := "EXAMPLESERIAL3"
+
+	tests := []struct {
+		name    string
+		devices []adbwire.DeviceEntry
+		want    serial.Serial
+		count   int
+	}{
+		{
+			name:    "one attached device",
+			devices: []adbwire.DeviceEntry{{Serial: testSerial, State: "device"}},
+			count:   1,
+		},
+		{
+			name: "a named device among three",
+			devices: []adbwire.DeviceEntry{
+				{Serial: otherSerial, State: "device"},
+				{Serial: testSerial, State: "device"},
+				{Serial: third, State: "device"},
+			},
+			want:  serial.MustParseSerial(testSerial),
+			count: 3,
+		},
+		{
+			// Measured: host:devices lists a phone that is attached but not usable, with
+			// its state token. Such a device is counted, because a fetch naming no serial
+			// would still be ambiguous with it plugged in — the count answers "could this
+			// be ambiguous", never "how many devices could be served".
+			name: "an unauthorized phone still counts as attached",
+			devices: []adbwire.DeviceEntry{
+				{Serial: testSerial, State: "device"},
+				{Serial: otherSerial, State: "unauthorized"},
+			},
+			want:  serial.MustParseSerial(testSerial),
+			count: 2,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			st, tr := newTestStore()
+			tr.devices = tc.devices
+			for _, e := range tc.devices {
+				tr.features[e.Serial] = tr.features[testSerial]
+			}
+
+			dev, err := st.Probe(t.Context(), tc.want)
+			if err != nil {
+				t.Fatalf("Probe: %v", err)
+			}
+
+			if dev.AttachedDevices != tc.count {
+				t.Errorf("AttachedDevices = %d, want %d: the count is of the whole device list", dev.AttachedDevices, tc.count)
+			}
+
+			// One reply, counted once. A second host:devices here would be a request for a
+			// number the session had already been told.
+			if ops := tr.opsWith("host:devices"); len(ops) != 1 {
+				t.Errorf("host:devices ops = %v, want exactly one: the count comes from the reply already read", ops)
+			}
+		})
+	}
+}
+
 func TestProbeReusesOneSession(t *testing.T) {
 	st, tr := newTestStore()
 

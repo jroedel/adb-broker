@@ -1,6 +1,7 @@
 package audit
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -44,6 +45,21 @@ const (
 // journalSocketPath is the journald datagram socket. It is a variable, not a
 // constant, only so tests can point it at a temporary socket; the exported API
 // deliberately offers no way to change it.
+//
+// That last clause survived a proposal to relax it, and the reasoning is recorded
+// here because the pressure will come back. app/broker's tests were publishing REAL
+// anchors into the host's journal — 3,321 of them, stamped _EXE=broker.test and
+// _EXE=deviceaudit.test — and the direct fix looked like letting a test in another
+// package repoint this socket at a temporary one. Go offers no way to do that
+// without an exported setter, and an exported setter is a production API for aiming
+// the broker's anchors wherever the caller likes: the single control against a
+// truncated tail, made redirectable by whoever invokes the binary. Rejected.
+//
+// The seam used instead is narrower and sits where the wiring already sits: the act
+// of anchoring is a parameter of the audit extension (deviceaudit.AnchorFunc), held
+// in an unexported package variable inside app/broker alongside openAuditLog and
+// newStorer. A test replaces what the process it drives does; nothing outside this
+// package can move this path.
 var journalSocketPath = "/run/systemd/journal/socket"
 
 // ErrAnchorField reports that an anchor field value was refused before any
@@ -134,6 +150,48 @@ func WriteAnchor(a Anchor) error {
 
 	if _, err := conn.Write(payload); err != nil {
 		return fmt.Errorf("audit: %w: send anchor seq %d: %w", ErrAuditUnavailable, a.Seq, err)
+	}
+
+	return nil
+}
+
+// AnchorTail publishes an anchor of l's tail as it stands now.
+//
+// It exists so the Anchor for a live log is built in exactly ONE place. Every caller
+// wants the same three values — Seq(), Head() hex-encoded, Path() — and a second
+// hand-rolled literal elsewhere is how one of them ends up publishing a raw [32]byte
+// where hex belongs, or naming the wrong file, in a control nobody exercises until
+// the day it is needed. There are two callers already: the devicebus audit extension,
+// which anchors after every recorded operation, and the broker's flag-boundary
+// denial, which appends a record no extension on the bus can see.
+//
+// The error names the log, the sequence number that went unanchored, and what that
+// costs. That wording is here rather than at each call site because both callers are
+// contractually forbidden from failing the operation over it — the record the anchor
+// would describe is already durably written to the hash-chained log — so the error's
+// only destination is an operator's stderr, and two hand-written spellings of one
+// diagnostic drift. A caller that discards it entirely leaves a permanently broken
+// anchor path invisible, which is precisely what the first setuid install did: the
+// log grew, every audit control held, and not one anchor was ever published.
+//
+// Seq and Head are read under two separate locks, so this must not run concurrently
+// with Append on the same log: an Append landing between the two reads would publish
+// the NEW sequence number against the OLD head, and verify reports that combination
+// as an altered tail record — a false alarm on the loudest control there is. Nothing
+// in this binary does that (one argv, one operation, one goroutine), and *Log offers
+// no single accessor for the pair. If a concurrent appender ever appears, that
+// accessor is the fix, not a lock wrapped around this function.
+func AnchorTail(l *Log) error {
+	head := l.Head()
+
+	a := Anchor{
+		Seq:     l.Seq(),
+		Hash:    hex.EncodeToString(head[:]),
+		LogPath: l.Path(),
+	}
+
+	if err := WriteAnchor(a); err != nil {
+		return fmt.Errorf("audit: publish an anchor for %s at seq %d, the only control against a truncated tail: %w", a.LogPath, a.Seq, err)
 	}
 
 	return nil

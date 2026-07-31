@@ -45,12 +45,24 @@ var emptyChainHead = strings.Repeat("0", hashHexLen)
 // detectable by recomputation, but an adversary who can write the file can recompute a
 // shorter chain that verifies perfectly. Only the anchor — published to a log the broker's
 // uid cannot rewrite — says which sequence number the file once held.
+//
+// On a setuid install there is exactly ONE workable way to give it anchors, and it is the
+// pipe: journalctl run as root, its JSON fed to --anchors -. The reason is structural, not a
+// missing feature, and it is spelled out on anchorFilter — the same threat-model decision
+// that keeps the broker's uid out of the systemd-journal group also keeps it from opening
+// /var/log/journal, so the --anchors <file|glob> form cannot read what it is pointed at.
+// Naming a glob is still accepted, because an operator with a journal export the broker CAN
+// read is a legitimate case; it is simply not the install this binary ships into.
 func runVerify(e env, args []string) int {
 	req := VerifyRequest{LogPath: auditLogPath}
 
 	fs := newFlagSet("verify", e.stderr)
 	fs.StringVar(&req.LogPath, "log", auditLogPath, "the audit log to verify")
-	fs.StringVar(&req.AnchorsPath, "anchors", "", `journal file or glob to read anchors from, or "-" for newline-delimited JSON anchors on stdin`)
+	fs.StringVar(&req.AnchorsPath, "anchors", "",
+		`"-" reads newline-delimited JSON anchors on stdin, which is the only form that works on a `+
+			`setuid install: run "journalctl -o json MESSAGE_ID=`+audit.MessageID+`" as root and pipe it in. `+
+			`A journal file or glob is also accepted, but only where THIS process can read the journal `+
+			`files, which the broker's own uid deliberately cannot`)
 
 	if exit, ok := e.bindFlags(fs, args); !ok {
 		return exit
@@ -223,6 +235,25 @@ func anchorFields(in verifyInput, filter journal.Filter) ([]map[string]string, e
 // Exe is the running binary's own path, from /proc/self/exe, which journald recorded the same
 // way. A verify run from a copy of the binary elsewhere therefore finds no anchors and says
 // so, rather than accepting anchors it cannot attribute to this install.
+//
+// This filter is also why --anchors cannot usefully name a journal FILE on the installed
+// host, and the arithmetic is worth writing down because it looks like a bug and is not one:
+//
+//   - Under setuid, os.Geteuid() is the broker's own uid, which is correct — those are the
+//     anchors — but that uid is deliberately NOT in the systemd-journal group, because
+//     granting it read access to every service's logs on the host was declined in the threat
+//     model. /var/log/journal/*/*.journal is root:systemd-journal 0640, so journal.Open
+//     cannot read it. That grant stays declined; the pipe form exists so it can.
+//   - Running verify as root does not help. The setuid bit sets the effective uid from the
+//     file's owner whoever invokes it, so os.Geteuid() is still the broker's uid; and were it
+//     somehow 0, this filter would select _UID=0 and match none of the anchors the broker
+//     published.
+//
+// The filter has been exercised against a real journal and did its job: of 3,365 entries
+// carrying this MESSAGE_ID, it discarded all of them — every test-suite anchor and the one
+// deliberately forged from python3.12 — because not one bore the installed binary's identity.
+// Weakening the _UID rule to make the file form work would trade the only property that makes
+// an anchor evidence for the convenience of not typing journalctl.
 func anchorFilter() (journal.Filter, error) {
 	exe, err := os.Executable()
 	if err != nil {
@@ -295,10 +326,17 @@ func isChainHash(s string) bool {
 // returns the fields of the ones that pass the same trust filter journal.Entries applies.
 //
 // This form exists so an operator can verify on a host where the broker's own uid cannot read
-// the journal files, which are root:systemd-journal 0640. It is an alternative INPUT PATH,
-// never a relaxation: the _UID and _EXE rules are applied here exactly as they are applied to
-// a journal file, because a source of anchors that skipped them would be a way around the one
-// rule that makes an anchor mean anything.
+// the journal files, which are root:systemd-journal 0640 — that is, on every host this binary
+// is installed setuid on, which makes it the primary path rather than the fallback it was
+// first drafted as. The reader runs as root and the broker stays at its own effective uid:
+//
+//	journalctl -o json MESSAGE_ID=8f3c1d7a5e4b42c9b1d06a2f7c93e5a4 | adb-broker verify --anchors -
+//
+// It is an alternative INPUT PATH, never a relaxation: the _UID and _EXE rules are applied
+// here exactly as they are applied to a journal file, because a source of anchors that skipped
+// them would be a way around the one rule that makes an anchor mean anything. Piping in
+// entries as root does not make them trustworthy — journald stamped _UID and _EXE at publish
+// time and this reader still requires both to be the broker's own.
 func readAnchorLines(r io.Reader, filter journal.Filter) ([]map[string]string, error) {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64<<10), maxAnchorLineBytes)

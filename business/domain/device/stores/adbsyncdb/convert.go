@@ -28,12 +28,19 @@ import (
 // caller, and it needs the raw token to say why, so it is carried rather than mapped: adb's
 // FAIL prose is measured to be identical for several different failures, which makes the
 // state token the only structured signal about device state the protocol offers.
+// attachedDevices is how many entries the host:devices reply carried, counted from the
+// reply this store had already read in order to select a device. It is a native int and
+// nothing here interprets it: the count is of every entry, including devices in states this
+// broker cannot serve, and including the ones a requested serial did not match. See
+// devicebus.Device.AttachedDevices for what a consumer may conclude from it, which is less
+// than it looks.
 type deviceRow struct {
-	serial        string
-	state         string
-	serverVersion string
-	brokerVersion string
-	features      []string
+	serial          string
+	state           string
+	serverVersion   string
+	brokerVersion   string
+	features        []string
+	attachedDevices int
 }
 
 // toSyncPath renders an AuthorizedPath as the sync protocol carries it: the raw device
@@ -79,6 +86,12 @@ func toBusFileRecord(p devicepath.AuthorizedPath, st adbwire.Stat) (devicebus.Fi
 // Model is left empty. It is not obtainable over this transport — reading it needs a
 // shell, and there is no shell in this binary — so the field stays empty rather than being
 // filled from an invented source that the audit record would then carry as fact.
+//
+// attachedDevices crosses as the int it already is. It is the one field here with no
+// parsing step, because there is nothing to parse: the transport counted its own device
+// list and a count has no invalid spelling. It is copied rather than recomputed — this
+// converter has no device list to count, and giving it one would mean a second
+// host:devices request for a number the session already knew.
 func toBusDevice(row deviceRow) (devicebus.Device, error) {
 	ser, err := serial.ParseSerial(row.serial)
 	if err != nil {
@@ -91,11 +104,12 @@ func toBusDevice(row deviceRow) (devicebus.Device, error) {
 	copy(features, row.features)
 
 	return devicebus.Device{
-		Serial:        ser,
-		State:         row.state,
-		Model:         "",
-		BrokerVersion: row.brokerVersion,
-		ServerVersion: row.serverVersion,
-		Features:      features,
+		Serial:          ser,
+		State:           row.state,
+		Model:           "",
+		BrokerVersion:   row.brokerVersion,
+		ServerVersion:   row.serverVersion,
+		Features:        features,
+		AttachedDevices: row.attachedDevices,
 	}, nil
 }

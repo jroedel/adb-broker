@@ -119,11 +119,12 @@ func TestToBusFileRecord(t *testing.T) {
 
 func TestToBusDevice(t *testing.T) {
 	row := deviceRow{
-		serial:        testSerial,
-		state:         "device",
-		serverVersion: testServerVer,
-		brokerVersion: testBrokerVer,
-		features:      []string{"stat_v2", "ls_v2", "sendrecv_v2"},
+		serial:          testSerial,
+		state:           "device",
+		serverVersion:   testServerVer,
+		brokerVersion:   testBrokerVer,
+		features:        []string{"stat_v2", "ls_v2", "sendrecv_v2"},
+		attachedDevices: 2,
 	}
 
 	t.Run("natives become the model", func(t *testing.T) {
@@ -145,6 +146,26 @@ func TestToBusDevice(t *testing.T) {
 			t.Errorf("Model = %q, want empty: reading it needs a shell, and there is none", dev.Model)
 		case !slices.Equal(dev.Features, row.features):
 			t.Errorf("Features = %v, want %v", dev.Features, row.features)
+		}
+	})
+
+	t.Run("the attached-device count crosses unchanged", func(t *testing.T) {
+		// Copied, never recomputed: this converter has no device list, and the row's count
+		// came from the one the session had already read. It is also not clamped to 1 for a
+		// row whose serial is the selected device's — the count is of the list, not of the
+		// selection.
+		for _, n := range []int{1, 2, 7} {
+			r := row
+			r.attachedDevices = n
+
+			dev, err := toBusDevice(r)
+			if err != nil {
+				t.Fatalf("toBusDevice: %v", err)
+			}
+
+			if dev.AttachedDevices != n {
+				t.Errorf("AttachedDevices = %d, want %d", dev.AttachedDevices, n)
+			}
 		}
 	})
 

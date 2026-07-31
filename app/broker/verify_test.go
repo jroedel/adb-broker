@@ -362,6 +362,49 @@ func TestVerifySkipsBlankLinesAndUnrelatedEntries(t *testing.T) {
 	}
 }
 
+// The anchor a run actually publishes is one verify accepts, from both of the two paths that
+// append to the log.
+//
+// Every other test in this file hands verify an anchor a test constructed. This one takes what
+// the broker itself published, renders it exactly as journalctl would, and feeds it back — so a
+// path that anchors the WRONG chain state fails here even though it anchors. Both paths matter
+// and for different reasons: the audit extension covers every recorded operation, and
+// denyBeforeBus covers the flag-boundary refusal no decorator on the bus can see, which is the
+// case that went unanchored until defect E was fixed.
+func TestTheAnchorARunPublishesIsOneVerifyAccepts(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{"a recorded probe", []string{"probe"}},
+		{"a flag-boundary denial", []string{"list", "--root", "/data/data"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logPath := newAuditLog(t)
+			published := captureAnchors(t)
+
+			runWithLog(t, logPath, newFakeStore(), tc.args...)
+
+			if len(*published) != 1 {
+				t.Fatalf("the run published %d anchors, want 1", len(*published))
+			}
+
+			anchor := (*published)[0]
+
+			got := runVerifyWith(t, logPath, anchorLine(t, os.Geteuid(), thisExe(t), anchor.log, anchor.seq, anchor.hash))
+
+			res := decode(t, lines(t, got.stdout)[0])
+			if res["status"] != statusOK || res["anchors"] != float64(1) {
+				t.Errorf("verify on the run's own anchor: %s, want status ok with one anchor; stderr %q", lines(t, got.stdout)[0], got.stderr)
+			}
+
+			if got.exit != 0 {
+				t.Errorf("exit = %d, want 0", got.exit)
+			}
+		})
+	}
+}
+
 func TestVerifyContactsNoDevice(t *testing.T) {
 	logPath, seq, head := chainState(t, 1)
 

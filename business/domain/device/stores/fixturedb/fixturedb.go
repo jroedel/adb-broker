@@ -200,6 +200,12 @@ func (s *Store) localPath(p devicepath.AuthorizedPath) string {
 // Probe reports this store's one synthetic device: state "device", the caller's broker
 // version with fixtureVersionSuffix appended, and the V2 feature set the capability gate
 // requires. Model is left empty, matching adbsyncdb, since a fixture has no shell either.
+//
+// AttachedDevices is 1, and it is a fact about this store rather than a stub: a fixture
+// Store serves exactly one synthetic device — Probe refuses any serial but its own — so
+// there is never a second one to count. That makes fixture mode the "unambiguous device"
+// case, which is the case a consumer uses the count to detect, so a consumer exercised
+// against a fixture takes the same branch it would take against one attached phone.
 func (s *Store) Probe(_ context.Context, ser serial.Serial) (devicebus.Device, error) {
 	if err := s.injected("probe"); err != nil {
 		return devicebus.Device{}, err
@@ -213,12 +219,13 @@ func (s *Store) Probe(_ context.Context, ser serial.Serial) (devicebus.Device, e
 	copy(features, fixtureFeatures[:])
 
 	return devicebus.Device{
-		Serial:        s.serial,
-		State:         "device",
-		Model:         "",
-		BrokerVersion: s.brokerVersion + fixtureVersionSuffix,
-		ServerVersion: "fixture",
-		Features:      features,
+		Serial:          s.serial,
+		State:           "device",
+		Model:           "",
+		BrokerVersion:   s.brokerVersion + fixtureVersionSuffix,
+		ServerVersion:   "fixture",
+		Features:        features,
+		AttachedDevices: 1,
 	}, nil
 }
 

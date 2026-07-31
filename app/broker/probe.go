@@ -9,6 +9,23 @@ import "context"
 // unreachable, and saying so once up front is clearer than eleven identical per-source
 // failures. Probe is also where the device's storage volume is pinned, so a phone whose
 // storage is not in the expected shape is discovered here rather than during a listing.
+//
+// Two members of the response exist so that a consumer can settle at startup what it would
+// otherwise have to discover per source or per file. Both are on ProbeResponse rather than
+// here, and neither is anything this function decides:
+//
+//   - allowlist, the compiled roots this binary can reach, read from devicepath by the
+//     response converter. Without it a root configured outside the allowlist is only
+//     discoverable by connecting to the phone and being refused, once per source, and a
+//     path_denied for a misconfigured source is a configuration error reported far too
+//     late. Reporting it widens nothing — the allowlist is compiled in and no runtime
+//     input can add to it.
+//   - attached_devices, the number of phones the transport reported, which the Storer
+//     counted. A consumer that sees 1 can omit --serial on every fetch, and so avoids the
+//     probe-per-fetch that honouring a pinned serial otherwise costs — see the comment in
+//     fetch.go. This is deliberately reported here instead of adding a serial to
+//     ExtBusiness.Fetch, which would hand every caller the capability that seam exists to
+//     withhold.
 func runProbe(e env, args []string) int {
 	var req ProbeRequest
 

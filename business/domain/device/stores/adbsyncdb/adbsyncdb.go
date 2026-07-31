@@ -204,11 +204,18 @@ func NewStore(brokerVersion string) *Store {
 }
 
 // Probe reads the device's identity: the adb server version, the selected device and its
-// state token, and the feature list that decides whether this device can be served at all.
+// state token, the feature list that decides whether this device can be served at all, and
+// how many devices the server reported as attached.
 //
 // Model is left empty. It is not obtainable without a shell, this package has no shell and
 // never will, and inventing a source for it would put a value in the audit record that
 // nothing measured.
+//
+// The attached-device count is not a second question asked of the server. It is counted
+// from the host:devices reply this store already read in order to select a device at all —
+// see connectLocked — so it is free, and it describes exactly the list the selection was
+// made from. It counts every entry, in whatever state, and not the entries a requested
+// serial matched; devicebus.Device.AttachedDevices says what a consumer may conclude.
 func (s *Store) Probe(ctx context.Context, ser serial.Serial) (devicebus.Device, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

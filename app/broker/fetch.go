@@ -53,7 +53,7 @@ func runFetch(e env, args []string) int {
 	// that did not ask for a device to be pinned would be a worse trade.
 	if !in.serial.IsZero() {
 		if _, err := bus.Probe(ctx, in.serial); err != nil {
-			return e.fail(displayBytes(req.Path), err)
+			return e.fail(req.Path, err)
 		}
 	}
 
@@ -115,8 +115,10 @@ func runFetch(e env, args []string) int {
 
 	case err != nil:
 		// Nothing has been written to stdout yet, so a normal error object is safe and is
-		// what a consumer can branch on.
-		return e.fail(displayBytes(req.Path), err)
+		// what a consumer can branch on. The RAW path goes to fail: the error object now
+		// carries path_b64 as well as path, and only the raw bytes can produce an
+		// authoritative one — see fromBusErrorResponse.
+		return e.fail(req.Path, err)
 	}
 
 	if werr := flush(e.stdout); werr != nil {

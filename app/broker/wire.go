@@ -67,6 +67,10 @@ type VerifyRequest struct{ LogPath, AnchorsPath string }
 // The pinned storage volume is deliberately absent. It goes to the audit log and nowhere
 // else: a consumer has no use for it, and giving it one would invite reasoning about the
 // phone's storage layout, which is this binary's job and not its consumer's.
+//
+// The last two members are the only ones a consumer reads in order to decide how to CALL
+// this binary rather than to learn about the phone. Both replace something a consumer could
+// otherwise only discover by connecting to a device and being refused.
 type ProbeResponse struct {
 	Proto  int    `json:"proto"`
 	Status string `json:"status"`
@@ -75,6 +79,39 @@ type ProbeResponse struct {
 	Model  string `json:"model"`
 	Broker string `json:"broker"`
 	ADB    string `json:"adb"`
+
+	// AttachedDevices is how many devices the transport reported as attached, and it is the
+	// one member here that is easy to misread. It counts EVERY device the adb server listed:
+	// it is NOT the number matching --serial — probing with --serial while two phones are
+	// plugged in reports 2 — and it is NOT a count of devices this broker could serve, since
+	// a phone in state "unauthorized" or "offline" is attached and is counted.
+	//
+	// The single question it answers is whether an operation that names no device could be
+	// ambiguous. That is worth a member of its own because a fetch cannot be given a serial
+	// for free: devicebus.ExtBusiness.Fetch takes no serial by design, so the only way this
+	// binary can honour `fetch --serial` is to run a full probe first, and on a first run of
+	// ~20,000 files that is 20,000 extra audited operations and 20,000 extra audit records
+	// (see runFetch). A consumer that reads 1 here can omit --serial on every fetch and pay
+	// none of it. A consumer that reads 2 must pass one, whatever the second phone's state.
+	AttachedDevices int `json:"attached_devices"`
+
+	// Allowlist is every root this binary can reach on the device, sorted — the compiled
+	// allowlist as devicepath.Roots reports it.
+	//
+	// It is reported because path_denied for a misconfigured source is a CONFIGURATION error,
+	// and without this member a consumer can only discover one by connecting to a phone and
+	// being refused, once per configured source. With it, a consumer validates its sources at
+	// startup and fails fast.
+	//
+	// Reporting it widens nothing, which is why it is safe to report at all: the allowlist is
+	// compiled in, no flag, environment variable or config key adds to it, and devicepath's
+	// Narrow can only take roots away. The list is a statement about THIS BINARY and not about
+	// the device — which is why it does not travel out through the Business layer the way the
+	// pinned volume does; see fromBusDeviceResponse.
+	//
+	// Always present and never empty: devicepath.Roots returns a copy of a non-empty list, so
+	// a consumer never distinguishes an absent member from an empty one.
+	Allowlist []string `json:"allowlist"`
 }
 
 // FileRecordResponse is one NDJSON record in a list stream: one regular file, written as it
@@ -106,20 +143,35 @@ type FileRecordResponse struct {
 // read, paired with its classification, so a consumer can decide from Code alone whether to
 // warn and carry on.
 //
-// Path here is the lossy human rendering with no authoritative companion, because the
-// contract specifies these two members and only these two. A per-path error naming a
-// filename that is not valid UTF-8 is therefore not round-trippable — see the note in the
-// package's README-level docs; it is a weakness of the specified shape rather than of this
-// converter.
+// PathB64 exists for the same reason FileRecordResponse's does, and its absence here was a
+// defect rather than a deliberate omission: Android filenames are byte strings that need
+// not be valid UTF-8, and this is the one place in the contract a consumer might want to ACT
+// on a path rather than merely display it — retry it, key a log by it, exclude it from a
+// later run. Giving that one place only the lossy rendering, while every other path member
+// in this contract is authoritative-by-base64, made it the one path a consumer could not
+// safely use. Path stays for the human-readable line; PathB64 is what a consumer round-trips
+// through, populated the same way fromBusFileRecordResponse populates a record's.
 type PathErrorResponse struct {
-	Code string `json:"code"`
-	Path string `json:"path"`
+	Code    string `json:"code"`
+	Path    string `json:"path"`
+	PathB64 string `json:"path_b64"`
 }
 
-// ListSummaryResponse is the single object that terminates a list stream.
+// ListSummaryResponse is the single object that terminates a list stream when the walk
+// finished, successfully or partially.
 //
-// It is distinguished from a record by having NO path member — that is the documented
-// discriminator, so no member named path may ever be added here.
+// It is NOT distinguished from a record by the absence of a path member — that was the
+// originally specified rule and it is unsafe. A list stream can also terminate with an
+// ErrorResponse instead of a summary (see runList), and ErrorResponse DOES carry a path
+// when the failure names one, e.g.
+// {"proto":1,"status":"error","code":"path_denied","path":"/sdcard/NOPE",...}. A consumer
+// that decodes "no path member present" as "this is a file record" reads that error object
+// as a record with an empty path, zero size and zero mtime, and silently loses Code — a
+// collision that depends on which error fired, so it survives hand-testing and only shows
+// up in production. The safe discriminator is the presence of a status member: every
+// terminator, summary or error alike, carries one, and FileRecordResponse never does. That
+// is why status has no omitzero here or on ErrorResponse — a terminator's status is never
+// allowed to disappear from the wire.
 //
 // Status is "ok" when nothing failed and "partial" when some paths failed but records were
 // still produced. A partial listing exits 0: the consumer needs to tell "nothing was
@@ -188,11 +240,25 @@ type VerifyResponse struct {
 // the exact failure this broker exists to remove.
 //
 // Path is omitted when the failure names no path, because "" is not a path and a consumer
-// logging the member would print an empty one.
+// logging the member would print an empty one. PathB64 is omitted under exactly the same
+// condition — present whenever Path is, absent otherwise, via the same omitzero tag — so a
+// consumer never has to work out whether a missing PathB64 means "no path" or "the broker
+// forgot to encode it".
+//
+// PathB64 must be built from the SAME raw path bytes as Path, never derived from Path
+// itself. Path is a display rendering: every call site that produces an ErrorResponse
+// receives a path that has already been coerced to valid UTF-8 by displayBytes, because a
+// rejected path may itself contain bytes that are not valid UTF-8 and a report that cannot
+// be encoded is not a report. Base64-encoding that coerced string would encode the U+FFFD
+// replacement character in place of whatever byte sequence was actually rejected — a value
+// that LOOKS authoritative and is not, which is worse than PathB64 being absent. See
+// fromBusErrorResponse in convert.go, which is the one place both members are built,
+// each from the same raw string, so they cannot drift apart.
 type ErrorResponse struct {
 	Proto   int    `json:"proto"`
 	Status  string `json:"status"`
 	Code    string `json:"code"`
 	Path    string `json:"path,omitzero"`
+	PathB64 string `json:"path_b64,omitzero"`
 	Message string `json:"message"`
 }

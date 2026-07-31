@@ -27,19 +27,39 @@ func marshal(t *testing.T, v any) string {
 
 func TestProbeResponseBytes(t *testing.T) {
 	got := marshal(t, ProbeResponse{
-		Proto:  proto,
-		Status: statusOK,
-		Serial: "EXAMPLESERIAL1",
-		State:  "device",
-		Model:  "",
-		Broker: "0.1.0",
-		ADB:    "1.0.41",
+		Proto:           proto,
+		Status:          statusOK,
+		Serial:          "EXAMPLESERIAL1",
+		State:           "device",
+		Model:           "",
+		Broker:          "0.1.0",
+		ADB:             "1.0.41",
+		AttachedDevices: 1,
+		Allowlist:       []string{"/sdcard/DCIM", "/sdcard/Download"},
 	})
 
-	want := `{"proto":1,"status":"ok","serial":"EXAMPLESERIAL1","state":"device","model":"","broker":"0.1.0","adb":"1.0.41"}` + "\n"
+	want := `{"proto":1,"status":"ok","serial":"EXAMPLESERIAL1","state":"device","model":"","broker":"0.1.0","adb":"1.0.41","attached_devices":1,"allowlist":["/sdcard/DCIM","/sdcard/Download"]}` + "\n"
 
 	if got != want {
 		t.Errorf("\n got: %q\nwant: %q", got, want)
+	}
+}
+
+func TestProbeResponseMembersAreAlwaysPresent(t *testing.T) {
+	// No omitempty and no omitzero on a probe response, for the same reason a record has
+	// none: a consumer must never have to distinguish an absent member from a zero one. The
+	// two that make this worth asserting are the new ones — an absent allowlist reads as "no
+	// roots are reachable" and an absent attached_devices reads as "no phone is attached",
+	// and both of those are the opposite of what a zero value would mean here.
+	decoded := map[string]any{}
+	if err := json.Unmarshal([]byte(marshal(t, ProbeResponse{})), &decoded); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	for _, member := range []string{"proto", "status", "serial", "state", "model", "broker", "adb", "attached_devices", "allowlist"} {
+		if _, ok := decoded[member]; !ok {
+			t.Errorf("the zero probe response omits %q", member)
+		}
 	}
 }
 
@@ -99,9 +119,9 @@ func TestListSummaryResponseBytes(t *testing.T) {
 		{
 			name: "some paths failed",
 			res: ListSummaryResponse{Proto: proto, Status: statusPartial, Files: 20397, Errors: []PathErrorResponse{
-				{Code: "permission_denied", Path: "/sdcard/DCIM/Camera/locked"},
+				{Code: "permission_denied", Path: "/sdcard/DCIM/Camera/locked", PathB64: "L3NkY2FyZC9EQ0lNL0NhbWVyYS9sb2NrZWQ="},
 			}},
-			want: `{"proto":1,"status":"partial","files":20397,"errors":[{"code":"permission_denied","path":"/sdcard/DCIM/Camera/locked"}]}`,
+			want: `{"proto":1,"status":"partial","files":20397,"errors":[{"code":"permission_denied","path":"/sdcard/DCIM/Camera/locked","path_b64":"L3NkY2FyZC9EQ0lNL0NhbWVyYS9sb2NrZWQ="}]}`,
 		},
 	} {
 		if got := marshal(t, tc.res); got != tc.want+"\n" {
@@ -111,8 +131,10 @@ func TestListSummaryResponseBytes(t *testing.T) {
 }
 
 func TestASummaryNeverCarriesAPathMember(t *testing.T) {
-	// A summary is distinguished from a record by having no path member. That is the whole
-	// discriminator, so this test exists to fail if anyone adds one.
+	// ListSummaryResponse itself never declares a path member — that remains true and is
+	// worth guarding — but it is NOT the discriminator a consumer may use to identify a
+	// terminator. See TestAbsenceOfPathDoesNotSafelyDiscriminateATerminator immediately
+	// below for why: a list stream's OTHER terminator, ErrorResponse, can carry a path.
 	decoded := map[string]any{}
 	if err := json.Unmarshal([]byte(marshal(t, ListSummaryResponse{})), &decoded); err != nil {
 		t.Fatalf("decode: %v", err)
@@ -120,6 +142,45 @@ func TestASummaryNeverCarriesAPathMember(t *testing.T) {
 
 	if _, ok := decoded["path"]; ok {
 		t.Error("a summary carries a path member")
+	}
+}
+
+func TestAbsenceOfPathDoesNotSafelyDiscriminateATerminator(t *testing.T) {
+	// This is Defect A, made concrete. The spec used to say a list stream's terminating
+	// summary is "distinguished by having no path member" — but a list can also terminate
+	// with an ErrorResponse, e.g. a denied root reported after the fact, and that error
+	// object DOES carry a path when the failure names one.
+	errTerminator := marshal(t, ErrorResponse{
+		Proto: proto, Status: statusError, Code: "path_denied", Path: "/sdcard/NOPE", PathB64: "L3NkY2FyZC9OT1BF", Message: "denied",
+	})
+
+	decoded := map[string]any{}
+	if err := json.Unmarshal([]byte(errTerminator), &decoded); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if _, ok := decoded["path"]; !ok {
+		t.Fatal("the fixture error terminator does not carry path; the test proves nothing")
+	}
+
+	// A consumer following the old "no path member" rule would read this object as a file
+	// record: PathB64 "" (since a FileRecordResponse decode would look for path_b64 anyway,
+	// but the point stands for any decoder keyed on path's absence), Size 0, Mtime 0 — and it
+	// would silently lose Code. The safe rule is the one below: status's presence, not
+	// path's absence, marks this object as a terminator rather than a record.
+	if _, ok := decoded["status"]; !ok {
+		t.Fatal("the fixture error terminator does not carry status; the new rule has nothing to check")
+	}
+
+	record := marshal(t, FileRecordResponse{Path: "/sdcard/DCIM/a.JPG"})
+
+	decodedRecord := map[string]any{}
+	if err := json.Unmarshal([]byte(record), &decodedRecord); err != nil {
+		t.Fatalf("decode record: %v", err)
+	}
+
+	if _, ok := decodedRecord["status"]; ok {
+		t.Error("a file record carries a status member; the discriminator no longer distinguishes anything")
 	}
 }
 
@@ -143,10 +204,11 @@ func TestErrorResponseBytes(t *testing.T) {
 		Status:  statusError,
 		Code:    "root_not_found",
 		Path:    "/sdcard/NOPE",
+		PathB64: "L3NkY2FyZC9OT1BF",
 		Message: "no such file or directory",
 	})
 
-	want := `{"proto":1,"status":"error","code":"root_not_found","path":"/sdcard/NOPE","message":"no such file or directory"}` + "\n"
+	want := `{"proto":1,"status":"error","code":"root_not_found","path":"/sdcard/NOPE","path_b64":"L3NkY2FyZC9OT1BF","message":"no such file or directory"}` + "\n"
 
 	if got != want {
 		t.Errorf("\n got: %q\nwant: %q", got, want)
@@ -154,6 +216,9 @@ func TestErrorResponseBytes(t *testing.T) {
 }
 
 func TestErrorResponseOmitsThePathWhenTheFailureNamesNone(t *testing.T) {
+	// Defect C, part 2: PathB64 must disappear under exactly the condition Path does, via
+	// the same omitzero tag, or a consumer would have to work out whether a missing PathB64
+	// alongside a missing Path means "no path" or "the broker forgot to encode it".
 	got := marshal(t, ErrorResponse{Proto: proto, Status: statusError, Code: "no_device", Message: "no device is attached"})
 
 	want := `{"proto":1,"status":"error","code":"no_device","message":"no device is attached"}` + "\n"

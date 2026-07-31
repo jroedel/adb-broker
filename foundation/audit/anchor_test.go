@@ -1,6 +1,7 @@
 package audit
 
 import (
+	"encoding/hex"
 	"errors"
 	"net"
 	"os"
@@ -196,6 +197,127 @@ func TestWriteAnchorMissingSocket(t *testing.T) {
 	if errors.Is(err, ErrAnchorField) {
 		t.Error("a transport failure must not be reported as a field rejection")
 	}
+}
+
+// TestAnchorTailPublishesTheLogsOwnTail asserts the three values every caller of
+// AnchorTail would otherwise have had to assemble itself: the log's sequence
+// number, its chain head in hex, and its path. Getting any of them from somewhere
+// else is a claim about a log that was never made.
+func TestAnchorTailPublishesTheLogsOwnTail(t *testing.T) {
+	conn, socket := listen(t)
+	useSocketPath(t, socket)
+
+	l, logPath := openTestLog(t)
+
+	if _, err := l.Append(Record{TS: time.Now(), Op: "probe", Decision: "allow", Result: "ok"}); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	if err := AnchorTail(l); err != nil {
+		t.Fatalf("AnchorTail: %v", err)
+	}
+
+	head := l.Head()
+
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+
+	buf := make([]byte, 4096)
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Fatalf("read datagram: %v", err)
+	}
+
+	got := string(buf[:n])
+	for _, want := range []string{
+		"ADB_BROKER_SEQ=1\n",
+		"ADB_BROKER_HASH=" + hex.EncodeToString(head[:]) + "\n",
+		"ADB_BROKER_LOG=" + logPath + "\n",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the anchor does not carry %q:\n%s", want, got)
+		}
+	}
+}
+
+// TestAnchorTailReportsWhyItCouldNotPublish is the whole reason this function
+// returns an error rather than swallowing one.
+//
+// Its callers are contractually forbidden from failing an operation over a failed
+// anchor, so the error's only destination is an operator's stderr — and on the
+// first setuid install it was discarded, which made a permanently broken anchor
+// path indistinguishable from a working one. The message therefore has to name the
+// log, the sequence number that went unanchored, and the transport reason.
+func TestAnchorTailReportsWhyItCouldNotPublish(t *testing.T) {
+	useSocketPath(t, filepath.Join(tempSocketDir(t), "absent.sock"))
+
+	l, logPath := openTestLog(t)
+
+	if _, err := l.Append(Record{TS: time.Now(), Op: "probe", Decision: "allow", Result: "ok"}); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	err := AnchorTail(l)
+	if !errors.Is(err, ErrAuditUnavailable) {
+		t.Fatalf("AnchorTail with no socket = %v, want it to wrap ErrAuditUnavailable", err)
+	}
+
+	for _, want := range []string{logPath, "seq 1", "absent.sock", "truncated tail"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the error %q does not mention %q", err, want)
+		}
+	}
+}
+
+// TestAnchorTailOnAnEmptyLogAnchorsTheEmptyChain covers a fresh install: 32 zero
+// bytes at seq 0 is a valid state to anchor, and refusing to publish it would
+// leave the very first record of a new chain uncovered.
+func TestAnchorTailOnAnEmptyLogAnchorsTheEmptyChain(t *testing.T) {
+	conn, socket := listen(t)
+	useSocketPath(t, socket)
+
+	l, _ := openTestLog(t)
+
+	if err := AnchorTail(l); err != nil {
+		t.Fatalf("AnchorTail on an empty log: %v", err)
+	}
+
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+
+	buf := make([]byte, 4096)
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Fatalf("read datagram: %v", err)
+	}
+
+	got := string(buf[:n])
+	for _, want := range []string{"ADB_BROKER_SEQ=0\n", "ADB_BROKER_HASH=" + strings.Repeat("0", 64) + "\n"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the anchor does not carry %q:\n%s", want, got)
+		}
+	}
+}
+
+// openTestLog opens a fresh, empty log the way the installer would create one:
+// Open deliberately does not create the file (see its doc comment).
+func openTestLog(t *testing.T) (*Log, string) {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "audit.log")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatalf("create the test log: %v", err)
+	}
+
+	l, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+
+	return l, path
 }
 
 // TestMessageIDIsAStableJournalMatch guards the constant a verifier greps for.

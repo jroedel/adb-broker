@@ -14,6 +14,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -82,6 +83,13 @@ type fakeStore struct {
 	probeErr      error
 	volumeErr     error
 
+	// attachedDevices is what this store reports as the number of attached devices, which a
+	// real Storer counts from its transport's device list. It is settable so a probe test
+	// can prove the App layer reports the STORE's number rather than deriving one of its own
+	// — deriving it is not possible here, and a response that quietly said 1 because one
+	// device was probed would be wrong on exactly the machine the member exists for.
+	attachedDevices int
+
 	records    []devicebus.FileRecord
 	pathErrors []devicebus.PathError
 	refused    int
@@ -106,10 +114,11 @@ func (f *fakeStore) Probe(_ context.Context, s serial.Serial) (devicebus.Device,
 	}
 
 	return devicebus.Device{
-		Serial:        serial.MustParseSerial(named),
-		State:         f.state,
-		BrokerVersion: f.brokerVersion,
-		ServerVersion: f.serverVersion,
+		Serial:          serial.MustParseSerial(named),
+		State:           f.state,
+		BrokerVersion:   f.brokerVersion,
+		ServerVersion:   f.serverVersion,
+		AttachedDevices: f.attachedDevices,
 	}, nil
 }
 
@@ -181,8 +190,11 @@ func newFakeStore() *fakeStore {
 	return &fakeStore{
 		state:         "device",
 		serverVersion: exampleServer,
-		records:       []devicebus.FileRecord{fileRecord(examplePath, exampleSize, exampleMtime)},
-		payload:       bytes.Repeat([]byte{'x'}, exampleSize),
+		// One phone, which is what the measured device session looked like and the case a
+		// consumer may omit --serial in.
+		attachedDevices: 1,
+		records:         []devicebus.FileRecord{fileRecord(examplePath, exampleSize, exampleMtime)},
+		payload:         bytes.Repeat([]byte{'x'}, exampleSize),
 	}
 }
 
@@ -211,6 +223,54 @@ func swap[T any](t *testing.T, seam *T, value T) {
 	*seam = value
 
 	t.Cleanup(func() { *seam = old })
+}
+
+// TestMain keeps this package's tests off the host's real journal.
+//
+// Every recorded operation anchors, and until the anchor became a seam that meant every
+// invocation these tests drive published a live datagram to /run/systemd/journal/socket:
+// 2,649 entries stamped _EXE=…/broker.test are permanently in this host's journal, each
+// claiming a sequence number and chain head for an audit log in a t.TempDir() that no longer
+// exists. Journal entries cannot be removed, so all of them are noise a real verify has to
+// discard forever — and the volume was what made the case for closing the hole.
+//
+// It is done here, once, rather than in each test's setup, so a test added later cannot
+// forget: publishing to the host is not something a test opts out of, it is something a test
+// must deliberately opt into by replacing this again. captureAnchors is how to opt into
+// OBSERVING one without publishing it.
+func TestMain(m *testing.M) {
+	publishAnchor = func(*audit.Log) error { return nil }
+
+	os.Exit(m.Run())
+}
+
+// capturedAnchor is what one anchor would have published: the three values audit.AnchorTail
+// reads off the live log.
+type capturedAnchor struct {
+	seq  uint64
+	hash string
+	log  string
+}
+
+// captureAnchors records every anchor an invocation publishes instead of sending it.
+//
+// It reassembles the anchor from the log the same way audit.AnchorTail does, which is
+// deliberate and limited: what these tests assert is WHETHER a code path anchors and at which
+// chain state, not the wire form. The wire form is asserted byte for byte against a real
+// datagram in foundation/audit's own tests, which is the only place that can.
+func captureAnchors(t *testing.T) *[]capturedAnchor {
+	t.Helper()
+
+	var published []capturedAnchor
+
+	swap(t, &publishAnchor, func(l *audit.Log) error {
+		head := l.Head()
+		published = append(published, capturedAnchor{seq: l.Seq(), hash: hex.EncodeToString(head[:]), log: l.Path()})
+
+		return nil
+	})
+
+	return &published
 }
 
 // newAuditLog creates an empty audit log in a temporary directory and returns its path.
@@ -297,13 +357,22 @@ func decode(t *testing.T, line string) map[string]any {
 
 // 1. probe emits exactly one object, with proto 1 and the transport's state token verbatim.
 
+// exampleAllowlist is the allowlist member as a consumer reads it: the six compiled roots,
+// sorted, as a JSON array.
+//
+// It is written out literally rather than built from devicepath.Roots so that a change to the
+// compiled allowlist fails here. The list is part of the stdout contract now, so it should not
+// be possible to alter what a consumer is told this binary can reach without editing a test
+// that says so.
+const exampleAllowlist = `["/sdcard/DCIM","/sdcard/Download","/sdcard/Movies","/sdcard/Music","/sdcard/Pictures","/sdcard/Recordings"]`
+
 func TestProbeEmitsOneObjectMatchingTheSpecifiedShape(t *testing.T) {
 	store := newFakeStore()
 
 	got := run(t, store, "probe")
 
-	want := fmt.Sprintf(`{"proto":1,"status":"ok","serial":%q,"state":"device","model":"","broker":%q,"adb":%q}`+"\n",
-		exampleSerial, version, exampleServer)
+	want := fmt.Sprintf(`{"proto":1,"status":"ok","serial":%q,"state":"device","model":"","broker":%q,"adb":%q,"attached_devices":1,"allowlist":%s}`+"\n",
+		exampleSerial, version, exampleServer, exampleAllowlist)
 
 	if got.stdout != want {
 		t.Errorf("stdout\n got: %q\nwant: %q", got.stdout, want)
@@ -311,6 +380,74 @@ func TestProbeEmitsOneObjectMatchingTheSpecifiedShape(t *testing.T) {
 
 	if got.exit != 0 {
 		t.Errorf("exit = %d, want 0", got.exit)
+	}
+}
+
+// A consumer cannot change the allowlist — it is compiled in — so the only thing reporting it
+// can do is turn a per-source runtime refusal into a startup check. That only works if EVERY
+// root is reported: a consumer that validated its sources against five of six would reject a
+// source this binary would have served.
+func TestProbeReportsEveryCompiledAllowlistRootInSortedOrder(t *testing.T) {
+	got := run(t, newFakeStore(), "probe")
+
+	var res struct {
+		Allowlist []string `json:"allowlist"`
+	}
+	if err := json.Unmarshal([]byte(lines(t, got.stdout)[0]), &res); err != nil {
+		t.Fatalf("decode the probe response: %v", err)
+	}
+
+	// devicepath.Roots is the allowlist in force and returns it sorted. Comparing against it
+	// rather than against a list retyped here is the point: the response must be the same
+	// allowlist the path parser enforces, not a second copy of it that could drift.
+	want := devicepath.Roots()
+
+	if !slices.Equal(res.Allowlist, want) {
+		t.Fatalf("allowlist = %v, want %v", res.Allowlist, want)
+	}
+
+	if !slices.IsSorted(res.Allowlist) {
+		t.Errorf("allowlist = %v, want it sorted", res.Allowlist)
+	}
+
+	// Every root reported must be one this binary would actually accept a path under. A root
+	// on the wire that ParseAuthorizedPath refuses would be a consumer's instruction to
+	// configure a source that then fails with path_denied.
+	for _, root := range res.Allowlist {
+		if _, err := devicepath.ParseAuthorizedPath(root); err != nil {
+			t.Errorf("reported root %q is not one this binary accepts: %v", root, err)
+		}
+	}
+}
+
+// The count is the store's, reported unchanged. The two failure modes it exists to prevent are
+// both "1 when it should not be": a consumer that sees 1 omits --serial on every fetch, and on
+// a machine with two phones that means archiving from whichever one answered.
+func TestProbeReportsTheAttachedDeviceCountTheStoreReported(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		args  []string
+		count int
+	}{
+		{name: "one phone", args: []string{"probe"}, count: 1},
+		{name: "three phones", args: []string{"probe"}, count: 3},
+
+		// Naming a serial selects one device; it does not change how many are attached. A
+		// response saying 1 here would tell a consumer that omitting --serial is safe, which
+		// is precisely what it is not.
+		{name: "a named serial does not narrow the count", args: []string{"probe", "--serial", exampleSerial}, count: 2},
+	} {
+		store := newFakeStore()
+		store.attachedDevices = tc.count
+
+		got := run(t, store, tc.args...)
+
+		res := decode(t, lines(t, got.stdout)[0])
+
+		// JSON numbers decode as float64; compare as a number rather than reformatting.
+		if n, ok := res["attached_devices"].(float64); !ok || int(n) != tc.count {
+			t.Errorf("%s: attached_devices = %v, want %d", tc.name, res["attached_devices"], tc.count)
+		}
 	}
 }
 
@@ -406,7 +543,7 @@ func TestListWithPerPathErrorsIsPartialAndExitsZero(t *testing.T) {
 	got := run(t, store, "list", "--root", "/sdcard/DCIM/Camera")
 
 	out := lines(t, got.stdout)
-	want := `{"proto":1,"status":"partial","files":1,"errors":[{"code":"permission_denied","path":"/sdcard/DCIM/Camera/locked"}]}`
+	want := `{"proto":1,"status":"partial","files":1,"errors":[{"code":"permission_denied","path":"/sdcard/DCIM/Camera/locked","path_b64":"L3NkY2FyZC9EQ0lNL0NhbWVyYS9sb2NrZWQ="}]}`
 
 	if out[len(out)-1] != want {
 		t.Errorf("summary\n got: %s\nwant: %s", out[len(out)-1], want)
@@ -919,8 +1056,8 @@ func TestStdoutCarriesOnlyProtocolBytes(t *testing.T) {
 		{
 			name: "probe",
 			args: []string{"probe"},
-			want: fmt.Sprintf(`{"proto":1,"status":"ok","serial":%q,"state":"device","model":"","broker":%q,"adb":%q}`+"\n",
-				exampleSerial, version, exampleServer),
+			want: fmt.Sprintf(`{"proto":1,"status":"ok","serial":%q,"state":"device","model":"","broker":%q,"adb":%q,"attached_devices":1,"allowlist":%s}`+"\n",
+				exampleSerial, version, exampleServer, exampleAllowlist),
 		},
 		{
 			name: "list",
@@ -1151,6 +1288,65 @@ func TestAFailedOperationIsStillRecorded(t *testing.T) {
 		if !strings.Contains(string(recorded), want) {
 			t.Errorf("the audit record does not contain %s:\n%s", want, recorded)
 		}
+	}
+}
+
+func TestAnAnchorFailureIsVisibleOnStderrAndNowhereElse(t *testing.T) {
+	// The failure this makes observable was invisible for a whole install: the broker ran, wrote
+	// its audit record, published no anchor, and the only trace was verify honestly reporting
+	// that a truncated tail "could not be ruled out". The anchor is the ONLY control against
+	// truncation, so a permanently broken anchor path that says nothing is the guarantee going
+	// unenforced while still appearing to be in force.
+	//
+	// It is reported on stderr and asserted to be nowhere else. Not on stdout, which carries the
+	// protocol and nothing else — a consumer capturing it expecting JSON must not find prose.
+	// Not in the exit status. Not in the error the operation returns, which is the delegate's.
+	// The comparison is against the same invocation with a working anchor rather than against a
+	// written-down response, so what is asserted is "nothing a consumer can observe changed" and
+	// not "the probe response still looks like this", which is a different test and already
+	// exists.
+	healthy := runWithLog(t, newAuditLog(t), newFakeStore(), "probe")
+
+	logPath := newAuditLog(t)
+
+	reason := "dial journal socket /run/systemd/journal/socket: connect: permission denied"
+	swap(t, &publishAnchor, func(l *audit.Log) error {
+		return fmt.Errorf("audit: publish an anchor for %s at seq %d, the only control against a truncated tail: %s", l.Path(), l.Seq(), reason)
+	})
+
+	got := runWithLog(t, logPath, newFakeStore(), "probe")
+
+	if got.stdout != healthy.stdout {
+		t.Errorf("stdout changed because an anchor failed\n got: %q\nwant: %q", got.stdout, healthy.stdout)
+	}
+
+	if got.exit != exitOK || healthy.exit != exitOK {
+		t.Errorf("exit = %d (healthy %d), want %d: an anchor failure must not fail an operation already recorded", got.exit, healthy.exit, exitOK)
+	}
+
+	if healthy.stderr != "" {
+		t.Errorf("a successful anchor put %q on stderr; only a failure may say anything", healthy.stderr)
+	}
+
+	// What an operator reading stderr must be able to learn: which log, how far the chain had
+	// got, and which of the candidate causes this is.
+	for _, fragment := range []string{"adb-broker:", logPath, "seq 1", reason} {
+		if !strings.Contains(got.stderr, fragment) {
+			t.Errorf("stderr does not mention %q, so it does not diagnose anything:\n%s", fragment, got.stderr)
+		}
+	}
+
+	if _, err := os.Stat(logPath); err != nil {
+		t.Fatalf("stat the audit log: %v", err)
+	}
+
+	recorded, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read the audit log: %v", err)
+	}
+
+	if !strings.Contains(string(recorded), `"op":"probe"`) {
+		t.Errorf("the operation was not recorded:\n%s", recorded)
 	}
 }
 

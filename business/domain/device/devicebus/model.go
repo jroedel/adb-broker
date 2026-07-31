@@ -18,6 +18,35 @@ type Device struct {
 	ServerVersion string
 	Features      []string
 
+	// AttachedDevices is how many devices the adb server reported as attached at the
+	// moment this store established its transport. Read the next paragraph before using
+	// it, because the obvious reading is the wrong one.
+	//
+	// It counts EVERY entry in the transport's device list. It is NOT the number of
+	// devices matching a requested serial: a Probe for one named serial with two phones
+	// plugged in reports 2, not 1. It is NOT a count of devices this broker could serve
+	// either — a phone in state "unauthorized" or "offline" is attached, is counted here,
+	// and would fail the moment anything was asked of it. The only question this number
+	// answers is "could an operation that names no device be ambiguous", and a consumer
+	// that reads it as anything else will be wrong on a machine with two phones on it.
+	//
+	// It is carried OUTWARD, like Volume, because only the Storer sees the device list.
+	// It exists because ExtBusiness.Fetch takes no serial and must not gain one — that
+	// asymmetry is the confinement guarantee documented on ExtBusiness — so the only way
+	// the App layer can honour a pinned serial on a fetch is to run a full Probe first,
+	// which on a first run of ~20,000 files means 20,000 extra audited operations and
+	// 20,000 extra audit records. A consumer that sees exactly 1 here knows a fetch that
+	// names no device cannot be ambiguous, and can drop the serial and the probes with it.
+	//
+	// It is a plain int at both ends of the layering: it is a count, there is no
+	// invariant a strong type could enforce over it that the Storer has not already
+	// established, and the two stores are the only things that can populate it.
+	//
+	// A successful Probe reports at least 1 — a Storer that found no device returns an
+	// error instead — so a zero here on a successful probe means the Storer did not
+	// populate it, not that no phone was attached.
+	AttachedDevices int
+
 	// Volume is the storage volume pinned for this device during Probe. It is carried
 	// OUTWARD here so an extension such as the audit log can record which volume this
 	// run trusted — it is never something a caller supplies. See the package doc and
@@ -25,6 +54,17 @@ type Device struct {
 	// exists.
 	Volume devicepath.Volume
 }
+
+// The compiled path allowlist is deliberately NOT on Device.
+//
+// It is a property of this BINARY — devicepath compiles it in, no runtime input can widen
+// it, and Narrow can only take roots away — so no store learns it from a phone and no
+// Business logic decides it. Putting it here would mean adbsyncdb and fixturedb each
+// populating a compiled constant they did not measure, which is two chances to derive one
+// list differently, and it would put the allowlist into every audit record that carries a
+// Device as though the device had reported it. The App layer reads devicepath.Roots at
+// response-building time instead; see fromBusDeviceResponse. Contrast Volume above, which
+// travels outward precisely because only the Storer can know it.
 
 // FileRecord describes one entry discovered while listing a device's storage. Path is
 // already an AuthorizedPath, so nothing downstream re-checks it — authority was decided

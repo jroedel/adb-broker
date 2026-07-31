@@ -56,6 +56,20 @@ func newTestLog(t *testing.T) (*audit.Log, string) {
 	return l, path
 }
 
+// newExtension wires this extension the way every test here needs it: with an
+// anchor publisher that succeeds and goes nowhere, and no stderr.
+//
+// Passing nil for the AnchorFunc would default to audit.AnchorTail, which sends a
+// real datagram to /run/systemd/journal/socket. That is not hypothetical: 672
+// anchors stamped _EXE=…/deviceaudit.test are permanently in this host's journal,
+// published by earlier runs of this file and claiming chain heads for logs in
+// t.TempDir() directories that no longer exist. Journal entries cannot be removed,
+// so each one is noise a real verify has to discard forever. Every test in this
+// file goes through here; the two that care about anchoring pass their own.
+func newExtension(log *audit.Log, callerUID int, clientAsserted string) devicebus.Extension {
+	return NewExtension(log, callerUID, clientAsserted, func(*audit.Log) error { return nil }, io.Discard)
+}
+
 func mustSerial(t *testing.T, s string) serial.Serial {
 	t.Helper()
 
@@ -190,7 +204,7 @@ func TestProbe_Success_AppendsOneAllowRecord(t *testing.T) {
 		},
 	}
 
-	ext := NewExtension(log, 1000, "user@example.com")(fake)
+	ext := newExtension(log, 1000, "user@example.com")(fake)
 
 	if _, err := ext.Probe(t.Context(), ser); err != nil {
 		t.Fatalf("Probe: unexpected error: %v", err)
@@ -229,7 +243,7 @@ func TestFetch_Success_RecordsBytesAndSHA256(t *testing.T) {
 		},
 	}
 
-	ext := NewExtension(log, 1000, "user@example.com")(fake)
+	ext := newExtension(log, 1000, "user@example.com")(fake)
 
 	if _, err := ext.Fetch(t.Context(), p, io.Discard, nil); err != nil {
 		t.Fatalf("Fetch: unexpected error: %v", err)
@@ -268,7 +282,7 @@ func TestList_Success_RecordsRootPathZeroBytesNoSHA(t *testing.T) {
 		},
 	}
 
-	ext := NewExtension(log, 1000, "user@example.com")(fake)
+	ext := newExtension(log, 1000, "user@example.com")(fake)
 
 	in := devicebus.ListInput{Root: root}
 	if _, err := ext.List(t.Context(), in, func(devicebus.FileRecord) error { return nil }); err != nil {
@@ -311,7 +325,7 @@ func TestFailedOperations_StillAppendAndReturnErrorUnchanged(t *testing.T) {
 			},
 		}
 
-		ext := NewExtension(log, 1, "x")(fake)
+		ext := newExtension(log, 1, "x")(fake)
 
 		_, err := ext.Probe(t.Context(), ser)
 		if !errors.Is(err, sentinel) {
@@ -337,7 +351,7 @@ func TestFailedOperations_StillAppendAndReturnErrorUnchanged(t *testing.T) {
 			},
 		}
 
-		ext := NewExtension(log, 1, "x")(fake)
+		ext := newExtension(log, 1, "x")(fake)
 
 		_, err := ext.List(t.Context(), devicebus.ListInput{Root: root}, func(devicebus.FileRecord) error { return nil })
 		if !errors.Is(err, sentinel) {
@@ -363,7 +377,7 @@ func TestFailedOperations_StillAppendAndReturnErrorUnchanged(t *testing.T) {
 			},
 		}
 
-		ext := NewExtension(log, 1, "x")(fake)
+		ext := newExtension(log, 1, "x")(fake)
 
 		_, err := ext.Fetch(t.Context(), p, io.Discard, nil)
 		if !errors.Is(err, sentinel) {
@@ -384,7 +398,7 @@ func TestFailedOperations_StillAppendAndReturnErrorUnchanged(t *testing.T) {
 		ser := mustSerial(t, "emulator-5554")
 
 		fake := &fakeExtBusiness{}
-		ext := NewExtension(log, 1, "x")(fake)
+		ext := newExtension(log, 1, "x")(fake)
 
 		if _, err := ext.Probe(t.Context(), ser); err != nil {
 			t.Fatalf("Probe: unexpected error: %v", err)
@@ -406,7 +420,7 @@ func TestRecord_CarriesCallerUIDAndClientAsserted(t *testing.T) {
 	ser := mustSerial(t, "emulator-5554")
 
 	fake := &fakeExtBusiness{}
-	ext := NewExtension(log, 4242, "asserted-client-id")(fake)
+	ext := newExtension(log, 4242, "asserted-client-id")(fake)
 
 	if _, err := ext.Probe(t.Context(), ser); err != nil {
 		t.Fatalf("Probe: unexpected error: %v", err)
@@ -447,7 +461,7 @@ func TestChain_ValidAfterMixedOperations(t *testing.T) {
 		},
 	}
 
-	ext := NewExtension(log, 1, "x")(fake)
+	ext := newExtension(log, 1, "x")(fake)
 
 	if _, err := ext.Probe(t.Context(), ser); err != nil {
 		t.Fatalf("Probe: unexpected error: %v", err)
@@ -498,7 +512,7 @@ func TestPathB64_RoundTripsInvalidUTF8(t *testing.T) {
 		},
 	}
 
-	ext := NewExtension(log, 1, "x")(fake)
+	ext := newExtension(log, 1, "x")(fake)
 
 	if _, err := ext.Fetch(t.Context(), p, io.Discard, nil); err != nil {
 		t.Fatalf("Fetch: unexpected error: %v", err)
@@ -535,7 +549,7 @@ func TestList_InvokesCallbackAndPropagatesItsError(t *testing.T) {
 		},
 	}
 
-	ext := NewExtension(log, 1, "x")(fake)
+	ext := newExtension(log, 1, "x")(fake)
 
 	invoked := false
 	_, err := ext.List(t.Context(), devicebus.ListInput{Root: root}, func(devicebus.FileRecord) error {
@@ -552,37 +566,124 @@ func TestList_InvokesCallbackAndPropagatesItsError(t *testing.T) {
 	}
 }
 
-// 10. An anchor failure does not fail the operation.
+// 10. An anchor failure does not fail the operation, and is reported on the
+// writer the extension was constructed with rather than swallowed.
 //
-// foundation/audit's journalSocketPath is unexported and that package is
-// frozen, so this package cannot point the real anchor socket at something
-// unusable from outside it. Instead this test substitutes writeAnchor, the
-// package-level indirection this package defines specifically so its own
-// tests can exercise this documented behaviour (see the comment on
-// writeAnchor and on Extension.anchor). This is the only injection seam
-// available without modifying foundation/audit.
-func TestAnchorFailure_DoesNotFailTheOperation(t *testing.T) {
+// The failing publisher is passed to NewExtension, which is the seam this
+// package now offers for it. The package-level writeAnchor variable it replaced
+// could only be reached from inside this package, which is why app/broker's
+// tests published 2,649 real anchors into this host's journal before the seam
+// moved into the constructor.
+func TestAnchorFailure_DoesNotFailTheOperationAndIsReported(t *testing.T) {
 	log, path := newTestLog(t)
 	ser := mustSerial(t, "emulator-5554")
 
-	saved := writeAnchor
-	writeAnchor = func(audit.Anchor) error { return errors.New("journal socket unreachable") }
-	t.Cleanup(func() { writeAnchor = saved })
+	reason := errors.New("dial journal socket /run/systemd/journal/socket: permission denied")
 
+	var stderr strings.Builder
 	fake := &fakeExtBusiness{}
-	ext := NewExtension(log, 1, "x")(fake)
+	ext := NewExtension(log, 1, "x", func(*audit.Log) error { return reason }, &stderr)(fake)
 
-	if _, err := ext.Probe(t.Context(), ser); err != nil {
+	dev, err := ext.Probe(t.Context(), ser)
+	if err != nil {
 		t.Fatalf("Probe: unexpected error despite anchor failure: %v", err)
+	}
+	if dev.Serial != ser {
+		t.Errorf("Probe returned Serial %v, want the delegate's %v: an anchor failure must not alter the result", dev.Serial, ser)
 	}
 
 	recs := readRecords(t, path)
 	if len(recs) != 1 {
 		t.Fatalf("got %d records, want 1 (the append must still have happened)", len(recs))
 	}
+
+	// The line has to name the reason: which of "no socket", "permission denied"
+	// and "field rejected" it is decides what an operator does next, and a bare
+	// "anchor failed" would send them back to guessing.
+	if got := stderr.String(); !strings.Contains(got, reason.Error()) {
+		t.Errorf("stderr = %q, want it to name the wrapped reason %q", got, reason.Error())
+	}
 }
 
-// 11. Extension ordering: wrap a fake with this extension via
+// 11. The report is made once per run, however many operations fail to anchor.
+//
+// Every operation anchors, so a first-ever run is roughly 20,000 of them, and a
+// permanently broken socket would otherwise put 20,000 identical lines on stderr
+// and bury the per-operation messages an operator is reading it for. The FIRST
+// failure is the diagnostic, so what this asserts is that it gets through and
+// that the rest do not repeat it.
+func TestAnchorFailure_IsReportedOnceNotPerOperation(t *testing.T) {
+	log, _ := newTestLog(t)
+	ser := mustSerial(t, "emulator-5554")
+
+	var stderr strings.Builder
+	fake := &fakeExtBusiness{}
+	ext := NewExtension(log, 1, "x", func(*audit.Log) error { return errors.New("socket unreachable") }, &stderr)(fake)
+
+	for range 5 {
+		if _, err := ext.Probe(t.Context(), ser); err != nil {
+			t.Fatalf("Probe: unexpected error: %v", err)
+		}
+	}
+
+	if got := strings.Count(stderr.String(), "socket unreachable"); got != 1 {
+		t.Errorf("stderr reported the anchor failure %d times over 5 failing anchors, want exactly 1:\n%s", got, stderr.String())
+	}
+}
+
+// 12. A successful anchor says nothing at all. stderr is a diagnostic stream,
+// and a line per operation on a healthy host would train an operator to ignore
+// the one line that matters.
+func TestAnchorSuccess_ReportsNothing(t *testing.T) {
+	log, _ := newTestLog(t)
+	ser := mustSerial(t, "emulator-5554")
+
+	var stderr strings.Builder
+	anchored := 0
+
+	fake := &fakeExtBusiness{}
+	ext := NewExtension(log, 1, "x", func(l *audit.Log) error {
+		anchored++
+
+		if l == nil {
+			t.Error("the extension anchored a nil log")
+		}
+
+		return nil
+	}, &stderr)(fake)
+
+	if _, err := ext.Probe(t.Context(), ser); err != nil {
+		t.Fatalf("Probe: unexpected error: %v", err)
+	}
+
+	if anchored != 1 {
+		t.Errorf("the log was anchored %d times for one operation, want 1", anchored)
+	}
+
+	if stderr.String() != "" {
+		t.Errorf("stderr = %q, want nothing for a successful anchor", stderr.String())
+	}
+}
+
+// 13. Nothing an anchor failure produces may reach a writer other than the one
+// stderr the extension was given — and a nil one is discarded rather than fatal.
+func TestAnchorFailure_WithNoWriterIsStillHarmless(t *testing.T) {
+	log, path := newTestLog(t)
+	ser := mustSerial(t, "emulator-5554")
+
+	fake := &fakeExtBusiness{}
+	ext := NewExtension(log, 1, "x", func(*audit.Log) error { return errors.New("nowhere to report this") }, nil)(fake)
+
+	if _, err := ext.Probe(t.Context(), ser); err != nil {
+		t.Fatalf("Probe: unexpected error with a nil report writer: %v", err)
+	}
+
+	if recs := readRecords(t, path); len(recs) != 1 {
+		t.Fatalf("got %d records, want 1", len(recs))
+	}
+}
+
+// 14. Extension ordering: wrap a fake with this extension via
 // devicebus.NewBusiness and assert records are still written when it is one
 // of several extensions.
 type passThroughExt struct {
@@ -646,7 +747,7 @@ func TestExtension_WorksAmongSeveralExtensions(t *testing.T) {
 
 	var calls []string
 	before := newPassThroughExt("before", &calls)
-	auditExt := NewExtension(log, 7, "asserted")
+	auditExt := newExtension(log, 7, "asserted")
 	after := newPassThroughExt("after", &calls)
 
 	biz := devicebus.NewBusiness(store, before, auditExt, after)

@@ -89,7 +89,7 @@ const (
 	exitUsage = 2
 )
 
-// The seams this package is tested through. All three are unexported package variables, so
+// The seams this package is tested through. All of them are unexported package variables, so
 // nothing outside the package — and nothing at runtime — can move them: they are visible to
 // this package's own tests and to the fixture build, and to nothing else.
 var (
@@ -107,6 +107,19 @@ var (
 	// substitute a fake so no phone is needed, and the fixture build substitutes a store
 	// that serves a local directory.
 	newStorer = func(brokerVersion string) devicebus.Storer { return adbsyncdb.NewStore(brokerVersion) }
+
+	// publishAnchor publishes an anchor of the audit log's tail. It is the ONE place this
+	// binary anchors from — the audit extension is handed it, and denyBeforeBus calls it —
+	// so a run cannot advance the chain head down one path and anchor down another.
+	//
+	// It is a seam because without one this package's tests publish real anchors into the
+	// host's journal: 3,321 entries stamped _EXE=…/broker.test are permanently in this
+	// host's, claiming chain heads for logs in temporary directories that no longer exist.
+	// Journal entries cannot be removed, so every one of them is noise a future verify has
+	// to discard forever. The narrower alternative was considered and rejected — see
+	// foundation/audit's journalSocketPath, which stays unexported precisely so that no
+	// production caller can aim the broker's anchors anywhere.
+	publishAnchor deviceaudit.AnchorFunc = audit.AnchorTail
 
 	// stdinReader is this process's standard input, read only by verify's --anchors - form.
 	// Main's signature carries the two OUTPUT streams, so this is what makes the stdin path
@@ -257,10 +270,14 @@ type env struct {
 // it. It is the field in the audit record to trust; clientAsserted, from --client, is a
 // caller-controlled label and is evidence of nothing, which is why it is recorded under a
 // name nobody can mistake for a verified identity.
+//
+// The extension is handed publishAnchor and this invocation's stderr. It anchors after every
+// record it writes and reports the first failure to publish one on stderr; it never reports
+// an anchor failure on stdout, in the exit status, or in the error a subcommand returns.
 func (e env) bus(clientAsserted string) devicebus.ExtBusiness {
 	return devicebus.NewBusiness(
 		newStorer(version),
-		deviceaudit.NewExtension(e.log, os.Getuid(), clientAsserted),
+		deviceaudit.NewExtension(e.log, os.Getuid(), clientAsserted, publishAnchor, e.stderr),
 	)
 }
 
@@ -277,9 +294,6 @@ func (e env) emit(v any) int {
 	return exitOK
 }
 
-// fail writes the error object for err, classified by whatever code err carries, and
-// reports exitError. path is the caller's own path for the operation, or "" when the
-// failure names none.
 // validClientLabel returns raw if it is an acceptable --client label, and empty otherwise.
 //
 // Used only when recording a refusal, where the label may be the very thing that was
@@ -291,6 +305,25 @@ func validClientLabel(raw string) string {
 	}
 
 	return label
+}
+
+// anchor publishes an anchor of the audit log's tail and reports a failure to do so on
+// stderr, without changing what this invocation reports to its caller.
+//
+// It exists for the one record this binary appends outside the audit extension — see
+// denyBeforeBus — and it deliberately reads exactly like the extension's own anchoring,
+// because it must: both advance the same chain head, and the invariant the extension
+// documents is that the LAST operation of a process always anchors. Both route through
+// publishAnchor, so the anchor is built in one place (audit.AnchorTail) and neither path
+// can drift into publishing a differently shaped claim about the same log.
+//
+// A failure is reported and nothing more. stderr, never stdout, and never the exit status
+// or the error object: the refusal happened and was recorded either way, and an anchor is a
+// detectability aid for a truncated tail, not a precondition for the record it describes.
+func (e env) anchor() {
+	if err := publishAnchor(e.log); err != nil {
+		fmt.Fprintf(e.stderr, "adb-broker: %v\n", err)
+	}
 }
 
 // denyBeforeBus records a refusal that never reached the Business layer, then reports it.
@@ -309,10 +342,18 @@ func validClientLabel(raw string) string {
 //
 // A failure to write the record does not change what is reported to the caller. The
 // operation was refused either way, and inventing a different outcome because the log
-// write failed would misreport the refusal.
+// write failed would misreport the refusal. The same is true of a failure to anchor it.
+//
+// The anchor is not optional here, and the first version of this method left it out. A run
+// consisting only of a flag-boundary denial appended a record — advancing the log's chain
+// head — and published nothing, which breaks the invariant deviceaudit.anchor documents:
+// the LAST operation of a process always anchors. The effect was precisely inverted from
+// the intent. A caller repeatedly probing paths it has no business reading is the pattern
+// this record type exists to catch, and it was the one record type whose tail no anchor
+// covered, so a truncation that removed exactly those records could not be detected.
 func (e env) denyBeforeBus(op, rawPath, clientAsserted string, err error) int {
 	if e.log != nil {
-		_, _ = e.log.Append(audit.Record{
+		_, appendErr := e.log.Append(audit.Record{
 			TS:        time.Now(),
 			Op:        op,
 			CallerUID: os.Getuid(),
@@ -330,11 +371,26 @@ func (e env) denyBeforeBus(op, rawPath, clientAsserted string, err error) int {
 			// object says, or the log and the consumer would disagree about one event.
 			Result: requestCode(err).String(),
 		})
+
+		// Only a record that actually landed is anchored. A failed Append left the chain
+		// head where it was, and anchoring the unchanged head would publish a claim about
+		// a record this run did not write.
+		if appendErr == nil {
+			e.anchor()
+		}
 	}
 
-	return e.failCode(requestCode(err), displayBytes(rawPath), err)
+	// The RAW bytes, not a display rendering: the error object carries path_b64 as well as
+	// path, and a refused path is exactly the case where the raw bytes may not be valid
+	// UTF-8. fromBusErrorResponse does the one coercion.
+	return e.failCode(requestCode(err), rawPath, err)
 }
 
+// fail writes the error object for err, classified by whatever code err carries, and
+// reports exitError.
+//
+// path is the caller's RAW path bytes for the operation, or "" when the failure names none.
+// See writeError for why it must not be coerced on the way in.
 func (e env) fail(path string, err error) int {
 	return e.failCode(errcode.From(err), path, err)
 }
@@ -362,16 +418,16 @@ func (e env) failUsage(err error) int {
 //
 // Message is free-form and for humans only. A consumer branches on Code and logs Message;
 // nothing anywhere parses it.
+//
+// path is the caller's RAW path bytes, not a display string. The error object carries both
+// path and path_b64, and only the raw bytes can produce an authoritative path_b64 — so the
+// UTF-8 coercion happens once, inside fromBusErrorResponse, rather than at each call site.
+// Coercing first and base64-ing the result would publish the base64 of a string full of
+// U+FFFD under a member name that promises the opposite.
 func (e env) writeError(code errcode.Code, path string, err error) {
 	fmt.Fprintf(e.stderr, "adb-broker: %v\n", err)
 
-	res := ErrorResponse{
-		Proto:   proto,
-		Status:  statusError,
-		Code:    code.String(),
-		Path:    path,
-		Message: err.Error(),
-	}
+	res := fromBusErrorResponse(code, path, err)
 
 	if werr := writeJSON(e.stdout, res); werr != nil {
 		fmt.Fprintf(e.stderr, "adb-broker: write the error object to stdout: %v\n", werr)
@@ -455,18 +511,31 @@ func flush(w io.Writer) error {
 }
 
 // usage describes the four subcommands. It goes to stderr, always.
+//
+// The journalctl line interpolates audit.MessageID rather than spelling it out. An operator
+// copies that command verbatim, so a hard-coded copy that drifted from the constant would
+// hand them a filter matching no anchors at all — and "no anchors found" is what a truncated
+// tail also looks like.
 func usage(w io.Writer) {
-	fmt.Fprint(w, `adb-broker — read-only, audited access to a phone's media over the adb sync protocol
+	fmt.Fprintf(w, `adb-broker — read-only, audited access to a phone's media over the adb sync protocol
 
 usage:
   adb-broker probe  [--serial <id>] [--client <name>]
   adb-broker list   --root <path> [--max-depth <n>] [--serial <id>] [--client <name>]
   adb-broker fetch  --path <path> [--serial <id>] [--client <name>]
-  adb-broker verify [--log <path>] --anchors <path|->
+  adb-broker verify [--log <path>] --anchors -
+
+verify compares the audit log against the anchors published to the journal, which is the only
+check that detects a truncated tail. It reads them from stdin, because this binary runs at the
+broker's own uid and that uid deliberately cannot read the journal files:
+
+  journalctl -o json MESSAGE_ID=%s | adb-broker verify --anchors -
+
+--anchors also accepts a journal file or glob, for a host where this process can read one.
 
 stdout carries the protocol (JSON) and nothing else; this text and every other human-facing
 message go to stderr. The audit log's location is compiled in and cannot be changed by a
 flag, an environment variable or a configuration file, and no environment variable is read
 for any purpose.
-`)
+`, audit.MessageID)
 }

@@ -3,6 +3,7 @@ package broker
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -84,6 +85,82 @@ func TestRejectedClientLabelIsRecordedWithoutTheLabel(t *testing.T) {
 	}
 	if records[0].ClientAsserted != "" {
 		t.Errorf("ClientAsserted = %q, want empty for a rejected label", records[0].ClientAsserted)
+	}
+}
+
+// A run that is nothing but a flag-boundary denial must publish an anchor for the chain head
+// it just advanced.
+//
+// This is the defect the first version of denyBeforeBus had. It appended the record — the log
+// grew, its head moved — and published nothing, so the invariant deviceaudit.anchor documents
+// ("the LAST operation of a process always anchors") held for every record EXCEPT this one.
+// The effect was exactly inverted from the intent: a caller repeatedly probing paths it has no
+// business reading is the pattern this record type exists to catch, and it was the one record
+// type whose tail no anchor covered, so a truncation removing precisely those records could
+// not be detected.
+func TestADenialOnlyRunAnchorsTheChainHeadItAdvanced(t *testing.T) {
+	logPath := newAuditLog(t)
+	published := captureAnchors(t)
+	store := newFakeStore()
+
+	got := runWithLog(t, logPath, store, "list", "--root", "/data/data")
+
+	if got.exit == 0 {
+		t.Fatalf("a denied root exited 0; stdout: %s", got.stdout)
+	}
+
+	summary, records := readLog(t, logPath)
+	if len(records) != 1 {
+		t.Fatalf("audit log holds %d records, want exactly 1", len(records))
+	}
+
+	if len(*published) != 1 {
+		t.Fatalf("a denial-only run published %d anchors, want exactly 1 for the record it wrote", len(*published))
+	}
+
+	anchor := (*published)[0]
+
+	// The anchor has to name the NEW head. An anchor for the previous one would be a claim
+	// about a log this run had already changed, and verify would read it as a shortened chain.
+	switch {
+	case anchor.seq != summary.LastSeq:
+		t.Errorf("the anchor claims seq %d, want %d, the sequence number the denial wrote", anchor.seq, summary.LastSeq)
+	case anchor.hash != summary.LastHash:
+		t.Errorf("the anchor claims head %s, want %s, the chain head after the denial", anchor.hash, summary.LastHash)
+	case anchor.log != logPath:
+		t.Errorf("the anchor names log %q, want %q: an anchor that does not say which log it describes is evidence about none", anchor.log, logPath)
+	}
+}
+
+// An anchor that cannot be published changes nothing the caller sees, on the deny path exactly
+// as on the recorded-operation path. The refusal happened and was recorded either way, and an
+// anchor is a detectability aid for a truncated tail, not a precondition for the record it
+// describes. It is reported on stderr, naming the reason, and nowhere else.
+func TestADenialWhoseAnchorCannotBePublishedIsReportedUnchanged(t *testing.T) {
+	logPath := newAuditLog(t)
+
+	reason := "dial journal socket /run/systemd/journal/socket: permission denied"
+	swap(t, &publishAnchor, func(*audit.Log) error { return errors.New(reason) })
+
+	got := runWithLog(t, logPath, newFakeStore(), "list", "--root", "/data/data")
+
+	// Byte for byte what a working anchor path produces: one path_denied error object.
+	out := lines(t, got.stdout)
+	if len(out) != 1 || !strings.Contains(out[0], `"code":"path_denied"`) {
+		t.Fatalf("stdout changed because an anchor failed:\n%s", got.stdout)
+	}
+
+	if got.exit != exitError {
+		t.Errorf("exit = %d, want %d: an anchor failure must not move the exit status", got.exit, exitError)
+	}
+
+	if !strings.Contains(got.stderr, reason) {
+		t.Errorf("stderr does not name why the anchor failed, which is the whole diagnostic:\n%s", got.stderr)
+	}
+
+	// And the record itself is still there and still verifies.
+	if _, records := readLog(t, logPath); len(records) != 1 {
+		t.Errorf("audit log holds %d records, want 1: the refusal must be recorded whether or not it could be anchored", len(records))
 	}
 }
 

@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"encoding/base64"
 	"fmt"
 	"strings"
 
@@ -8,6 +9,7 @@ import (
 	"github.com/jroedel/adb-broker/business/types/devicepath"
 	"github.com/jroedel/adb-broker/business/types/errcode"
 	"github.com/jroedel/adb-broker/business/types/serial"
+	"github.com/jroedel/adb-broker/foundation/audit"
 	"github.com/jroedel/adb-broker/foundation/errs"
 )
 
@@ -154,7 +156,7 @@ func toVerifyInput(req VerifyRequest) (verifyInput, error) {
 		// Required rather than defaulted to the system journal: the anchor comparison is the
 		// only check that can detect a truncated tail, and an operator who did not say where
 		// the anchors are must not be told the log verified.
-		fieldErrors.Addf("anchors", `is required: name a journal file or glob, or "-" to read newline-delimited JSON anchors from stdin`)
+		fieldErrors.Addf("anchors", `is required: "-" reads newline-delimited JSON anchors from stdin, which is the only form that works on a setuid install (pipe "journalctl -o json MESSAGE_ID=`+audit.MessageID+`" run as root); a journal file or glob is accepted only where this process can read the journal files`)
 	}
 
 	if !fieldErrors.Empty() {
@@ -247,15 +249,37 @@ func isClientByte(b byte) bool {
 // there is no App-side representation of the pinned volume anywhere in this package, which
 // is what makes "the volume never crosses into the App layer" a fact rather than a rule to
 // remember.
+//
+// Model is copied through and is always empty in practice. Neither store can populate it:
+// reading a device model needs a shell, and this binary has none and never will. The member
+// stays because it is in the published contract, not because anything fills it.
+//
+// Allowlist is the one member that does NOT come from dev, and that is the deliberate part.
+// devicepath.Roots reports what THIS BINARY compiled in — nothing the phone said, nothing a
+// Storer measured — so routing it through devicebus.Device would have both stores populate a
+// compiled constant neither of them learned from a device: two chances to derive one list
+// differently, and a value the audit extension would then record on every probe as though it
+// were device state. Contrast the pinned Volume, which travels outward precisely because only
+// the Storer can know it. The allowlist is readable identically from every layer, so it is
+// read here, at the one edge that reports it.
+//
+// Roots already returns a sorted copy of the allowlist in force, so this must not sort,
+// filter or re-derive it — and it must never be built from a second list of roots kept here,
+// which would be a copy free to drift from the one ParseAuthorizedPath enforces.
+//
+// AttachedDevices is copied through as the int the Storer counted. See ProbeResponse for what
+// it counts, which is not what a reader expects.
 func fromBusDeviceResponse(dev devicebus.Device) ProbeResponse {
 	return ProbeResponse{
-		Proto:  proto,
-		Status: statusOK,
-		Serial: dev.Serial.String(),
-		State:  dev.State,
-		Model:  dev.Model,
-		Broker: dev.BrokerVersion,
-		ADB:    dev.ServerVersion,
+		Proto:           proto,
+		Status:          statusOK,
+		Serial:          dev.Serial.String(),
+		State:           dev.State,
+		Model:           dev.Model,
+		Broker:          dev.BrokerVersion,
+		ADB:             dev.ServerVersion,
+		AttachedDevices: dev.AttachedDevices,
+		Allowlist:       devicepath.Roots(),
 	}
 }
 
@@ -299,8 +323,9 @@ func fromBusListSummaryResponse(sum devicebus.ListSummary) ListSummaryResponse {
 	pathErrors := make([]PathErrorResponse, len(sum.Errors))
 	for i, pe := range sum.Errors {
 		pathErrors[i] = PathErrorResponse{
-			Code: pe.Code.String(),
-			Path: displayPath(pe.Path),
+			Code:    pe.Code.String(),
+			Path:    displayPath(pe.Path),
+			PathB64: pe.Path.Base64(),
 		}
 	}
 
@@ -327,6 +352,35 @@ func fromBusFetchResultResponse(result devicebus.FetchResult) FetchTrailer {
 		Status: statusOK,
 		Bytes:  result.Bytes,
 		SHA256: result.SHA256,
+	}
+}
+
+// fromBusErrorResponse builds the error object writeError puts on stdout, from rawPath —
+// the RAW bytes of the path the failing operation named, never a value that has already
+// been through displayBytes.
+//
+// This is the one place both Path and PathB64 are built, and it exists because they must
+// be built from the SAME string. writeError's callers (fail, failCode, failUsage,
+// denyBeforeBus, all in broker.go) sit on the far side of the App/Business boundary from a
+// device path's raw bytes, and the historical shortcut was to coerce to display form once,
+// close to where the path was obtained, and hand that single string all the way down to
+// ErrorResponse. That shortcut is exactly what would make PathB64 wrong: Base64-encoding an
+// already-coerced string encodes U+FFFD in place of whatever byte sequence was actually
+// rejected, producing a value that looks authoritative and is not. Threading rawPath down to
+// this converter instead of re-deriving one string from the other is the only way both
+// members describe the same bytes.
+//
+// rawPath == "" means the failure names no path at all, not an empty one. Path and PathB64
+// both come out as their zero value in that case, and ErrorResponse omits both via the same
+// omitzero tag, so a consumer never has to tell "no path" from "the empty path".
+func fromBusErrorResponse(code errcode.Code, rawPath string, err error) ErrorResponse {
+	return ErrorResponse{
+		Proto:   proto,
+		Status:  statusError,
+		Code:    code.String(),
+		Path:    displayBytes(rawPath),
+		PathB64: base64.StdEncoding.EncodeToString([]byte(rawPath)),
+		Message: err.Error(),
 	}
 }
 

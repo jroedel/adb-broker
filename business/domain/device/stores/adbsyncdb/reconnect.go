@@ -124,6 +124,19 @@ func (s *Store) connectLocked(ctx context.Context, want serial.Serial) (*session
 			serverVersion: serverVersion,
 			brokerVersion: s.brokerVersion,
 			features:      features,
+
+			// Counted from the reply already in hand. host:devices returns the WHOLE
+			// list — adbwire parses every line of the payload and selectDevice then picks
+			// one out of it — so this costs no extra request and cannot disagree with the
+			// selection: it is the same slice. Asking the server again would be both
+			// slower and less truthful, since a replug between the two requests would
+			// have this number describe a different set of phones than the one the
+			// transport was selected from.
+			//
+			// It is therefore the count as of THIS session's establishment, not a live
+			// one. A reconnect re-reads it, so a rebuilt session reports the list the
+			// rebuild saw. The broker is one-shot, so that is the only count there is.
+			attachedDevices: len(entries),
 		},
 	}, nil
 }

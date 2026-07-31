@@ -291,6 +291,43 @@ func TestFromBusListSummaryResponse(t *testing.T) {
 	}
 }
 
+func TestFromBusListSummaryResponseRoundTripsANonUTF8Path(t *testing.T) {
+	// Defect C, part 1. Before the fix PathErrorResponse had no path_b64, so a per-path
+	// error naming a filename that is not valid UTF-8 could not be acted on: Path is
+	// necessarily lossy for such a name, and there was no authoritative companion. This
+	// mirrors TestFromBusFileRecordResponseCoercesOnlyTheHumanReadablePath, which already
+	// establishes that /sdcard/DCIM/Camera accepts a non-UTF-8 leaf name.
+	raw := "/sdcard/DCIM/Camera/locked_\xff\xfe"
+
+	sum := devicebus.ListSummary{Errors: []devicebus.PathError{
+		{Path: devicepath.MustParseAuthorizedPath(raw), Code: errcode.CodePermissionDenied},
+	}}
+
+	res := fromBusListSummaryResponse(sum)
+	if len(res.Errors) != 1 {
+		t.Fatalf("got %d errors, want 1", len(res.Errors))
+	}
+
+	pe := res.Errors[0]
+
+	if pe.Path == raw {
+		t.Error("path carries the raw bytes; a JSON string cannot, so it must be coerced")
+	}
+
+	if !strings.Contains(pe.Path, "�") {
+		t.Errorf("path = %q, want the invalid bytes replaced", pe.Path)
+	}
+
+	decoded, err := base64.StdEncoding.DecodeString(pe.PathB64)
+	if err != nil {
+		t.Fatalf("decode path_b64: %v", err)
+	}
+
+	if string(decoded) != raw {
+		t.Errorf("path_b64 decodes to %q, want the raw bytes %q", decoded, raw)
+	}
+}
+
 func TestFromBusListSummaryResponseCarriesTheCodeEachPathFailureDecided(t *testing.T) {
 	sum := devicebus.ListSummary{Errors: []devicebus.PathError{
 		{Path: devicepath.MustParseAuthorizedPath("/sdcard/DCIM/a"), Code: errcode.CodePermissionDenied},
@@ -351,6 +388,68 @@ func TestToVerifyInput(t *testing.T) {
 
 	if _, err := toVerifyInput(VerifyRequest{AnchorsPath: "-"}); err == nil {
 		t.Error("an empty --log was accepted")
+	}
+}
+
+func TestFromBusErrorResponse(t *testing.T) {
+	res := fromBusErrorResponse(errcode.CodeRootNotFound, "/sdcard/NOPE", errors.New("no such file or directory"))
+
+	switch {
+	case res.Proto != proto:
+		t.Errorf("proto = %d", res.Proto)
+	case res.Status != statusError:
+		t.Errorf("status = %q", res.Status)
+	case res.Code != "root_not_found":
+		t.Errorf("code = %q", res.Code)
+	case res.Path != "/sdcard/NOPE":
+		t.Errorf("path = %q", res.Path)
+	case res.PathB64 != "L3NkY2FyZC9OT1BF":
+		t.Errorf("path_b64 = %q", res.PathB64)
+	case res.Message != "no such file or directory":
+		t.Errorf("message = %q", res.Message)
+	}
+}
+
+func TestFromBusErrorResponseOmitsBothPathMembersForAnEmptyRawPath(t *testing.T) {
+	// rawPath == "" means the failure names no path at all, not an empty one: Path and
+	// PathB64 must both come out zero, or the omitzero tags on ErrorResponse would disagree
+	// with each other about whether a path was named.
+	res := fromBusErrorResponse(errcode.CodeNoDevice, "", errors.New("no device is attached"))
+
+	if res.Path != "" {
+		t.Errorf("path = %q, want empty", res.Path)
+	}
+
+	if res.PathB64 != "" {
+		t.Errorf("path_b64 = %q, want empty", res.PathB64)
+	}
+}
+
+func TestFromBusErrorResponseThreadsTheRawBytesRatherThanReDerivingThem(t *testing.T) {
+	// Defect C, part 2, and the whole difficulty of that fix: rawPath must reach this
+	// converter BEFORE displayBytes has coerced it, so Path and PathB64 are built from the
+	// same string. If a caller instead coerced first and handed this converter the coerced
+	// string, PathB64 would decode to bytes containing U+FFFD rather than the raw path the
+	// operation actually named — which looks authoritative and is not.
+	raw := "/sdcard/DCIM/Camera/locked_\xff\xfe"
+
+	res := fromBusErrorResponse(errcode.CodePermissionDenied, raw, errors.New("denied"))
+
+	if res.Path == raw {
+		t.Error("path carries the raw bytes; a JSON string cannot, so it must be coerced")
+	}
+
+	if !strings.Contains(res.Path, "�") {
+		t.Errorf("path = %q, want the invalid bytes replaced", res.Path)
+	}
+
+	decoded, err := base64.StdEncoding.DecodeString(res.PathB64)
+	if err != nil {
+		t.Fatalf("decode path_b64: %v", err)
+	}
+
+	if string(decoded) != raw {
+		t.Errorf("path_b64 decodes to %q, want the raw bytes %q", decoded, raw)
 	}
 }
 

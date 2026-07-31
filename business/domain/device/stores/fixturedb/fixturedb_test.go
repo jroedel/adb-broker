@@ -542,6 +542,28 @@ func TestProbeReportsFixtureState(t *testing.T) {
 	}
 }
 
+// A fixture serves exactly one synthetic device, so its probe reports the unambiguous case
+// a consumer uses the count to detect: with 1 attached device a fetch that names no serial
+// cannot be ambiguous, so the consumer can drop --serial and the probe-per-fetch it costs.
+// A fixture reporting 0 would send a consumer down the "name the device" branch that fixture
+// mode exists to let it avoid rehearsing against a phone.
+func TestProbeReportsExactlyOneAttachedDevice(t *testing.T) {
+	st := NewStore(t.TempDir(), testBrokerVer)
+
+	for _, ser := range []serial.Serial{{}, serial.MustParseSerial(fixtureSerial)} {
+		dev, err := st.Probe(t.Context(), ser)
+		if err != nil {
+			t.Fatalf("Probe(%q): %v", ser.String(), err)
+		}
+
+		// Naming the serial must not change the count: it is a count of what is attached,
+		// not of what matched.
+		if dev.AttachedDevices != 1 {
+			t.Errorf("Probe(%q): AttachedDevices = %d, want 1", ser.String(), dev.AttachedDevices)
+		}
+	}
+}
+
 func TestProbeAcceptsItsOwnSerial(t *testing.T) {
 	st := NewStore(t.TempDir(), testBrokerVer)
 

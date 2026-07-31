@@ -31,12 +31,30 @@
 //
 // Seq, Prev, Hash and TS belong to foundation/audit. This package does not compute
 // them, so a record cannot claim a position in the chain it does not hold.
+//
+// # Why a failed anchor is announced but never fatal
+//
+// An anchor failure cannot fail, retry or retroactively alter an operation that has
+// already been recorded — see Extension.anchor for why. The consequence of that,
+// unstated in the first draft of this package and paid for immediately, is that a
+// PERMANENTLY broken anchor path is invisible: the first setuid install ran, wrote
+// its audit record, published no anchor at all, and nothing said so, because the
+// error was discarded. verify could then only report that a truncated tail "could
+// not be ruled out" — the guarantee going unenforced, quietly.
+//
+// So the failure is reported on stderr, once per run, naming the wrapped reason.
+// Never on stdout, which carries this binary's protocol and nothing else; never in
+// the exit status; never in the error returned by Probe, List or Fetch, which this
+// package promises to pass through exactly as received. Reporting is the whole of
+// the change: an operator learns the anchor path is broken, and the operation the
+// caller asked for is unaffected in every observable way.
 package deviceaudit
 
 import (
 	"context"
-	"encoding/hex"
+	"fmt"
 	"io"
+	"sync"
 	"time"
 
 	"github.com/jroedel/adb-broker/business/domain/device/devicebus"
@@ -46,13 +64,24 @@ import (
 	"github.com/jroedel/adb-broker/foundation/audit"
 )
 
-// writeAnchor is audit.WriteAnchor, indirected through a package variable so
-// this package's own tests can substitute a failing implementation and prove
-// that an anchor failure does not affect the audited operation. This is the
-// only seam available for that: foundation/audit's journalSocketPath variable
-// is unexported and the package is frozen, so a test outside it has no other
-// way to point an anchor at an unreachable socket.
-var writeAnchor = audit.WriteAnchor
+// AnchorFunc publishes an anchor of a log's current tail. audit.AnchorTail is the
+// only implementation in the production build.
+//
+// It is a parameter of NewExtension rather than a direct call to audit.AnchorTail,
+// for one reason: the package that WIRES this extension can then hold it in an
+// unexported seam of its own and keep test anchors off the host's real journal
+// socket. That is not a hypothetical tidiness — 3,321 anchors published by
+// broker.test and deviceaudit.test are permanent residents of this host's journal,
+// claiming sequence numbers and chain heads for logs in long-deleted temporary
+// directories, because no such seam existed.
+//
+// It grants nothing. Whoever constructs this extension already hands it the
+// *audit.Log itself, so it already decides where records go; deciding where the
+// anchors describing them go is strictly less authority than that. What keeps both
+// honest is that only compiled-in code constructs the extension — app/broker's
+// audit log path is a constant and its seams are unexported package variables — not
+// that this argument is absent.
+type AnchorFunc func(*audit.Log) error
 
 // Extension decorates a devicebus.ExtBusiness, appending one audit.Record for
 // every Probe, List and Fetch call it delegates.
@@ -61,19 +90,52 @@ type Extension struct {
 	log            *audit.Log
 	callerUID      int
 	clientAsserted string
+
+	// writeAnchor publishes the tail anchor after each appended record.
+	writeAnchor AnchorFunc
+
+	// stderr is where a failure to publish one is reported, and the reason this
+	// type holds a writer at all. It is a plain field rather than an option
+	// because there is exactly one destination an anchor failure may go to and
+	// no caller has a reason to vary it — an option would only invite one to.
+	stderr io.Writer
+
+	// reportAnchorFailure limits that report to the first failure of the run.
+	// See anchor for why once and not every time.
+	reportAnchorFailure sync.Once
 }
 
 // NewExtension returns a devicebus.Extension that appends one audit.Record to
 // log for every ExtBusiness call the wrapped bus performs, tagging each
 // record with callerUID and clientAsserted. log must already be open (see
 // audit.Open); this package never creates or closes it.
-func NewExtension(log *audit.Log, callerUID int, clientAsserted string) devicebus.Extension {
+//
+// anchor publishes the tail anchor after each record; see AnchorFunc for why the
+// caller supplies it. A nil anchor is audit.AnchorTail, so a wiring mistake cannot
+// silently disable anchoring — the same reasoning that makes the broker open its
+// audit log unconditionally rather than as a side effect of wiring this extension.
+//
+// stderr receives the one line an anchor failure produces. A nil stderr discards
+// it: a caller with nowhere to report is a caller with nowhere to report, and
+// panicking mid-operation over a diagnostic would make the anchor exactly as load
+// bearing as this package documents it is not.
+func NewExtension(log *audit.Log, callerUID int, clientAsserted string, anchor AnchorFunc, stderr io.Writer) devicebus.Extension {
+	if anchor == nil {
+		anchor = audit.AnchorTail
+	}
+
+	if stderr == nil {
+		stderr = io.Discard
+	}
+
 	return func(bus devicebus.ExtBusiness) devicebus.ExtBusiness {
 		return &Extension{
 			bus:            bus,
 			log:            log,
 			callerUID:      callerUID,
 			clientAsserted: clientAsserted,
+			writeAnchor:    anchor,
+			stderr:         stderr,
 		}
 	}
 }
@@ -158,10 +220,11 @@ type entry struct {
 // append builds and writes one audit.Record for e, then publishes a
 // best-effort anchor of the log's new tail.
 //
-// Neither an Append failure nor a WriteAnchor failure is surfaced to the
+// Neither an Append failure nor an anchor failure is surfaced to the
 // caller of Probe, List or Fetch — those methods always return exactly what
 // the wrapped bus returned. For the anchor this is a deliberate design
-// choice, explained on the WriteAnchor call below. For Append itself, the
+// choice, explained on anchor below; the failure is reported on stderr
+// instead, which is a diagnostic and not a change of outcome. For Append itself, the
 // alternative — inventing a synthetic error when the log write fails —would
 // mean an operation's returned error no longer reflects what the delegate
 // actually did, which is the one thing this extension promises never to
@@ -206,23 +269,44 @@ func (ext *Extension) append(e entry) {
 // that nothing in the frozen seam calls.
 //
 // A failure here — no journald socket (a non-systemd host), a full socket
-// buffer, or an anchor field this run's log path happens to violate — is
-// deliberately ignored, with no fallback and no retry: the record it would
-// describe is already durably written to the hash-chained log above by
-// append. Refusing, or retroactively failing, an operation that has already
-// completed and already been recorded because a detectability aid for TAIL
-// TRUNCATION could not be published would make the anchor more load-bearing
-// than foundation/audit's own doc comment says it is.
+// buffer, a datagram dropped on the way out of a setuid process, or an anchor
+// field this run's log path happens to violate — does not fail, retry or
+// retroactively alter anything: the record it would describe is already
+// durably written to the hash-chained log above by append. Refusing, or
+// retroactively failing, an operation that has already completed and already
+// been recorded because a detectability aid for TAIL TRUNCATION could not be
+// published would make the anchor more load-bearing than foundation/audit's
+// own doc comment says it is.
+//
+// It is, however, REPORTED, which the first draft of this method did not do —
+// it discarded the error, and a permanently broken anchor path was therefore
+// indistinguishable from a working one. What that cost is measurable: the
+// first setuid install wrote its audit record and published nothing, and the
+// only trace was verify honestly reporting that a truncated tail could not be
+// ruled out. The line carries the wrapped reason, because which of those
+// causes it is decides what an operator does next.
+//
+// Once per run, not once per operation, and this is the reason the count in the
+// paragraph above matters: every operation anchors, so a first-ever run is
+// roughly 20,000 anchors, and a permanently broken socket would produce roughly
+// 20,000 identical lines. That is not twenty thousand facts; it is one fact,
+// repeated until it has buried every other message on the stream — including the
+// per-operation errors an operator is reading stderr for in the first place. The
+// FIRST failure is what diagnoses the host, and sync.Once guarantees the first
+// one is the one that gets through rather than being sampled or rate-limited
+// into possibly never appearing.
 func (ext *Extension) anchor() {
-	head := ext.log.Head()
+	err := ext.writeAnchor(ext.log)
+	if err == nil {
+		return
+	}
 
-	_ = writeAnchor(audit.Anchor{
-		Seq:  ext.log.Seq(),
-		Hash: hex.EncodeToString(head[:]),
-		// An anchor names the log it describes. The whole point of publishing one
-		// is that it can be compared against a specific file afterwards, and on a
-		// host with more than one install "some log had this head" answers nothing.
-		LogPath: ext.log.Path(),
+	ext.reportAnchorFailure.Do(func() {
+		// stderr, never stdout: stdout carries the protocol and a consumer
+		// capturing it expecting JSON must not find prose there. The prefix
+		// matches every other operator-facing line this binary emits, so one
+		// grep finds them all.
+		fmt.Fprintf(ext.stderr, "adb-broker: %v; further anchor failures in this run are not reported\n", err)
 	})
 }
 
