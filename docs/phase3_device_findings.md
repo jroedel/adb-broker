@@ -259,3 +259,120 @@ Two related observations from the same data:
   `verify` as root to read them would filter for `_UID=0` and match nothing. The only workable
   operator path is a pipe: `journalctl` as root into a broker still at euid 995. The glob
   argument should say so rather than offering a path that cannot work.
+
+---
+
+## 9. Two numbers this project recorded as unmeasured
+
+Both were flagged as open questions rather than guesses: journald retention (ADB_BROKER.md open
+question 9, THREAT_MODEL.md §9 and T13) and a linear-walk verification speed (ADB_BROKER.md open
+question 7, phase-3-verification-plan.md Stage 7). Measured on this host, 2026-07-31.
+
+### 9.1 journald retention — the truncation-detection horizon
+
+This agent's uid (1003) is in neither `adm` nor `systemd-journal`, which is the same restriction
+§8 already documented for `verify --anchors`. `journalctl` warns about it on every invocation and
+only returns this uid's own split-by-uid entries. What follows is reported split by what was
+actually readable.
+
+**Storage is persistent, not volatile.** `/etc/systemd/journald.conf` has `Storage=` commented
+out (compile-time default `auto`), and `/var/log/journal/<machine-id>/` exists on disk (directory
+present since 2024-09-12) — `auto` with the directory present means persistent storage. Anchors
+survive a reboot on this host. There is no `/etc/systemd/journald.conf.d/` at all — no drop-ins,
+nothing overriding the shipped defaults. Every retention-relevant key in the file is commented,
+i.e. left at its compiled-in default: `SystemMaxUse=`, `SystemKeepFree=`, `SystemMaxFileSize=`
+and `MaxRetentionSec=` are all unset; `SystemMaxFiles=` defaults to 100; `MaxFileSec=` defaults to
+1 month (a per-file rotation trigger, not a deletion rule). **`MaxRetentionSec` being unset is
+the load-bearing fact**: nothing on this host deletes a journal entry for being old. Eviction only
+happens under size pressure.
+
+**Content this uid could read:** `journalctl --list-boots` (own entries only) shows the oldest
+visible boot starting Wed 2026-07-22 12:22:07 CEST — a 9-day window from today. This is not the
+retention horizon; it's the limit of what uid 1003 personally logged and can see.
+
+**Content this uid could not read but could measure via filesystem metadata:** the directory
+(`drwxr-sr-x+`, world `r-x`) is listable and stat-able by anyone, even though the `root:systemd-
+journal 0640` files inside are not (`head`/`cat` on `system.journal` confirmed: `Permission
+denied`). Archived journal filenames embed the first entry's realtime timestamp in hex
+microseconds-since-epoch; decoding the oldest surviving file's name
+(`system@...-0006516f2ee078f2.journal`) gives `1778387829946610` µs = **2026-05-10 04:37:10 UTC**,
+which matches that file's filesystem birth time exactly (`stat`: `Birth: 2026-05-10 06:37:10
++0200`), confirming the decode. That is **82 days** before today. `du -sh` on the machine-id
+directory (stat-only, no read needed) reports **1.9G** across 100 files (53 of them `system@…`);
+`df` on the containing filesystem shows **1.8T total, 481G available** — journal usage is under
+0.11% of the free space on this host. `journalctl --disk-usage` as this uid separately reports
+63.9M, which is this uid's own slice, not the total.
+
+**The horizon, stated as a sentence an operator can act on:** on this host, storage is persistent
+and no age-based eviction is configured (`MaxRetentionSec` unset), so a published anchor is not
+deleted for being old — it is only at risk once total journal usage grows enough to force
+`SystemMaxUse`/`SystemKeepFree`-driven rotation or the 100-file cap, and at the measured rate
+(1.9G in at least 82 days, against 481G free) that is not imminent on this host; but "not
+imminent today" is not a number, and nothing in the design states what the actual cap resolves to
+in days, because that cap is a percentage of free space and log volume, not a fixed duration —
+**the horizon exists, is currently long (≥ 82 days, observed), and is unquantified in days**
+because it is defined by disk headroom and journal volume rather than by time. An operator who
+wants a hard guarantee should set `MaxRetentionSec` explicitly rather than rely on this behavior,
+which is a property of default disk headroom, not a stated design guarantee.
+
+This does not overturn anything already written: THREAT_MODEL.md line 535 already says
+"unquantified," and ADB_BROKER.md's open question 9 already says the same. It replaces
+"unquantified" with what could actually be measured on this host, and adds the one fact that
+matters beyond a day count: retention here is size-bounded, not time-bounded, which the design
+had not stated either way.
+
+### 9.2 The audit hash chain's linear verify walk
+
+Two different linear walks are in play in this codebase and they should not be conflated. The
+`KEYED-HASH`-driven walk named in ADB_BROKER.md's open question 7 is `foundation/journal`'s entry-
+array traversal over systemd's own journal files, done because `KEYED-HASH` tables use SipHash-2-4
+and this repo has no SipHash implementation. That walk was **not** measured here: this uid cannot
+read the journal files needed to build a realistic-sized fixture (§9.1), and open question 7 is
+about that code path specifically, not about `foundation/audit`.
+
+What was measured is `foundation/audit`'s own linear walk: `VerifyChain` in `log.go`, which reads
+the audit log start-to-finish and recomputes every record's SHA-256 chain link
+(`record.go:HashRecord`). This is the walk that decides whether the *audit log's own* `verify`
+stays practical as that log grows — a related question, not the same one, and one the docs had
+also left unquantified.
+
+**Method.** A standalone Go module in scratchpad (`auditbench`, `replace`-directed at this repo's
+module path — nothing added to `/opt/projects/adb-broker`) built synthetic logs through the
+package's real `audit.Open`/`audit.Append` path, one record per call, then timed a single
+`audit.VerifyChain` pass over the resulting file. Three sizes, three repetitions each:
+
+| Records | File size | Wall clock (3 runs) | Records/sec (3 runs) | Per record (3 runs) |
+|---|---|---|---|---|
+| 10,000 | 4,848,151 B | 116.6 / 113.6 / 113.2 ms | 85,762 / 88,057 / 88,356 | 11.66 / 11.36 / 11.32 µs |
+| 50,000 | 24,329,274 B | 564.1 / 587.3 / 572.9 ms | 88,634 / 85,128 / 87,279 | 11.28 / 11.75 / 11.46 µs |
+| 200,000 | 97,583,343 B | 2307.0 / 2445.3 / 2329.2 ms | 86,692 / 81,788 / 85,868 | 11.54 / 12.23 / 11.65 µs |
+
+Host: Intel(R) Core(TM) i5-8250U CPU @ 1.60GHz, 8 logical CPUs (`GOMAXPROCS=8`), though
+`VerifyChain` is single-threaded — the walk is sequential by construction (each record's hash
+depends on the previous one).
+
+Wall clock scales linearly with record count (10k→50k is 5x the records for ~4.9x the time;
+50k→200k is 4x the records for ~4.0-4.2x the time), and records/sec stays flat at
+**≈ 82,000–88,000/sec** across two full orders of magnitude — this is `O(n)`, as the design always
+said, with a per-record cost that does not grow with log size. Per-record cost averages
+**≈ 11.6 µs**, using the 200,000-record trials (the largest, least warm-up-sensitive sample).
+
+**What this costs in practice:**
+
+- **The measured library, 48,704 records** (one archive run, one record per file — §5): a full
+  chain verification costs **48,704 × 11.6 µs ≈ 0.57 seconds**. Trivially practical.
+- **A year of daily runs**, with rotation deliberately absent (ADB_BROKER.md line 1114) so the log
+  only grows: if every day adds another 48,704-record archive run, day 365 holds
+  17,776,960 records, and *that single verify* costs **≈ 206 seconds (≈ 3.4 minutes)**.
+- **Cumulative cost of running `verify` once a day for that whole year**, each time against the
+  log as it stood that day (Σ, d=1..365, of d × 0.57 s): **≈ 38,400 seconds ≈ 10.7 hours of CPU
+  time spent verifying, over the year**, growing without bound in subsequent years because nothing
+  here rotates the log.
+
+**Does this invalidate anything written?** No existing claim is contradicted — the docs called
+this "unmeasured," not wrong. It does sharpen the open question, though: at today's 48,704-file
+library the walk is a non-issue (sub-second), but the *design* choice to run rotation-free
+(ADB_BROKER.md line 1114) means the linear-walk cost is unbounded over the life of the host, not
+just of one archive run, and 3-4 minutes at one year is the kind of number that should be in the
+design rather than left as "unmeasured," since it is the point at which an operator running
+`verify` interactively would start to notice the wait.
