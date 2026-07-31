@@ -99,6 +99,10 @@ var (
 	// of opening is replaceable, and only from inside this package.
 	openAuditLog = func() (*audit.Log, error) { return audit.Open(auditLogPath) }
 
+	// globalFlags consumes any arguments that appear before the subcommand and returns the
+	// remainder. The release build takes none; see Main.
+	globalFlags = func(args []string) ([]string, error) { return args, nil }
+
 	// newStorer builds the transport this invocation will read the device through. Tests
 	// substitute a fake so no phone is needed, and the fixture build substitutes a store
 	// that serves a local directory.
@@ -146,6 +150,24 @@ func Main(args []string, stdout, stderr io.Writer) int {
 		// An error object as well as the usage text, for the same reason an unknown
 		// subcommand gets one: a consumer that invoked this binary wrongly must be able to
 		// tell that from a device failure without parsing prose.
+		return e.failUsage(errors.New("no subcommand given"))
+	}
+
+	// Arguments that precede the subcommand. The release build accepts none, and that is
+	// deliberate: every global flag that could change what this binary reads is a flag that
+	// could widen its authority, and the allowlist rule is that no runtime input can. The
+	// fixture build replaces this to accept --fixture DIR, which is exactly such a flag —
+	// which is why fixture mode is a separate binary behind a build tag.
+	args, gerr := globalFlags(args)
+	if gerr != nil {
+		usage(stderr)
+
+		return e.failUsage(gerr)
+	}
+
+	if len(args) == 0 {
+		usage(stderr)
+
 		return e.failUsage(errors.New("no subcommand given"))
 	}
 
