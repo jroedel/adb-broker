@@ -353,6 +353,13 @@ worth stating baldly: **no input the broker reads at runtime can increase its au
 All six roots were confirmed to exist on the target device — directories, mode `0o2770`,
 `uid=10269 gid=1023`, all on the same filesystem.
 
+`probe` reports this list verbatim, as `allowlist` — see **Operations** — sorted and exactly as
+`devicepath.Roots()` returns it, whatever narrowing the optional configuration file above has
+applied. Reporting it does not make it settable: nothing a consumer sends back changes what the
+next invocation compiles in, and the field exists so a consumer can validate its configured
+sources against it once, at startup, instead of discovering a misconfigured one only by being
+refused on the device.
+
 ### There is no device-side confinement to fall back on
 
 Worth stating before the rules, because it establishes what they are carrying. The sync
@@ -504,8 +511,13 @@ topology.
 no adversary involved at all, the `dev` comparison starts failing for every remaining entry.
 Rather than emitting a per-file `path_denied` storm — which reads as "these thousand files
 are all forbidden" instead of "the ground moved" — the broker re-stats the root once on the
-first mismatch and, if it no longer resolves to the pinned `dev`, aborts that source with
-`volume_unresolved`. One clear cause beats a thousand misleading symptoms.
+first mismatch and, if it no longer resolves to the pinned `dev`, aborts the run with
+`volume_unresolved` — not merely the source being listed. A remount invalidates every other
+configured source exactly as it invalidates this one, so stopping at "this source failed" and
+letting the archiver move on to the next would reproduce, one level up, the exact "thousand
+misleading symptoms" problem this re-stat exists to prevent at the per-file level. One clear
+cause beats a thousand misleading symptoms, including ones shaped like sources rather than
+files.
 
 This resolution is the **only** place the broker traverses a symlink deliberately. It
 happens once, in one function, against a compiled constant — not once per caller-supplied
@@ -565,9 +577,11 @@ time and can differ across reboots or remounts. The pin is established at runtim
 and is recorded in the run's audit record so that two runs can be compared after the fact. A
 hard-coded `190` would be a latent, silent failure the first time the phone rebooted.
 
-**What this costs on a real device: nothing.** A bounded 12-directory walk of the media tree
-found 1,778 regular files, all on `dev=190`, and **zero symlinks**. Refusing symlinks below
-the root does not exclude any real content on this phone.
+**What this costs on a real device: nothing.** The discovery run's bounded 12-directory walk
+found 1,778 regular files, all on `dev=190`, and zero symlinks. The Stage 1 full six-root walk
+to unlimited depth superseded that sample at scale: **48,704 regular files, zero symlinks, zero
+entries refused as non-regular or off-volume** (`phase3_device_findings.md` §6). Refusing
+symlinks below the root does not exclude any real content on this phone.
 
 #### `LST2` does not follow symlinks; `STA2` does
 
@@ -641,7 +655,7 @@ adb-broker probe [--serial <id>]
 ```
 
 ```json
-{"proto":1,"status":"ok","serial":"EXAMPLESERIAL1","state":"device","model":"Pixel_8_Pro","broker":"0.1.0","adb":"1.0.41"}
+{"proto":1,"status":"ok","serial":"EXAMPLESERIAL1","state":"device","broker":"0.1.0","adb":"1.0.41","attached_devices":1,"allowlist":["/sdcard/DCIM","/sdcard/Download","/sdcard/Movies","/sdcard/Music","/sdcard/Pictures","/sdcard/Recordings"]}
 ```
 
 Called once before a run. A disconnected phone makes every configured source unreachable,
@@ -649,8 +663,49 @@ and saying so once up front is clearer than eleven identical per-source failures
 is what decides whether a run starts at all.
 
 `state` must be reported verbatim from the transport (`device`, `unauthorized`,
-`offline`, `bootloader`, …). The archiver treats anything other than `device` as fatal,
-and needs the raw value to say why.
+`offline`, `bootloader`, …). The archiver treats anything other than `device` as fatal, and
+needs the raw value to say why — but be clear about when that branch actually runs. A device
+in any state but `device` fails inside connection setup, at
+`host-serial:<serial>:features` or a step after it, before a `devicebus.Device` is ever
+returned, so a *successful* probe response never actually carries a `state` other than
+`device`: a device in any other state produces an error object instead, with `code` already
+one of `unauthorized`, `offline`, or the rest of the taxonomy below. The fatal-if-not-`device`
+check the archiver is told to write is consequently unreachable in normal operation — the same
+shape of caution this document flags at `host:host-features` under **Transport**, where a check
+that can never fail is the trap rather than the safeguard. `state` still stays reported
+verbatim, because it is still what got read on the one path where it is reported at all, and a
+defensive branch that never fires costs nothing to leave in place.
+
+**There is no `model` member, and there must never be one.** Reading a device's model needs a
+shell — there is no sync-protocol call for it — and this binary has no shell channel and never
+will, so nothing could populate it. This is the same call already made for `mtime_nsec` below:
+a field that can never be populated does not belong in a contract inviting someone to try, so
+the rule is MUST NOT rather than "always empty." `proto` stays at `1` despite this being a
+removal, which the rule under **Versioning** would normally treat as a bump; see that section
+for the one-time exception and why it does not set a precedent.
+
+**`attached_devices` is the size of the whole `host:devices` list, and it answers exactly one
+question: could an operation naming no device be ambiguous.** It is not filtered by
+`--serial` — probing with `--serial` while two phones are attached reports `2`, not `1` — and
+it is not a count of devices this broker could *serve*, since a phone in state `unauthorized`
+or `offline` is attached and is counted regardless. A consumer that reads `1` knows a `fetch`
+naming no device cannot be ambiguous and can omit `--serial`; a consumer that reads `2` or more
+must pass one. This member exists because `fetch` cannot be given a serial for free:
+`ExtBusiness.Fetch` takes no serial by design (see **Architecture**), so the only way this
+binary can honour a pinned `fetch --serial` is to run a full `probe` first — and on a first run
+of ~20,000 files that is 20,000 extra audited operations and 20,000 extra audit records for a
+caller who never asked for a device to be pinned. Reading `attached_devices` once, at the top
+of a run, is how a consumer avoids paying that.
+
+**`allowlist` is the compiled roots this binary can reach, sorted, and it is always present
+and never empty.** `path_denied` for a misconfigured source is a *configuration* error, and
+without this member the only way to discover one is to connect to a phone and be refused, once
+per configured source. Reporting it widens nothing: the list is compiled in, no flag,
+environment variable or configuration file adds to it, and the narrowing configuration file
+described under **Confinement** can only take roots away. It is a statement about *this
+binary*, not about the device, which is why it is read straight from `devicepath.Roots()` at
+the App layer rather than being routed through `devicebus.Device` the way the pinned volume
+deliberately is not.
 
 With no `--serial` and several devices attached, this must fail with
 `multiple_devices` and list the serials. Picking one silently would archive from
@@ -742,10 +797,29 @@ listing can be parsed incrementally rather than buffered:
 {"path":"/sdcard/DCIM/Camera/IMG_0182.JPG","path_b64":"L3NkY2FyZC9EQ0lNL0NhbWVyYS9JTUdfMDE4Mi5KUEc=","size":103159,"mtime":1709828653}
 ```
 
-Terminated by exactly one summary line, distinguished by having no `path`:
+**Terminated by exactly one object carrying a `status` member** — a summary when the walk
+finished, successfully or partially; an error object instead when it did not (a denied root, or
+a `volume_unresolved` remount mid-listing — see **Error taxonomy**).
+
+An earlier draft of this section specified the wrong discriminator, and it is worth being
+explicit that it was wrong rather than merely refining it: it said the summary is
+"distinguished by having no `path`." **That rule is unsafe, and it was confirmed by running the
+binary.** A `list` that fails outright terminates with an error object, and that object *does*
+carry `path` when the failure names one:
 
 ```json
-{"proto":1,"status":"partial","files":20397,"errors":[{"code":"permission_denied","path":"/sdcard/DCIM/Camera/locked"}]}
+{"proto":1,"status":"error","code":"path_denied","path":"/sdcard/NOPE","path_b64":"L3NkY2FyZC9OT1BF","message":"..."}
+```
+
+A consumer following the documented rule decodes that as a file record with an empty
+`path_b64`, a zero `size` and no `code` — and because the collision only fires on the paths
+that happen to trigger this particular error, it survives hand-testing and shows up only in
+production. **The safe discriminator is the presence of a `status` member.** Every terminator,
+summary or error alike, carries one; no `FileRecordResponse` ever does. Check for `status`
+first, then tell the two terminator kinds apart from each other by its value.
+
+```json
+{"proto":1,"status":"partial","files":20397,"errors":[{"code":"permission_denied","path":"/sdcard/DCIM/Camera/locked","path_b64":"L3NkY2FyZC9EQ0lNL0NhbWVyYS9sb2NrZWQ="}]}
 ```
 
 | Field | Requirement | Notes |
@@ -755,6 +829,13 @@ Terminated by exactly one summary line, distinguished by having no `path`:
 | `size` | MUST | Exact bytes, `int64`, from `LIST_V2`. |
 | `mtime` | MUST | Unix **seconds**. See *Timestamps are not to be corrected*. |
 | `mtime_nsec` | MUST NOT | **The transport cannot provide it.** See below. |
+
+Each entry in the summary's `errors[]` above pairs a `code` with the path it names, and
+carries a `path_b64` alongside them — MUST, the same rule as the record's own field, and its
+absence here was a defect rather than a deliberate omission. A per-path error is the one place
+in this contract a consumer might want to *act* on a path rather than merely display it —
+retry it, key a log entry by it, exclude it from a later run — and giving that one place only
+the lossy `path` rendering made it the one path a consumer could not safely use.
 
 `mtime_nsec` is downgraded from MAY to MUST NOT, and this closes an open question rather
 than deferring it. The `STAT_V2`/`LIST_V2` reply was decoded field by field and carries
@@ -799,7 +880,8 @@ Framed as header line, raw bytes, trailer line:
 
 The framing exists so that a truncated transfer is detectable: the archiver reads exactly
 `size` bytes and then requires a trailer. A stream that ends without one is a failure,
-whatever the byte count said.
+whatever the byte count said — see below for exactly what the broker does, and does not do,
+on stdout when that happens partway through.
 
 **Measured properties of `RECV` that the implementation must accommodate:**
 
@@ -817,6 +899,54 @@ whatever the byte count said.
   *Connection lifecycle* under **Transport**. The three observed failures were `open failed:
   No such file or directory`, `open failed: Permission denied`, and `read failed: Is a
   directory`.
+
+#### A failure after the header: no trailer, not a corrupted one
+
+The framing above documents success. A `RECV` can also fail after the header has already gone
+out — one of the three failures just above, or the device disappearing mid-transfer — and what
+happens then has to be specified as precisely as the success path, because getting it wrong
+does not merely fail the transfer, it corrupts it.
+
+**Once the header is on stdout, nothing else may be written there except the trailer.** The
+header commits to an exact byte count, so the archiver reads exactly `size` bytes and whatever
+the broker puts on stdout after a short transfer is read as the tail of the payload. An earlier
+version of this contract wrote a full `ErrorResponse` object at this point, and it was measured
+rather than merely reasoned about: with `--fail-after 5` against a 42-byte fixture file, the
+archiver ended up writing `hello` followed by 37 bytes of `{"proto":1,"status":"error",…` into
+its staging file — a file with the wrong length and the wrong bytes and no marker announcing
+either.
+
+**So the stream simply ends.** No trailer follows the short payload, and a missing trailer is
+already this contract's signal for a failed transfer — the same rule the framing above states
+for success, "a stream that ends without one is a failure whatever the byte count said." It is
+also the only signal available here that cannot be confused with content, because it is the
+absence of something rather than the presence of something a reader might mistake for bytes.
+
+A failure trailer on stdout — a `{"status":"error","code":…}` object in place of the success
+trailer — was considered, and rejected, and it is worth recording why rather than leaving it
+looking like an oversight: an archiver reading exactly `size` bytes via something like
+`io.CopyN(dst, r, size)` before it ever looks for a trailer would swallow such an object as the
+last bytes of the file, exactly like the corrupted-object case above. There is no framing that
+puts a failure signal after the payload without that signal being readable as payload, and
+after the header, "before anything has committed to a byte count" is no longer a place that
+exists on stdout.
+
+The classification still has to go somewhere, so it goes to stderr — a human line, then one
+machine-greppable line that is part of this contract rather than an implementation detail of
+how the broker happens to log:
+
+```
+adb-broker: transfer failed after the header was sent; the stream ends without a trailer
+adb-broker: code=transfer_failed path=/sdcard/DCIM/Camera/IMG_0182.JPG: read failed: Is a directory
+```
+
+A consumer that needs the code has nowhere else to look for it, which is why that second line
+is guaranteed rather than left to whatever a log statement happened to say. The exit code is
+non-zero, as for any other failure that produced no usable output on stdout.
+
+A truncated transfer's practical next question is whether the device is still there at all.
+`probe` answers exactly that in one further invocation, and it is the documented recovery step:
+run it, and let its `code` decide whether to retry this file or abort the run.
 
 Throughput was measured at ~39.5 MiB/s, but over a USB 2.0 port that this is close to
 saturating. It is a port measurement, not a device or protocol one, and is not a number to
@@ -849,19 +979,22 @@ Every failure — whether a whole operation or one path within a listing — car
 machine-readable `code`:
 
 ```json
-{"proto":1,"status":"error","code":"root_not_found","path":"/sdcard/NOPE","message":"no such file or directory"}
+{"proto":1,"status":"error","code":"root_not_found","path":"/sdcard/NOPE","path_b64":"L3NkY2FyZC9OT1BF","message":"no such file or directory"}
 ```
+
+`path_b64` is present exactly when `path` is, never independently — see *Filenames are bytes*
+below, which now applies here rather than only to a list record.
 
 | `code` | Meaning | What the archiver does |
 |---|---|---|
-| `no_device` | Nothing attached | **Aborts the run.** Every source is unreachable. |
+| `no_device` | No device answers what was asked — nothing is attached, or a named `--serial` names a device that is not among what is attached (`adbwire.ErrDeviceNotFound`; three other phones can be plugged in and this code still fires) | **Aborts the run.** Either way there is no device to serve the request. |
 | `unauthorized` | USB debugging not accepted | Aborts, with instructions. |
 | `offline` | Attached but not usable | Aborts. |
 | `multiple_devices` | Ambiguous without `--serial` | Aborts. Never guesses. |
 | `no_adb_server` | Nothing listening on `127.0.0.1:5037` | Aborts. The host must start it. |
 | `path_denied` | Outside the allowlist, wrong spelling, a symlink, or off the pinned volume | **Aborts that source.** A configuration error, not a device condition. |
 | `audit_unavailable` | The audit log cannot be opened or its head does not verify | Aborts the run before any device contact. |
-| `volume_unresolved` | `/sdcard` does not `STA2` to a directory, or stopped resolving to the pinned `dev` mid-listing | From `probe`, aborts the run. From a `list`, aborts that source. Storage is not in the shape that was pinned. |
+| `volume_unresolved` | `/sdcard` does not `STA2` to a directory, or stopped resolving to the pinned `dev` mid-listing | **Aborts the run**, whether reported by `probe` or by a `list`. A remount that invalidates the pin invalidates it for every other configured source too, so treating this as a per-source failure would reproduce, one level up, the exact "thousand misleading symptoms" problem the pin's own re-stat exists to prevent at the per-file level. |
 | `root_not_found` | The named tree does not exist | **Skips that source, continues.** One of eleven folders having been removed says nothing about the other ten. |
 | `not_a_directory` | Root is a file | Skips that source. |
 | `permission_denied` | A path could not be read | Per-path: warn, continue. Never ends a run. |
@@ -904,6 +1037,15 @@ something this broker will not read. Continuing quietly would produce a backup t
 silently missing a whole tree, which is the failure mode the entire tool exists to
 prevent. It does not abort the *run*, because the other ten sources are still valid.
 
+`no_device`'s gloss above is deliberately wider than "nothing attached," because that
+narrower wording is untrue of one case the code covers: a named `--serial` that is not among
+the attached devices maps to `no_device` too (`adbwire.ErrDeviceNotFound`, classified in
+`adbsyncdb.go`), and three other phones can be sitting on the same USB hub when it fires. The
+archiver aborts either way — a device it can't find is a device it can't find, and a run that
+otherwise treats the two causes differently would need to explain the difference to a human,
+not act on it — so the fix here is a wider gloss on the one code, not a seventeenth code that
+would only restate the abort behaviour it already has.
+
 The partial case matters and deserves stating explicitly: a `list` that reads most of a
 tree and fails on one subdirectory must emit every record it *did* read, then a summary
 with `"status":"partial"` and the per-path errors. Exit code should still be `0`. The
@@ -926,7 +1068,10 @@ around.
 
 A denial is logged with the same weight as a success. The denial records are the ones that
 matter most, and a design where the interesting events are the ones that go unwritten is
-not an audit trail.
+not an audit trail. This includes a denial at the flag boundary — a `--root` outside the
+allowlist, a malformed `--client` — which never reaches the audit extension because it never
+reaches the bus; it is appended directly, and it anchors too (see **The anchor**), so "the last
+operation of a process always anchors" holds for every record type without exception.
 
 ```json
 {"seq":1042,"ts":"2026-07-30T16:52:03.114Z","op":"fetch","caller_uid":1003,"client_asserted":"photos","serial":"EXAMPLESERIAL1","path_b64":"L3NkY2FyZC8…","decision":"allow","result":"ok","bytes":103159,"sha256":"e3b0c442…","prev":"9f2b…","hash":"41d0…"}
@@ -991,9 +1136,33 @@ deletion of the whole file, because an adversary can recompute a shorter valid c
 
 ### The anchor
 
-So the chain head is anchored outside the file. Periodically, and at process exit, the
-broker emits `{seq, hash}` to the systemd journal under a stable `MESSAGE_ID`. The journal
-is written by a process the broker does not run as and cannot rewrite.
+So the chain head is anchored outside the file. **After every operation the audit extension
+records** — `probe`, `list`, `fetch`, and a flag-boundary denial that never reached the bus —
+the broker emits `{seq, hash}` to the systemd journal under a stable `MESSAGE_ID`. That is
+deliberate, not a batching choice described loosely: there is no shutdown hook to hang a single
+"final anchor" off, so the only way to guarantee the invariant this control depends on — the
+*last* operation of a process always anchors — is to make *every* operation a candidate for
+being the last one. On a first-ever run of roughly 20,000 operations that is roughly 20,000
+small, best-effort datagrams to a local socket, negligible next to the device I/O each
+operation already performs. The journal is written by a process the broker does not run as and
+cannot rewrite.
+
+**A failure to publish one is ignored for the operation's outcome, and that is deliberate.**
+The record it would describe is already durably appended to the hash-chained log; refusing, or
+retroactively failing, an operation that already completed and was already recorded because a
+detectability aid for tail truncation could not be published would make the anchor more
+load-bearing than the rest of this section says it is. So the failure never changes what a
+caller sees: never on stdout, never in the exit status, never in the error a subcommand
+returns.
+
+**But it is not silent either, and the first setuid install shipped exactly that mistake.** It
+wrote every audit record and published not one genuine anchor, and nothing said so, because the
+error was simply discarded — `verify` could only report that a truncated tail "could not be
+ruled out," the guarantee going unenforced quietly (the Stage 2 finding, `phase3_device_findings.md`
+§8). The failure is now reported on stderr, once per process, naming the wrapped reason —
+once, because a permanently broken socket would otherwise produce roughly 20,000 identical
+lines and bury every other message an operator is reading stderr for, including the per-operation
+errors this same stream carries.
 
 Measured 2026-07-31 (`audit_experiment.md`): the write is a single `AF_UNIX`/`SOCK_DGRAM`
 datagram of newline-separated `KEY=value` pairs to `/run/systemd/journal/socket`. No
@@ -1047,6 +1216,16 @@ no-exec rule is absolute — while the Go standard library has no journal reader
 `foundation/journal` parses the journal files directly, opened `O_RDONLY`, writing nothing
 and never touching the journal directory.
 
+That direct reader is what `--anchors <file|glob>` uses, and on the setuid install this binary
+ships as, it is not the path that actually works — see **Fail closed** below for why, and what
+to run instead. `--anchors -` bypasses this reader entirely: it takes newline-delimited JSON on
+stdin, exactly as `journalctl -o json MESSAGE_ID=<id>` emits it when run by an operator who
+does have journal access, and applies the same `_UID`/`_EXE` trust filter to each decoded line
+that the direct reader applies to each journal object it walks. Everything below —
+`KEYED-HASH`, `COMPACT`, `COMPRESSED-ZSTD` — describes the machinery of the file reader alone;
+the stdin path is a scanner and one JSON decode per line, and it is the one that matters for
+the shipped install.
+
 Measured header flags on this host (systemd 255): `COMPRESSED-ZSTD KEYED-HASH COMPACT`,
 compatible `TAIL_ENTRY_BOOT_ID`. Each one shapes the reader:
 
@@ -1096,8 +1275,18 @@ pressure is not a control. Full verification of the entire chain is a separate `
 subcommand rather than a startup cost.
 
 `verify` reads the log and the journal anchors and reports the first divergence. It takes no
-device and no network. Whoever runs it needs journal read access — root, or membership in
-`systemd-journal`; the broker itself has neither.
+device and no network. **On the setuid install this document specifies, `verify` cannot gain
+journal read access by running as anyone in particular.** It runs through the same `4550`
+binary as every other subcommand, so its euid is pinned to the broker's own uid — deliberately
+outside `systemd-journal` — no matter who invokes it, and running it as root does not help:
+setuid resets the effective uid back to the file owner's on every `exec`, and even if it
+somehow stayed root, the `_UID` filter under **Anchors are forgeable** would then select
+`_UID=0` and match none of the anchors the broker ever published. The one workable path is
+`--anchors -`: an operator with real journal access — root, or `systemd-journal` membership —
+runs `journalctl -o json MESSAGE_ID=<id>` as a separate process outside the setuid binary and
+pipes its output into `verify`'s stdin. `--anchors <file|glob>` is still accepted, for a host
+where this process's own euid can read the journal files directly, but that is not the install
+this binary ships into.
 
 ### Where it lives
 
@@ -1159,10 +1348,13 @@ Android filenames are byte strings, not necessarily valid UTF-8, and JSON string
 be. A camera roll is ASCII, but the messaging, design-app and download folders contain
 whatever arrived.
 
-So `path_b64` is always present and is authoritative; `path` is for logs and may be lossy.
-The archiver uses `path_b64`. The cost of getting this wrong is a file that is never
-archived, which is the one outcome the whole design exists to prevent — cheap insurance
-for a case that may never arise.
+So every member named `path` on the wire has a `path_b64` companion, and it is the
+authoritative one — this is no longer only a property of a list record. The file record's
+`path_b64` is always present; a per-path list error's and the top-level error object's are
+present exactly when `path` is, and absent exactly when it is not, since `""` is not a path
+either. `path` is for logs and may be lossy in every one of those places; the archiver acts on
+`path_b64`. The cost of getting this wrong is a file that is never archived, which is the one
+outcome the whole design exists to prevent — cheap insurance for a case that may never arise.
 
 **Honest status of this rule: it is justified by prudence, not by evidence from this
 device.** Every name sampled during protocol discovery — across `DCIM`, `Movies`, `Music`
@@ -1173,8 +1365,15 @@ download caches) are exactly the ones not fully walked. But it should not be cit
 something the measurements confirmed, because they did not.
 
 `devicepath.AuthorizedPath` holds the raw bytes in a `string`, which in Go is byte-safe. The
-lossy UTF-8 coercion happens once, in `fromBusFileRecordResponse`, and only for the `path`
-field.
+lossy UTF-8 coercion happens in exactly one function, `displayBytes`, and only for a `path`
+member — never for `path_b64`. Every response that carries a path calls it: `fromBusFileRecordResponse`
+for a record, the per-path error built inside `fromBusListSummaryResponse`, and
+`fromBusErrorResponse` for the top-level error object. Centralizing the coercion in one
+function, rather than letting each of those three call sites reimplement
+`strings.ToValidUTF8`, is what keeps them agreeing on what "lossy" means; `fromBusErrorResponse`
+additionally has to be handed the *raw* path rather than an already-coerced one, precisely so
+that its own `path_b64` is base64 of the real bytes and not of a string already full of
+`U+FFFD` — see the note on the taxonomy's error object above.
 
 An earlier draft specified a second type, `devicepath.DevicePath`, for unvalidated raw bytes.
 **It does not exist and should not.** A second path type whose whole purpose is to hold a path
@@ -1227,12 +1426,12 @@ app/broker/wire.go                          request + response structs, primitiv
 app/broker/convert.go                       toBus* / fromBus*Response
 business/domain/device/devicebus/
   devicebus.go                              Business, ExtBusiness, Extension, Storer
-  model.go                                  Device, FileRecord, ListResult
+  model.go                                  Device, FileRecord, ListInput, PathError, ListSummary, FetchInfo, FetchResult
   extensions/deviceaudit/deviceaudit.go     hash-chained audit decorator
 business/domain/device/stores/adbsyncdb/
-  adbsyncdb.go                              Storer implementation over the sync protocol
-  volume.go                                 STA2 root resolution; the only deliberate symlink traversal
+  adbsyncdb.go                              Storer implementation over the sync protocol; ResolveVolume lives here
   reconnect.go                              re-establish transport after a terminal RECV FAIL
+  walk.go                                   LIST_V2-driven recursive walk; the mid-listing volume re-check
   convert.go                                toSync* / toBusFileRecord
 business/types/devicepath/
   path.go                                   AuthorizedPath, the allowlist, Child traversal
@@ -1338,6 +1537,12 @@ adb-broker-fixture --fixture /path/to/tree list --root /sdcard/DCIM/Camera
 With `--fixture DIR`, the broker serves `DIR` as though it were the device: `/sdcard/…`
 paths map to `DIR/sdcard/…`, and `probe` reports a synthetic serial with
 `"state":"device"`. Same wire format, same error codes, no hardware.
+
+`probe` also reports `"attached_devices":1` in fixture mode, because the fixture store serves
+exactly one synthetic device and refuses any serial but its own — there is never a second one
+to count. That makes fixture mode the unambiguous-device case, which is the case a consumer
+uses the count to detect, so a test rehearsing against a fixture takes the same branch it would
+take against one real attached phone.
 
 This closes a real gap. The adapter's unit tests currently inject a fake command runner
 in-process, which exercises the parsing but not the protocol; the device tests exercise
@@ -1446,7 +1651,11 @@ over it. It escalates with `sudo` if it is not already root, and it is idempoten
 
 The broker's uid needs **no** group for the adb server, which listens on loopback TCP with no
 peer-credential check — see `THREAT_MODEL.md` §8.1, since that fact cuts both ways. It needs
-no journal read access either: it writes anchors and never reads them.
+no journal read access either: it writes anchors and never reads them — and neither can
+`verify`, which runs through this same setuid binary at this same fixed euid regardless of who
+invokes it, so granting the broker's uid `systemd-journal` membership would be the only way to
+change that, and this document does not ask for it. The operator path is the
+`journalctl | verify --anchors -` pipe under **Audit logging → Reading the journal back**.
 
 `make verify-install` re-checks every property without changing anything, and is worth
 running from monitoring. It asserts that **the broker's uid differs from every member of
@@ -1481,9 +1690,20 @@ a member of the caller group. Both controls verified independently before any Go
 - Adding fields is compatible. Removing or repurposing one is a `proto` bump. New `code`
   values are compatible, since unknown codes degrade to `internal`.
 
-`proto` stays at `1`. The removal of `--verify-device` and the addition of `path_denied`,
-`no_adb_server`, `audit_unavailable` and `volume_unresolved` are compatible under the rules
-above, and nothing consumes the interface yet.
+`proto` stays at `1`. The removal of `--verify-device`, and the addition of `path_denied`,
+`no_adb_server`, `audit_unavailable`, `volume_unresolved`, `path_b64` on a per-path list error
+and on the top-level error object, and `probe`'s `attached_devices` and `allowlist`, are all
+compatible under the rules above, and nothing consumes the interface yet.
+
+The removal of `probe`'s `model` member is the one exception, and it does not fold into
+"compatible under the rules above" — removing a member is exactly what a major bump exists to
+record, so a consumer can tell "this never existed" from "this existed and vanished out from
+under me." It is not bumped anyway, on grounds specific enough to write down rather than wave
+at: nothing has ever consumed this contract — the first consumer is being written now — so
+`proto` 1 has no installed base to protect and no reader who ever depended on `model`, and a
+version number recording the removal of a member no consumer ever read would be noise every
+future reader has to decode. This is a **one-time exception, not a precedent**: the next member
+removed from this contract, once a consumer exists, gets the ordinary bump.
 
 The rename from `photos-adb-broker` to `adb-broker`, the new `--client` flag, and the
 `caller_uid`/`client_asserted` audit fields are all likewise compatible: the flag is
@@ -1571,11 +1791,13 @@ Steps 1–4 are independent and have no dependency on a phone being present. Ste
    which requires phone-side privilege that the threat model excludes and a second user this
    device does not have. It is recorded as provenance and enforced nowhere, and nothing about
    the volume crosses the wire to the caller. The mid-invocation remount case is handled by
-   re-stating the root once and failing the source with `volume_unresolved` rather than
-   emitting per-file denials.
+   re-stating the root once and, on the second failure, aborting the run with
+   `volume_unresolved` rather than emitting per-file denials or failing only the source in
+   front of the walk — a remount invalidates every other configured source too.
 
    Still genuinely open within this: **is refusing *all* symlinks below the root too blunt?**
-   Zero symlinks were found among 1,778 files, so it costs nothing today, and a future device
+   Zero symlinks were found among the discovery run's 1,778 files, and the Stage 1 full walk
+   found the same result across all 48,704, so it costs nothing today, and a future device
    shipping a legitimate one would show up as missing files rather than as an error. The
    `list` summary counts refused non-regular entries specifically so that this is visible
    instead of silent.
@@ -1605,4 +1827,7 @@ Steps 1–4 are independent and have no dependency on a phone being present. Ste
 (it does not — whole seconds only, so `mtime_nsec` is now MUST NOT); whether `LST2` follows
 symlinks (it does not, `STA2` does); whether the six roots exist (they do); whether anchors
 actually reach the journal and survive with their custom fields (they do, measured
-2026-07-31); and whether the broker needs journal read access (it does not — `verify` does).
+2026-07-31); and whether the broker needs journal read access (it does not, and — on the
+setuid install this ships as — neither does `verify`, which is why anchors arrive over
+`--anchors -` from a `journalctl` process an operator runs as root, rather than being read
+directly by anything wearing the broker's own uid).
