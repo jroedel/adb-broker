@@ -10,53 +10,53 @@ one of them.
 
 ---
 
-## 0. Resume here (updated 2026-07-31 ~01:20 CEST)
+## 0. Resume here (updated 2026-07-31 ~03:50 CEST)
 
-**Wave 1 is four-fifths done and gate G1 is green.** `go build ./...`, `make test-unit`,
-`make lint` and `make deps-check` all pass across eight packages.
+**Waves 1 and 2 are complete. Wave 3 is in flight.** The gate is green across ten packages:
+`go build ./...`, `make test-unit` under `-race`, `make lint` in both build configurations,
+and `make deps-check`.
 
 Landed and committed: `foundation/errs`, `foundation/adbwire`, `foundation/audit`,
-`business/types/devicepath`, and `business/types/{mtime,filekind,serial,errcode}`.
+`foundation/journal`, `business/types/{devicepath,mtime,filekind,serial,errcode}`, and
+`business/domain/device/devicebus`.
 
-**Outstanding from wave 1: `foundation/journal`.** Its agent was stopped part-way to save
-credits. The work is **not lost** — it is in `git stash@{0}`:
+In flight (wave 3): `stores/adbsyncdb` and `extensions/deviceaudit`.
+Remaining after that: wave 4 — `app/broker` + `cmd/adb-broker`, fixture mode behind the
+build tag, and the `device`-tagged manifest in §9.
 
-```
-git stash pop        # restores foundation/journal/{format.go,journal.go,journal_test.go}
-```
+### The journal reader is no longer the project's biggest risk
 
-State of that stash: `format.go` and `journal.go` are complete and **compile**.
-`journal_test.go` holds 28 well-named tests, including
-`TestEntriesRejectsForgedAnchorFromWrongUID`. It does **not compile** — the test helpers
-`builder` and `testEntry` were being written when the agent stopped and live in a file that
-was never created. **Finishing it means writing those two helpers**, then the hand-built
-golden-byte fixtures and `journal_integration_test.go`. It was stashed rather than left in
-the tree because a non-compiling test package would fail G1 for a reason unrelated to the
-code under test.
+The plan assumed the real journal was unreadable here, so the reader could only be tested
+against synthetic fixtures — a circularity where a writer and reader sharing one wrong
+assumption both pass. That premise was **half wrong**. System files are denied, but
+`/var/log/journal/*/user-1003*.journal` carry an ACL and are readable by this uid. So the
+parser was diffed against `journalctl`'s own output: **29,367 entries, 29,367 of 29,367
+cursors byte-identical, 804,689 field values byte-identical**, with the only absent fields
+being zstd-compressed ones and their count matching the reported compressed-object count for
+every entry. Re-checked independently at integration time on one file, by MESSAGE_ID/UID/EXE
+triple: 138 and 114 entries, exact match.
 
-Next actions, in order:
+That procedure is recorded in `journal_integration_test.go`'s doc comment so it can be redone.
 
-1. `git stash pop`, write the missing test helpers, get `go test ./foundation/journal/...`
-   green, commit. Do not weaken a test to make it pass — the golden-byte fixtures exist
-   specifically to break the circularity of a writer and reader sharing one wrong assumption.
-2. Wave 2 (`devicebus`), then wave 3 (`adbsyncdb` + `deviceaudit`), then wave 4
-   (`app`/`cmd` + fixture mode + device tests), with the gates in §7.
+### Operational notes for an unattended run
 
-Three findings from wave 1 that should be folded into the other docs, recorded here so they
-are not lost with a session:
+- **`git push` fails under cron** with `Permission denied (publickey)`, because cron does not
+  export `SSH_AUTH_SOCK`. Fix: `export SSH_AUTH_SOCK=/run/user/1003/keyring/ssh` before
+  pushing. This works while the desktop session's keyring agent is alive; if it is not, the
+  on-disk key can be used directly with
+  `GIT_SSH_COMMAND='ssh -i ~/.ssh/id_ed25519 -o IdentitiesOnly=yes'`. Commits always succeed;
+  only the push needs this.
+- Do not have an interactive session on the same conversation open when a scheduled resume
+  fires.
 
-- **`adb_experiment.md` is missing two measured protocol facts.** `OKAY` has two shapes —
-  `host:transport*` and `sync:` reply with a *bare* `OKAY` and no length-prefixed payload,
-  after which the socket is a stream. And the adb server **closes the socket after answering
-  a value query**, so a second request on the same connection reads zero bytes and the client
-  must redial. Both were probed against the live server while building `adbwire`.
-- **`ADB_BROKER.md` should drop `devicepath.DevicePath`.** No such type exists and none
-  should: a second, *unvalidated* path type is a way to hold a path that skipped validation.
-  `AuthorizedPath` holds raw device bytes in a `string`, and device-supplied names enter
-  through `Child`, which revalidates.
-- **One unverified assumption exists in the whole codebase**: `RECV`'s `DONE` carries a 4-byte
-  argument rather than `LIS2`'s 72-byte dirent body. Reasoned from AOSP's client and
-  `SYNC.TXT`, not measured. It is now the top item on the device manifest in §9.
+### Corrections already folded into the other documents
+
+`adb_experiment.md` gained Phase 0c (the bare-`OKAY` asymmetry; the single-use host socket)
+and the `RECV` `DONE` argument width under *Still untested*. `ADB_BROKER.md` lost
+`devicepath.DevicePath`. Done in commit `9c624fc`.
+
+**Still exactly one unverified assumption in the codebase**: `RECV`'s `DONE` carries a 4-byte
+argument rather than `LIS2`'s 72-byte dirent body. Top item on the device manifest in §9.
 
 ---
 
