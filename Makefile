@@ -76,14 +76,16 @@ cover:
 	go test -count=1 -coverprofile=coverage.out ./...
 	go tool cover -func=coverage.out | tail -1
 
-## install: create and verify the audit identity, then install the binary. Needs root;
-## escalates with sudo itself. Pass extra flags via ARGS, e.g. ARGS="--client photos".
-install: build
-	zarf/install.sh --binary $(BINARY) $(ARGS)
+## install: copy the binary to ~/.local/bin. No root, no service account, no setuid.
+## The broker creates its own audit log on first run; see ADB_BROKER.md, "Installation".
+## Override the destination with PREFIX, e.g. PREFIX=/usr/local.
+PREFIX ?= $(HOME)/.local
 
-## verify-install: re-check every install property without changing anything
-verify-install:
-	zarf/install.sh --verify-only
+install: build
+	install -D -m 0755 $(BINARY) $(PREFIX)/bin/adb-broker
+	@echo "installed $(PREFIX)/bin/adb-broker"
+	@echo "keep it at ONE path: anchors carry the publishing binary's _EXE, and a second copy"
+	@echo "splits them into two identities that verify cannot see at once."
 
 ## clean: remove build and coverage artifacts
 clean:
@@ -91,4 +93,4 @@ clean:
 
 .PHONY: help build build-fixture vet fmt lint vuln-check deps-check \
 	test-unit test-integration test-fixture test-device test cover \
-	install verify-install clean
+	install clean

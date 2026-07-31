@@ -149,14 +149,14 @@ func toVerifyInput(req VerifyRequest) (verifyInput, error) {
 	var fieldErrors errs.FieldErrors
 
 	if req.LogPath == "" {
-		fieldErrors.Addf("log", "is empty; omit the flag to verify the compiled-in audit log")
+		fieldErrors.Addf("log", "is empty; omit the flag to verify this user's own audit log")
 	}
 
 	if req.AnchorsPath == "" {
 		// Required rather than defaulted to the system journal: the anchor comparison is the
 		// only check that can detect a truncated tail, and an operator who did not say where
 		// the anchors are must not be told the log verified.
-		fieldErrors.Addf("anchors", `is required: "-" reads newline-delimited JSON anchors from stdin, which is the only form that works on a setuid install (pipe "journalctl -o json MESSAGE_ID=`+audit.MessageID+`" run as root); a journal file or glob is accepted only where this process can read the journal files`)
+		fieldErrors.Addf("anchors", `is required: name a journal file or glob — this user's own anchors are in /var/log/journal/*/user-<uid>.journal, which that user can read — or "-" to read newline-delimited JSON on stdin as "journalctl -o json MESSAGE_ID=`+audit.MessageID+`" emits it`)
 	}
 
 	if !fieldErrors.Empty() {

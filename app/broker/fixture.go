@@ -5,7 +5,6 @@ package broker
 import (
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strconv"
 
@@ -32,13 +31,18 @@ import (
 //
 // # Why the audit log moves
 //
-// The release audit log is /var/log/adb-broker/audit.log, owned by the broker's own uid with
-// chattr +a, created by the installer. A developer running the fixture binary is not that
-// uid and cannot open it, so fixture mode keeps its log inside the fixture directory. That
-// is a real hash-chained log with a real fail-closed check on its tail — the mechanism is
-// exercised, not stubbed — it simply lives somewhere a test can create.
+// The release audit log is the invoking user's own, at ~/.local/state/adb-broker/audit.log.
+// A developer running the fixture binary would otherwise append fixture traffic to their real
+// chain and anchor it under their real uid, so fixture mode keeps its log inside the fixture
+// directory instead. That is a real hash-chained log with a real fail-closed check on its tail
+// — the mechanism is exercised, not stubbed — it simply lives somewhere disposable.
 //
-// The release path stays a const in broker.go and is unreachable from here.
+// This mattered for a different reason before 2026-08-01: the release log was owned by a
+// service account the developer was not, so fixture mode could not have opened it at all. The
+// separation is now a choice rather than a necessity, which makes it more important to state,
+// not less — nothing but this code keeps fixture records out of a real chain.
+//
+// How the release path is derived stays in broker.go and is unreachable from here.
 func init() {
 	// The +fixture suffix is NOT applied here. fixturedb.NewStore already appends it to the
 	// broker version it reports, and that value is the one that reaches probe's response and
@@ -60,7 +64,7 @@ func init() {
 		return fixturedb.NewStore(fixtureDir, brokerVersion, opts...)
 	}
 
-	openAuditLog = func() (*audit.Log, error) { return openFixtureAuditLog() }
+	openAuditLog = openFixtureAuditLog
 }
 
 // The fixture build's global flags.
@@ -153,24 +157,14 @@ func parseFixtureFlag(args []string) ([]string, error) {
 // it, so the installer makes it. In fixture mode there is no installer and no adversary to
 // defend against — the point is to exercise the chain and the fail-closed check, both of
 // which behave exactly as they do in production once the file exists.
-func openFixtureAuditLog() (*audit.Log, error) {
+func openFixtureAuditLog() (*audit.Log, bool, error) {
 	if fixtureDir == "" {
-		return nil, fmt.Errorf("%w: the fixture binary needs --fixture DIR before the subcommand", audit.ErrAuditUnavailable)
+		return nil, false, fmt.Errorf("%w: the fixture binary needs --fixture DIR before the subcommand", audit.ErrAuditUnavailable)
 	}
 
-	dir := filepath.Join(fixtureDir, "var", "log", "adb-broker")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, fmt.Errorf("%w: create %s: %w", audit.ErrAuditUnavailable, dir, err)
-	}
-
-	path := filepath.Join(dir, "audit.log")
-	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
-		f, cerr := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o640)
-		if cerr != nil {
-			return nil, fmt.Errorf("%w: create %s: %w", audit.ErrAuditUnavailable, path, cerr)
-		}
-		_ = f.Close()
-	}
-
-	return audit.Open(path)
+	// The same open-or-create the release build performs, at a path under the fixture
+	// directory. This used to hand-roll creation, because audit.Open refused to create and
+	// only the installer was allowed to; audit.Create exists now, so there is one
+	// implementation and fixture mode exercises it rather than a lookalike.
+	return openOrCreateLogAt(filepath.Join(fixtureDir, "var", "log", "adb-broker", "audit.log"))
 }

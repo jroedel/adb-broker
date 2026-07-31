@@ -118,7 +118,13 @@ func runWithStore(t *testing.T, store devicebus.Storer, stdout io.Writer, args .
 	t.Helper()
 
 	logPath := newAuditLog(t)
-	swap(t, &openAuditLog, func() (*audit.Log, error) { return audit.Open(logPath) })
+	swap(t, &openAuditLog, func() (*audit.Log, bool, error) {
+		// audit.Open, NOT the open-or-create Main uses: these helpers hand out paths that
+		// must FAIL to open, and a creating seam would answer them by making a fresh log.
+		log, err := audit.Open(logPath)
+
+		return log, false, err
+	})
 	swap(t, &newStorer, func(string) devicebus.Storer { return store })
 
 	return Main(args, stdout, io.Discard)
@@ -201,7 +207,13 @@ func TestFetchThatFailsMidStreamWritesNoJSONIntoThePayload(t *testing.T) {
 	var errBuf strings.Builder
 
 	logPath := newAuditLog(t)
-	swap(t, &openAuditLog, func() (*audit.Log, error) { return audit.Open(logPath) })
+	swap(t, &openAuditLog, func() (*audit.Log, bool, error) {
+		// audit.Open, NOT the open-or-create Main uses: these helpers hand out paths that
+		// must FAIL to open, and a creating seam would answer them by making a fresh log.
+		log, err := audit.Open(logPath)
+
+		return log, false, err
+	})
 	swap(t, &newStorer, func(string) devicebus.Storer { return store })
 
 	code := Main([]string{"fetch", "--path", "/sdcard/DCIM/Camera/big.mp4"}, &out, &errBuf)
@@ -288,7 +300,13 @@ func TestUnclassifiedMidStreamFailureIsFatalNotPerFile(t *testing.T) {
 	var out, errBuf strings.Builder
 
 	logPath := newAuditLog(t)
-	swap(t, &openAuditLog, func() (*audit.Log, error) { return audit.Open(logPath) })
+	swap(t, &openAuditLog, func() (*audit.Log, bool, error) {
+		// audit.Open, NOT the open-or-create Main uses: these helpers hand out paths that
+		// must FAIL to open, and a creating seam would answer them by making a fresh log.
+		log, err := audit.Open(logPath)
+
+		return log, false, err
+	})
 	swap(t, &newStorer, func(string) devicebus.Storer { return store })
 
 	if code := Main([]string{"fetch", "--path", "/sdcard/DCIM/Camera/big.mp4"}, &out, &errBuf); code == 0 {

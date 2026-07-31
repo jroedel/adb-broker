@@ -282,10 +282,10 @@ func corruptTail(t *testing.T, path string) {
 func runVerifyOn(t *testing.T, logPath string) string {
 	t.Helper()
 
-	swap(t, &openAuditLog, func() (*audit.Log, error) {
+	swap(t, &openAuditLog, func() (*audit.Log, bool, error) {
 		t.Fatal("verify opened the audit log for appending; it must not be gated by the fail-closed check")
 
-		return nil, nil
+		return nil, false, nil
 	})
 
 	var stdout, stderr strings.Builder

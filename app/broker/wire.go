@@ -63,10 +63,11 @@ type FetchRequest struct{ Path, Serial, Client string }
 
 // VerifyRequest is the verify subcommand's flags.
 //
-// LogPath defaults to the compiled-in audit log path; the flag exists because verify reads
-// a log rather than writing one, and an operator investigating a copy of a log must be able
-// to name it. AnchorsPath is a journal file or glob, or "-" for newline-delimited JSON
-// anchors on stdin.
+// LogPath left empty means the invoking user's own audit log, resolved after flag parsing so
+// that an explicit --log still works where that cannot be determined. The flag exists because
+// verify reads a log rather than writing one, and an operator investigating a copy of a log —
+// or another account's, given the per-uid path — must be able to name it. AnchorsPath is a
+// journal file or glob, or "-" for newline-delimited JSON anchors on stdin.
 type VerifyRequest struct{ LogPath, AnchorsPath string }
 
 // ProbeResponse is the single object probe writes to stdout.

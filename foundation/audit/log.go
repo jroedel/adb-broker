@@ -1,9 +1,12 @@
 // Package audit is the broker's hash-chained, append-only audit log and the
 // journald anchor writer that backs it.
 //
-// Every operation the broker performs is recorded somewhere the caller cannot
-// reach, in a form where both alteration and deletion are detectable. The two
-// halves divide the work:
+// Every operation the broker performs is recorded in a form where both
+// alteration and deletion are detectable. It is no longer recorded somewhere the
+// caller cannot reach: the privileged install was withdrawn on 2026-08-01 and
+// the log is now an ordinary file owned by the account that writes it, so
+// detection is the whole of the guarantee rather than half of it. The two halves
+// that remain divide the work:
 //
 //   - The hash chain (this file, plus record.go) makes editing a record,
 //     reordering records and removing records from the middle detectable, by
@@ -11,9 +14,11 @@
 //     truncation of the tail or deletion of the whole file: an adversary who
 //     can write the file can recompute a shorter, internally valid chain.
 //   - The journald anchor (anchor.go) is the control for that. Publishing
-//     (seq, hash) to the journal — a log the broker's uid cannot rewrite —
-//     means a later verifier can notice that the file no longer contains the
-//     sequence number the journal says it once did.
+//     (seq, hash) to the journal — a sink this process cannot rewrite — means a
+//     later verifier can notice that the file no longer contains the sequence
+//     number the journal says it once did. A chain created from nothing anchors
+//     itself at seq 0 for the same reason, so that a log deleted and recreated
+//     is visible even when nothing is appended to it afterwards.
 //
 // Nothing in this package claims a property it does not have. See
 // TestVerifyChainCannotDetectTailTruncation, which exists specifically to
@@ -29,6 +34,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -58,12 +64,23 @@ type Log struct {
 
 // Open opens an existing audit log for appending and validates its tail.
 //
-// The file is opened O_WRONLY|O_APPEND and deliberately NOT O_CREATE. The
-// installer creates /var/log/adb-broker/audit.log owned by a different uid with
-// the append-only attribute (chattr +a) set; a process that can create its own
-// audit log can also delete the real one and start a fresh chain, so the
-// broker is given no way to bring a log into existence. A missing file is a
-// deployment fault, not a condition to paper over.
+// The file is opened O_WRONLY|O_APPEND and deliberately NOT O_CREATE. Bringing
+// a log into existence is Create's job, and keeping the two apart is what stops
+// a wrong path, or a log that has been removed, from being answered with a
+// silent fresh chain. A missing file is a distinguishable condition — the error
+// unwraps to os.ErrNotExist — and app/broker is the single place that decides
+// what to do about it.
+//
+// This separation used to be justified differently and the older reasoning is
+// worth recording, because it was correct for the deployment it described: the
+// installer created /var/log/adb-broker/audit.log owned by a uid the broker did
+// not run as, with the append-only attribute set, and a process able to create
+// its own audit log could also delete the real one and start over. The
+// privileged install was withdrawn on 2026-08-01, so the broker and the log's
+// owner are now the same account and that argument no longer holds. What
+// replaces it is not a file permission but a published fact: a newly created
+// chain anchors itself at seq 0, so a deleted log leaves a mark in a sink this
+// process cannot rewrite. See ADB_BROKER.md, "Fail closed".
 //
 // Open then confirms the descriptor is genuinely a writable, append-mode
 // regular file, reads the last record and RECOMPUTES its hash, so an edited or
@@ -135,6 +152,53 @@ func Open(path string) (*Log, error) {
 	l.seq, l.head = tail.Seq, head
 
 	return l, nil
+}
+
+// Create brings a new audit log into existence, open for appending, with an
+// empty chain: seq 0, and a head of 32 zero bytes.
+//
+// It exists because the privileged installer that was once the only thing
+// permitted to create a log was withdrawn on 2026-08-01. A broker that refuses
+// to create its own log protects nothing now — it runs as the account that owns
+// the file either way — while costing every rebuilt host an audit_unavailable on
+// every run until someone remembers a manual step. That failure mode is the one
+// the withdrawal exists to remove, so refusing here would reintroduce it.
+//
+// The caller is responsible for anchoring the empty chain immediately, which is
+// what keeps a deleted-and-recreated log detectable; see AnchorTail and
+// app/broker's openAuditLog seam. Create does not anchor, because a foundation
+// package that reached the journal on its own would put a second anchoring path
+// beside the one app/broker holds, and there is deliberately only one.
+//
+// The parent is created 0700 and the file 0600. Neither mode defends against the
+// account that writes the log, which can change both; they keep it off the list
+// of things every other account on the host can read, which is the ordinary
+// reason for a mode and the only thing claimed for these.
+//
+// O_EXCL is what stops this from being a way to lose a chain. Create never
+// truncates and never adopts a file that is already there: if anything exists at
+// path — including one this process would have been glad to append to — it
+// fails, and the error unwraps to os.ErrExist so a caller that lost a race can
+// retry Open.
+func Create(path string) (*Log, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, fmt.Errorf("audit: %w: create the directory for %s: %w", ErrAuditUnavailable, path, err)
+	}
+
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("audit: %w: create %s: %w", ErrAuditUnavailable, path, err)
+	}
+
+	// Checked on a file this process just made, for the same reason Open checks one it did
+	// not: the mode that matters is what the kernel granted, not what was asked for.
+	if err := confirmAppendable(f); err != nil {
+		f.Close()
+
+		return nil, fmt.Errorf("audit: %w: %s: %w", ErrAuditUnavailable, path, err)
+	}
+
+	return &Log{f: f, path: path}, nil
 }
 
 // confirmAppendable reports whether f is a regular file whose descriptor the

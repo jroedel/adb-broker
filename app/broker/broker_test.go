@@ -301,7 +301,13 @@ func run(t *testing.T, store *fakeStore, args ...string) result {
 func runWithLog(t *testing.T, logPath string, store *fakeStore, args ...string) result {
 	t.Helper()
 
-	swap(t, &openAuditLog, func() (*audit.Log, error) { return audit.Open(logPath) })
+	swap(t, &openAuditLog, func() (*audit.Log, bool, error) {
+		// audit.Open, NOT the open-or-create Main uses: these helpers hand out paths that
+		// must FAIL to open, and a creating seam would answer them by making a fresh log.
+		log, err := audit.Open(logPath)
+
+		return log, false, err
+	})
 
 	if store != nil {
 		swap(t, &newStorer, func(brokerVersion string) devicebus.Storer {
@@ -1369,7 +1375,13 @@ func TestListStreamsRatherThanBuffering(t *testing.T) {
 	}
 
 	logPath := newAuditLog(t)
-	swap(t, &openAuditLog, func() (*audit.Log, error) { return audit.Open(logPath) })
+	swap(t, &openAuditLog, func() (*audit.Log, bool, error) {
+		// audit.Open, NOT the open-or-create Main uses: these helpers hand out paths that
+		// must FAIL to open, and a creating seam would answer them by making a fresh log.
+		log, err := audit.Open(logPath)
+
+		return log, false, err
+	})
 	swap(t, &newStorer, func(v string) devicebus.Storer { store.brokerVersion = v; return store })
 
 	// Each record must be flushed BEFORE the next one is asked for, which is what "streamed as

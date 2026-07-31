@@ -36,6 +36,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/user"
+	"path/filepath"
 	"time"
 
 	"github.com/jroedel/adb-broker/business/domain/device/devicebus"
@@ -45,23 +47,95 @@ import (
 	"github.com/jroedel/adb-broker/foundation/audit"
 )
 
-// auditLogPath is the ONE place the audit log's location is written down, and it is a
-// compiled-in constant on purpose.
+// auditLogPath is the ONE place the audit log's location is decided, and it is derived
+// rather than configured.
 //
-// No flag, environment variable or configuration file may change it. The guarantee the log
-// provides is that an operation the caller cannot reach was recorded before it happened; a
-// caller that can redirect the log to a file it owns has removed that guarantee without
-// removing the appearance of it. The installer creates this file owned by the broker's own
-// uid with the append-only attribute set, and the broker is given no way to bring a log
-// into existence — a process that can create its own audit log can also delete the real one
-// and start a fresh chain.
+// No flag, environment variable or configuration file may change it. That rule outlived the
+// reason it was first given. It used to protect a log the caller could not reach: redirecting
+// it to a file the caller owned would have removed the guarantee while leaving the appearance
+// of it. Since the privileged install was withdrawn on 2026-08-01 the caller owns the log
+// anyway, so what the rule protects now is narrower and still worth having — one account, one
+// chain, at a location no invocation can argue with, so that the anchors published under that
+// account's uid and the log they describe cannot be pointed at different files.
 //
-// This is also why THIS BINARY IS SETUID AND IGNORES ITS ENVIRONMENT ENTIRELY. A setuid
-// binary inherits the caller's environment and Go's runtime does not sanitize it, so there
-// is no environment read anywhere in this package: no ADB_* variable, no proxy variable, no
-// path override. The compiled-in constant and the absent environment reads are the same
-// decision looked at from two sides.
-const auditLogPath = "/var/log/adb-broker/audit.log"
+// The path comes from user.Current(), which reads the passwd database for the running uid.
+// NOT os.UserHomeDir, which reads $HOME: a value the caller sets is exactly the input this
+// must not take, and using it would also break TestPackageSourceReadsNoEnvironment, which
+// fails if any non-test file in this package or in cmd/adb-broker mentions os.Getenv,
+// os.LookupEnv or os.Environ. That test was mandatory when this binary was setuid, since a
+// setuid binary inherits its caller's environment unsanitized. It is merely correct now, and
+// it is kept.
+//
+// Two users running this binary keep two separate chains. That is the intended shape: their
+// anchors already carry different journald-stamped _UIDs, and one chain shared between two
+// accounts would be a chain either could rewrite behind the other.
+func auditLogPath() (string, error) {
+	u, err := user.Current()
+	if err != nil {
+		return "", fmt.Errorf("determine the invoking user, whose audit log this is: %w", err)
+	}
+
+	if u.HomeDir == "" {
+		return "", fmt.Errorf("uid %s has no home directory, so there is nowhere to keep an audit log", u.Uid)
+	}
+
+	return filepath.Join(u.HomeDir, ".local", "state", "adb-broker", "audit.log"), nil
+}
+
+// openOrCreateAuditLog opens the invoking user's audit log, creating it when this is the
+// first run for this account, and reports which of the two it did.
+//
+// The caller anchors a created log immediately. That is not tidiness: a chain that has just
+// come into existence is indistinguishable, by inspection of the file, from one that was
+// deleted and recreated — both recompute perfectly — so the seq-0 anchor is the only thing
+// that makes the second case visible when nothing is appended afterwards.
+//
+// Creation is reached ONLY when the log is absent. Any other failure to open is returned
+// unchanged, so a log that exists and cannot be read is never quietly replaced by an empty
+// one, which would destroy the history it failed to open.
+func openOrCreateAuditLog() (*audit.Log, bool, error) {
+	path, err := auditLogPath()
+	if err != nil {
+		return nil, false, fmt.Errorf("audit: %w: %w", audit.ErrAuditUnavailable, err)
+	}
+
+	return openOrCreateLogAt(path)
+}
+
+// openOrCreateLogAt is the open-or-create decision itself, separated from deciding WHICH log
+// so that the fixture build reaches the same code with its own path. Fixture mode exercising
+// the real creation path — including the seq-0 anchor its caller then publishes — is the
+// point of fixture mode; a second implementation of this would be a second thing to get
+// wrong, and the one that never runs in production is the one that would.
+func openOrCreateLogAt(path string) (*audit.Log, bool, error) {
+	log, err := audit.Open(path)
+
+	switch {
+	case err == nil:
+		return log, false, nil
+
+	case !errors.Is(err, os.ErrNotExist):
+		return nil, false, err
+	}
+
+	log, err = audit.Create(path)
+
+	switch {
+	case err == nil:
+		return log, true, nil
+
+	case errors.Is(err, os.ErrExist):
+		// Another broker created it between this process's Open and its Create. That
+		// chain is the real one; this process joins it rather than competing for the
+		// path, and reports itself as having created nothing, because it did not.
+		log, err = audit.Open(path)
+
+		return log, false, err
+
+	default:
+		return nil, false, err
+	}
+}
 
 // version is this binary's own version, reported as the broker member of a probe response
 // and recorded on the Device the audit log sees. It is not read from the device and it is
@@ -100,11 +174,12 @@ const (
 // nothing outside the package — and nothing at runtime — can move them: they are visible to
 // this package's own tests and to the fixture build, and to nothing else.
 var (
-	// openAuditLog opens the audit log at the compiled-in path. The indirection exists so
-	// tests can point the fail-closed check at a t.TempDir() file instead of needing root
-	// and instead of touching /var/log/adb-broker. The PATH stays a constant; only the act
-	// of opening is replaceable, and only from inside this package.
-	openAuditLog = func() (*audit.Log, error) { return audit.Open(auditLogPath) }
+	// openAuditLog opens the invoking user's audit log, creating it on a first run, and
+	// reports whether it created one. The indirection exists so tests can point the
+	// fail-closed check at a t.TempDir() file rather than at the real chain of whoever is
+	// running the suite. How the path is DERIVED stays fixed; only the act of opening is
+	// replaceable, and only from inside this package.
+	openAuditLog = openOrCreateAuditLog
 
 	// globalFlags consumes any arguments that appear before the subcommand and returns the
 	// remainder. The release build takes none; see Main.
@@ -144,9 +219,10 @@ var (
 //
 //  1. The subcommand name is resolved. A help request and an unknown subcommand are
 //     answered here, without opening the audit log, because printing usage is not an
-//     operation and must work on a host where the audit identity has not been installed.
-//  2. The audit log is opened and its tail verified. If that fails, an audit_unavailable
-//     error object is written and the invocation ends, having done nothing else.
+//     operation and must work on a host where nothing has been set up yet.
+//  2. The audit log is opened — created, on a first run for this account, and anchored at
+//     seq 0 — and its tail verified. If that fails, an audit_unavailable error object is
+//     written and the invocation ends, having done nothing else.
 //  3. Only then are flags parsed, a bus constructed, and a device contacted.
 //
 // Step 2 precedes step 3 deliberately: a caller must not be able to learn whether its flags
@@ -155,12 +231,13 @@ var (
 // "help" is answered before — the check is what decides whether this binary interprets flags
 // at all, so it cannot come second.
 //
-// Step 2 applies to verify as well, which is worth being explicit about because verify touches
-// no device. The tension is real: verify exists partly to diagnose a damaged log, and a log
-// whose TAIL will not verify now refuses to be diagnosed. What that costs is bounded — audit
-// Open validates only the tail record, so verify still reports an edit anywhere else in the
-// chain and still reports a truncation the anchors expose — but if this ordering is ever
-// relaxed, verify is the one subcommand where relaxing it would be defensible.
+// Step 2 does NOT apply to verify, and this comment used to say the opposite of the code
+// directly below it. The exemption is real and is argued at its own site: gating the tool that
+// exists to diagnose a damaged log on that log opening cleanly makes the diagnostic refuse
+// precisely when it is needed, and verify never appends, touches no device, and opens nothing
+// for writing, so there is no unauditable read for the check to prevent. The stale half of the
+// contradiction is corrected here rather than left for the next reader to resolve by guessing
+// which of the two was current.
 func Main(args []string, stdout, stderr io.Writer) int {
 	e := env{stdout: stdout, stderr: stderr}
 
@@ -222,10 +299,11 @@ func Main(args []string, stdout, stderr io.Writer) int {
 		return run(e, rest)
 	}
 
-	log, err := openAuditLog()
+	log, created, err := openAuditLog()
 	if err != nil {
-		// Every failure audit.Open reports wraps ErrAuditUnavailable. Anything else would
-		// be a bug in this seam, and internal — which is fatal — is the safe reading of it.
+		// Every failure audit.Open and audit.Create report wraps ErrAuditUnavailable.
+		// Anything else would be a bug in this seam, and internal — which is fatal — is
+		// the safe reading of it.
 		code := errcode.CodeInternal
 		if errors.Is(err, audit.ErrAuditUnavailable) {
 			code = errcode.CodeAuditUnavailable
@@ -236,6 +314,21 @@ func Main(args []string, stdout, stderr io.Writer) int {
 	defer func() { _ = log.Close() }()
 
 	e.log = log
+
+	// A chain that has just been created is anchored here, before the subcommand runs and
+	// therefore before any device is contacted, so that the journal records the reset even
+	// if this invocation goes on to fail or to append nothing.
+	//
+	// The failure is reported and then ignored, exactly as the audit extension treats its
+	// own anchors: the alternative is refusing an operation because a detectability aid
+	// could not be published, which would make the anchor more load bearing than it is. It
+	// is not silent, because an anchor path that is permanently broken and quiet is the one
+	// mistake this design has already made once.
+	if created {
+		if err := publishAnchor(log); err != nil {
+			fmt.Fprintf(stderr, "adb-broker: %v\n", err)
+		}
+	}
 
 	return run(e, rest)
 }
@@ -272,11 +365,14 @@ type env struct {
 
 // bus wires the Business core with the audit extension.
 //
-// callerUID is os.Getuid() — the REAL uid. Under setuid the real uid is the caller's while
-// the effective uid is the broker's, and the kernel supplies it, so a caller cannot forge
-// it. It is the field in the audit record to trust; clientAsserted, from --client, is a
-// caller-controlled label and is evidence of nothing, which is why it is recorded under a
-// name nobody can mistake for a verified identity.
+// callerUID is os.Getuid() — the REAL uid. The kernel supplies it, so a caller cannot forge
+// it into somebody else's, and it is the field in the audit record to trust of the two. Since
+// the setuid install was withdrawn the real and effective uids coincide, which changes nothing
+// about where the number comes from and does narrow what it proves: it names the account an
+// honest run was made from, and constrains nothing about an account willing to write the log
+// file directly. clientAsserted, from --client, is a caller-controlled label and is evidence of
+// nothing, which is why it is recorded under a name nobody can mistake for a verified identity.
+// Both fields are kept; collapsing them would erase exactly that distinction.
 //
 // The extension is handed publishAnchor and this invocation's stderr. It anchors after every
 // record it writes and reports the first failure to publish one on stderr; it never reports
@@ -530,19 +626,22 @@ usage:
   adb-broker probe  [--serial <id>] [--client <name>]
   adb-broker list   --root <path> [--max-depth <n>] [--serial <id>] [--client <name>]
   adb-broker fetch  --path <path> [--serial <id>] [--client <name>]
-  adb-broker verify [--log <path>] --anchors -
+  adb-broker verify [--log <path>] --anchors <file|glob|->
 
 verify compares the audit log against the anchors published to the journal, which is the only
-check that detects a truncated tail. It reads them from stdin, because this binary runs at the
-broker's own uid and that uid deliberately cannot read the journal files:
+check that detects a truncated tail. Run it AS THE ACCOUNT THAT RUNS THE BACKUPS, never as
+root: it accepts only anchors bearing its own uid, so a root run matches nothing and reports a
+confident pass over an empty set.
 
+  adb-broker verify --anchors '/var/log/journal/*/user-'"$(id -u)"'.journal'
   journalctl -o json MESSAGE_ID=%s | adb-broker verify --anchors -
 
---anchors also accepts a journal file or glob, for a host where this process can read one.
+Both forms work unprivileged; the first reads this user's own journal file directly, the second
+takes journalctl's output on stdin and suits a scripted run.
 
 stdout carries the protocol (JSON) and nothing else; this text and every other human-facing
-message go to stderr. The audit log's location is compiled in and cannot be changed by a
-flag, an environment variable or a configuration file, and no environment variable is read
-for any purpose.
+message go to stderr. The audit log lives at ~/.local/state/adb-broker/audit.log, derived from
+the passwd entry for this uid — not from $HOME — and no flag, environment variable or
+configuration file can move it. No environment variable is read for any purpose.
 `, audit.MessageID)
 }

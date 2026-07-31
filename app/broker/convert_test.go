@@ -3,6 +3,8 @@ package broker
 import (
 	"encoding/base64"
 	"errors"
+	"os/user"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -452,11 +454,38 @@ func TestFromBusErrorResponseThreadsTheRawBytesRatherThanReDerivingThem(t *testi
 	}
 }
 
-func TestTheCompiledAuditLogPathIsTheInstalledOne(t *testing.T) {
-	// The installer creates this file, owned by the broker's own uid with the append-only
-	// attribute set. If the constant and the installer ever disagree, every invocation fails
-	// closed — which is the safe direction, and loud, but this test says so first.
-	if auditLogPath != "/var/log/adb-broker/audit.log" {
-		t.Errorf("auditLogPath = %q", auditLogPath)
+func TestTheAuditLogPathIsThisUsersOwnAndIsNotTakenFromTheEnvironment(t *testing.T) {
+	// The path is derived from the passwd entry for the running uid, so this asserts the
+	// shape rather than a constant: one fixed location per account, under that account's
+	// home directory, which is what makes a chain and the anchors published beside it
+	// describe the same file.
+	got, err := auditLogPath()
+	if err != nil {
+		t.Fatalf("auditLogPath: %v", err)
+	}
+
+	u, err := user.Current()
+	if err != nil {
+		t.Fatalf("user.Current: %v", err)
+	}
+
+	if want := filepath.Join(u.HomeDir, ".local", "state", "adb-broker", "audit.log"); got != want {
+		t.Errorf("auditLogPath() = %q, want %q", got, want)
+	}
+
+	// $HOME is the input this must not take. os.UserHomeDir would read it, user.Current
+	// does not, and the difference is the whole reason the derivation is written the way it
+	// is: a caller that can move the audit log has removed the guarantee without removing
+	// the appearance of one. TestPackageSourceReadsNoEnvironment enforces the same rule
+	// statically; this one proves it about the value actually produced.
+	t.Setenv("HOME", filepath.Join(t.TempDir(), "not-the-real-home"))
+
+	after, err := auditLogPath()
+	if err != nil {
+		t.Fatalf("auditLogPath after moving HOME: %v", err)
+	}
+
+	if after != got {
+		t.Errorf("auditLogPath() followed $HOME: got %q, want %q unchanged", after, got)
 	}
 }

@@ -46,26 +46,41 @@ var emptyChainHead = strings.Repeat("0", hashHexLen)
 // shorter chain that verifies perfectly. Only the anchor — published to a log the broker's
 // uid cannot rewrite — says which sequence number the file once held.
 //
-// On a setuid install there is exactly ONE workable way to give it anchors, and it is the
-// pipe: journalctl run as root, its JSON fed to --anchors -. The reason is structural, not a
-// missing feature, and it is spelled out on anchorFilter — the same threat-model decision
-// that keeps the broker's uid out of the systemd-journal group also keeps it from opening
-// /var/log/journal, so the --anchors <file|glob> form cannot read what it is pointed at.
-// Naming a glob is still accepted, because an operator with a journal export the broker CAN
-// read is a legitimate case; it is simply not the install this binary ships into.
+// Both anchor sources work unprivileged, and that is new. Under the withdrawn setuid install
+// this process ran at a service account's euid that was deliberately outside systemd-journal,
+// so the --anchors <file|glob> form could not read what it was pointed at and a pipe from a
+// root journalctl was the only path that worked. Running as the invoking user removes the
+// obstacle: systemd grants a user read access to its own journal file by ACL, and this user's
+// own anchors are exactly the ones the trust filter accepts. Measured 2026-08-01 on this host,
+// as uid 1003 with no adm and no systemd-journal membership.
+//
+// It MUST be run as the account whose backups it is verifying, and running it as root is the
+// mistake to expect. anchorFilter selects on the uid this process is running as, so a root run
+// looks for _UID=0, matches none of the anchors the broker ever published, and reports a
+// confident pass over nothing.
 func runVerify(e env, args []string) int {
-	req := VerifyRequest{LogPath: auditLogPath}
+	var req VerifyRequest
 
 	fs := newFlagSet("verify", e.stderr)
-	fs.StringVar(&req.LogPath, "log", auditLogPath, "the audit log to verify")
+	fs.StringVar(&req.LogPath, "log", "", "the audit log to verify (default: this user's own)")
 	fs.StringVar(&req.AnchorsPath, "anchors", "",
-		`"-" reads newline-delimited JSON anchors on stdin, which is the only form that works on a `+
-			`setuid install: run "journalctl -o json MESSAGE_ID=`+audit.MessageID+`" as root and pipe it in. `+
-			`A journal file or glob is also accepted, but only where THIS process can read the journal `+
-			`files, which the broker's own uid deliberately cannot`)
+		`a journal file or glob to read anchors from, or "-" for newline-delimited JSON on stdin as `+
+			`"journalctl -o json MESSAGE_ID=`+audit.MessageID+`" emits it. Both work unprivileged: this `+
+			`process runs as the invoking user, whose own anchors are in a journal file that user can read`)
 
 	if exit, ok := e.bindFlags(fs, args); !ok {
 		return exit
+	}
+
+	// Resolved after parsing rather than as the flag's default, so that an explicit --log
+	// still works on a host where this user's own path cannot be determined at all.
+	if req.LogPath == "" {
+		path, err := auditLogPath()
+		if err != nil {
+			return e.failCode(errcode.CodeAuditUnavailable, "", err)
+		}
+
+		req.LogPath = path
 	}
 
 	in, err := toVerifyInput(req)
@@ -217,43 +232,42 @@ func anchorFields(in verifyInput, filter journal.Filter) ([]map[string]string, e
 
 // anchorFilter builds the only anchor filter this binary will use.
 //
-// UID IS WHAT MAKES AN ANCHOR TRUSTWORTHY. /run/systemd/journal/socket is mode 0666, so any
-// local process can publish a well-formed entry carrying the broker's MESSAGE_ID with a
-// fabricated sequence number and hash — one such forged anchor is a permanent resident of
-// this host's journal, published deliberately during an experiment, and journal entries
-// cannot be removed. An adversary who truncates the audit log can publish an anchor matching
-// the shortened chain. What that adversary cannot forge is _UID, which journald derives from
-// the sending socket's credentials. Filtering on MESSAGE_ID alone would be a check that
-// accepts everything, which is worse than no check because it produces a confident pass.
+// TWO STAMPED FIELDS MAKE AN ANCHOR TRUSTWORTHY, and since 2026-08-01 only one of them
+// discriminates on this host. /run/systemd/journal/socket is mode 0666, so any local process
+// can publish a well-formed entry carrying the broker's MESSAGE_ID with a fabricated sequence
+// number and hash — one such forged anchor is a permanent resident of this host's journal,
+// published deliberately during an experiment, and journal entries cannot be removed. An
+// adversary who truncates the audit log can publish an anchor matching the shortened chain.
+// Filtering on MESSAGE_ID alone would be a check that accepts everything, which is worse than
+// no check because it produces a confident pass.
 //
-// The uid is os.Geteuid(), NOT os.Getuid(). The kernel fills a unix socket's credentials from
-// the sender's EFFECTIVE uid, so the anchors this setuid binary published carry the broker's
-// own uid, while the real uid is whichever consumer invoked it and would match nothing. This
-// is the one place in the package where the effective uid is the right one; the audit
-// record's caller_uid is the real uid, for the opposite reason.
+// What an adversary cannot forge is _UID and _EXE, both derived by journald from the sending
+// socket's credentials rather than from anything the sender says.
+//
+// The uid is os.Geteuid(), and it stays that way. The kernel fills a unix socket's credentials
+// from the sender's EFFECTIVE uid, which under the withdrawn setuid install was the broker's
+// service account and is now simply this process's uid — the two coincide, so nothing here had
+// to change. Do not "simplify" it to os.Getuid(): they are equal today only because no setuid
+// bit is involved, and the reason this one is effective is a property of the socket, not of
+// the install. The audit record's caller_uid is the real uid, for the opposite reason.
 //
 // Exe is the running binary's own path, from /proc/self/exe, which journald recorded the same
-// way. A verify run from a copy of the binary elsewhere therefore finds no anchors and says
-// so, rather than accepting anchors it cannot attribute to this install.
+// way. A verify run from a copy of the binary elsewhere finds no anchors and says so, rather
+// than accepting anchors it cannot attribute to this install.
 //
-// This filter is also why --anchors cannot usefully name a journal FILE on the installed
-// host, and the arithmetic is worth writing down because it looks like a bug and is not one:
+// BE CLEAR ABOUT WHAT THE FILTER IS NOW WORTH, because the measurement is unflattering and
+// deleting it would leave the code looking stronger than it is. Counted 2026-08-01, of the
+// 3,652 entries in this host's journal carrying this MESSAGE_ID, every single one bears
+// _UID=1003 — the test-suite anchors, the fixture binary's, and the deliberate forgery from
+// python3.12 — because they were all published by processes running as this user, and this
+// user is now who verify runs as. The _UID half discards NOTHING here; _EXE discards all of
+// them. Against a process running as any other uid the filter is as strong as it ever was.
+// Against one running as this account it is not evidence at all, since that account owns the
+// binary whose path _EXE names. See THREAT_MODEL.md §5.5, which accepts that deliberately.
 //
-//   - Under setuid, os.Geteuid() is the broker's own uid, which is correct — those are the
-//     anchors — but that uid is deliberately NOT in the systemd-journal group, because
-//     granting it read access to every service's logs on the host was declined in the threat
-//     model. /var/log/journal/*/*.journal is root:systemd-journal 0640, so journal.Open
-//     cannot read it. That grant stays declined; the pipe form exists so it can.
-//   - Running verify as root does not help. The setuid bit sets the effective uid from the
-//     file's owner whoever invokes it, so os.Geteuid() is still the broker's uid; and were it
-//     somehow 0, this filter would select _UID=0 and match none of the anchors the broker
-//     published.
-//
-// The filter has been exercised against a real journal and did its job: of 3,365 entries
-// carrying this MESSAGE_ID, it discarded all of them — every test-suite anchor and the one
-// deliberately forged from python3.12 — because not one bore the installed binary's identity.
-// Weakening the _UID rule to make the file form work would trade the only property that makes
-// an anchor evidence for the convenience of not typing journalctl.
+// Neither half may be weakened for convenience. _EXE is now the only one doing work, and the
+// forged anchor is retained as a test fixture precisely because it is the one entry that still
+// exercises it.
 func anchorFilter() (journal.Filter, error) {
 	exe, err := os.Executable()
 	if err != nil {
@@ -325,10 +339,12 @@ func isChainHash(s string) bool {
 // readAnchorLines reads newline-delimited JSON entries — journalctl -o json output — and
 // returns the fields of the ones that pass the same trust filter journal.Entries applies.
 //
-// This form exists so an operator can verify on a host where the broker's own uid cannot read
-// the journal files, which are root:systemd-journal 0640 — that is, on every host this binary
-// is installed setuid on, which makes it the primary path rather than the fallback it was
-// first drafted as. The reader runs as root and the broker stays at its own effective uid:
+// This form exists for a host where this process cannot read the journal files directly:
+// /var/log/journal/*/*.journal is root:systemd-journal 0640, and only the per-user file is
+// ACL-readable by its own uid. It was the ONLY workable form under the withdrawn setuid
+// install, where the effective uid was a service account outside systemd-journal; since
+// 2026-08-01 it is the scripted alternative to a form that now works unprivileged, not the
+// primary path. The reader can be root or the user itself:
 //
 //	journalctl -o json MESSAGE_ID=8f3c1d7a5e4b42c9b1d06a2f7c93e5a4 | adb-broker verify --anchors -
 //
