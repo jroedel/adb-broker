@@ -2,16 +2,27 @@
 //
 // The device's own daemon applies no confinement to the paths it will stat: measured,
 // adbd answers for /data, /proc/1/maps and the root filesystem as readily as it answers
-// for media. The rules in this package are therefore the ONLY boundary between an adb
-// sync transport and the rest of the device's filesystem.
+// for media. Confinement is therefore entirely the host's job, and this package holds the
+// part of it that is decidable from a path string and a pinned filesystem.
 //
-// Confinement is two mechanisms, and they are different in kind:
+// It is NOT the whole boundary, and an earlier version of this comment claimed it was.
+// Confinement below the root rests on THREE load-bearing checks:
 //
 //   - AuthorizedPath (this file) enforces every rule that is decidable from the path
 //     string alone: the compiled allowlist and the accepted spelling.
 //   - Volume (volume.go) pins the storage volume at runtime, because "is this on the
 //     media filesystem" is a property of a path paired with a mounted volume, not of
 //     the path, and so cannot be decided by a constructor.
+//   - The kind check, which admits only regular files and directories, lives in the
+//     storage layer against filekind.Kind and NOT in this package. It is the check that
+//     stops a planted symlink, because a symlink reports its own inode's dev — the media
+//     volume it was created on — and so passes the pin whatever it points at. See
+//     Volume's doc comment and docs/THREAT_MODEL.md §5.7, which puts it plainly:
+//     removing the kind check would make symlink escapes reachable and nothing else in
+//     the design would stop them.
+//
+// The distinction matters because a control credited with more than it does is worse than
+// no control. Two claims of this exact shape have already been walked back in this design.
 //
 // Enforcement is structural rather than procedural. AuthorizedPath has no exported
 // fields, no exported way to construct a non-zero value other than ParseAuthorizedPath,
