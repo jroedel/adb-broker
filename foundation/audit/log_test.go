@@ -3,6 +3,7 @@ package audit
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -575,6 +576,98 @@ func TestCloseIsIdempotentAndAppendAfterCloseFails(t *testing.T) {
 
 	if _, err := l.Append(sampleRecord("push", 1000)); !errors.Is(err, ErrAuditUnavailable) {
 		t.Errorf("Append after Close = %v, want ErrAuditUnavailable", err)
+	}
+}
+
+// TestLogPathNamesTheOpenFile covers Path, which exists so a caller publishing
+// an anchor can say which log the anchor describes without having to carry the
+// path alongside the *Log separately. A Path that disagreed with what Open was
+// actually given would make an anchor's LogPath a guess dressed up as a fact.
+func TestLogPathNamesTheOpenFile(t *testing.T) {
+	path := installLog(t)
+
+	l, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer l.Close()
+
+	if got := l.Path(); got != path {
+		t.Errorf("Path() = %q, want %q", got, path)
+	}
+}
+
+// TestChainErrorMessageNamesTheOffendingRecord covers both of Error's shapes: a
+// record that decoded far enough to have a sequence number is named by it, and
+// one that did not falls back to the line number. Either way the underlying
+// cause's own text must still be in there — a message that named only the
+// coordinates and not the reason would send an operator straight back to the
+// error value to find out what actually happened.
+func TestChainErrorMessageNamesTheOffendingRecord(t *testing.T) {
+	cause := errors.New("hash mismatch: stored a, recomputed b")
+
+	tests := []struct {
+		name string
+		ce   *ChainError
+		want []string // substrings the message must contain
+	}{
+		{
+			name: "a decoded record is named by sequence number",
+			ce:   &ChainError{Line: 7, Seq: 3, Err: cause},
+			want: []string{"seq 3", "line 7", cause.Error()},
+		},
+		{
+			name: "an undecodable record falls back to the line number",
+			ce:   &ChainError{Line: 4, Seq: 0, Err: cause},
+			want: []string{"line 4", cause.Error()},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.ce.Error()
+
+			for _, want := range tc.want {
+				if !strings.Contains(got, want) {
+					t.Errorf("Error() = %q, want it to contain %q", got, want)
+				}
+			}
+
+			// The fallback case must not name a sequence number it does not
+			// have: "seq 0" would read as a real, decoded record rather than
+			// as "this one could not be identified at all".
+			if tc.ce.Seq == 0 && strings.Contains(got, "seq") {
+				t.Errorf("Error() = %q, names a sequence number for a record that has none", got)
+			}
+		})
+	}
+}
+
+// TestChainErrorUnwrapSurvivesErrorsIs is the property that matters most about
+// ChainError: an Unwrap that dropped the cause would make errors.Is silently
+// false at exactly the moment an operator is using it to diagnose a tampered
+// log. VerifyChain's own tests (TestVerifyChainDetectsEdit and friends) extract
+// the *ChainError with errors.As but never chase the cause any further, so this
+// is the one place that checks the chain does not end there.
+func TestChainErrorUnwrapSurvivesErrorsIs(t *testing.T) {
+	cause := errors.New("prev does not match the running chain head")
+	ce := &ChainError{Line: 2, Seq: 1, Err: cause}
+
+	if !errors.Is(ce, cause) {
+		t.Fatal("errors.Is(ChainError, cause) = false, want true: Unwrap must expose the wrapped failure")
+	}
+
+	// Wrapped one level further, the way VerifyChain's caller sees it (fmt.Errorf
+	// around whatever VerifyChain returned), the cause must still be reachable.
+	wrapped := fmt.Errorf("verify: %w", ce)
+
+	if !errors.Is(wrapped, cause) {
+		t.Error("errors.Is on a further-wrapped ChainError = false, want true")
+	}
+
+	var got *ChainError
+	if !errors.As(wrapped, &got) || got != ce {
+		t.Error("errors.As did not recover the original *ChainError through the extra wrapping")
 	}
 }
 
