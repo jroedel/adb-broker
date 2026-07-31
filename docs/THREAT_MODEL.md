@@ -162,7 +162,7 @@ device behaviour the threat depends on, `judgement` where the rule is retained o
 | T4 | Path-form tricks: `..`, relative paths, trailing/doubled slash, NUL | Rejected before anything else looks at the path | measured — each form tested against the device; `..` genuinely escapes upward, relative paths resolve with cwd `/` | None for the forms tested |
 | T5 | Prefix confusion: `/sdcard/Download-private` | Comparison is over path segments, never string prefixes | measured (`error=2`, so the device would have answered) | None |
 | T6 | An app plants a symlink in the media tree pointing at `/data` | **One** control, not two: the kind check. `LIST_V2` dirents carry `lstat` semantics, so non-regular/non-directory entries are omitted and never followed | measured (`LST2` does not follow symlinks, `STA2` does) | TOCTOU — see T7. **The `dev` check does not help here** — see §5.7 |
-| T7 | The file is swapped for a symlink between `LST2` and `RECV` | None available. `RECV` follows symlinks and the protocol offers no `openat`-style handle | measured (`RECV` necessarily traverses two symlinks on every read) | **Accepted.** Requires code execution on the phone timed against the broker; such an adversary has better options |
+| T7 | The file is swapped for a symlink between `LST2` and `RECV` | None available. `RECV` follows symlinks and the protocol offers no `openat`-style handle | measured (`RECV` necessarily traverses two symlinks on every read) | **Accepted, signed off 2026-07-31 — see §5.8.** Requires code execution on the phone timed against the broker; such an adversary has better options |
 | T8 | A bind mount inside the tree introduces a foreign filesystem with no symlink anywhere | The `dev` pin catches it; a string rule never could | judgement (mechanism follows from the measured `dev` values) | None known. **This is the only threat the `dev` check uniquely answers** — see §5.7 |
 | T9 | The device returns a directory entry naming something outside the tree | Device-supplied paths are re-parsed through `ParseAuthorizedPath` **and** `dev`-checked on the return path | measured (`adbd` applies no confinement) | None known |
 | T10 | The broker is used as a general remote-execution channel to the phone | There is no shell. The outbound vocabulary is a compiled constant: six host services plus `LST2`, `STA2`, `LIS2`, `RECV`. `shell:`, `exec:`, `SEND`, `root:`, `tcpip:`, `reverse:` are never sent | judgement (design rule, enforced by construction) | A source edit and rebuild — again attributable |
@@ -199,7 +199,7 @@ allowlist plus the volume pin — carrying more than it was credited with.
 | T24 | An empty file is treated as a failure | Zero `DATA` packets is success | measured — one such file exists on the device | None |
 | T25 | The run hangs forever | Deadlines on every read and write | measured — an over-sized length prefix blocks with no reply, no timeout, ever | None |
 | T26 | `mtime` is "corrected" and every cheap-path comparison breaks | `mtime.Mtime` wraps `int64` seconds and exposes no timezone conversion, no `time.Time`, no arithmetic | measured — camera files and screenshots disagree about what `mtime` means | The helpful mistake is not available to write |
-| T27 | A non-UTF-8 filename is silently never archived | `path_b64` is MUST and authoritative; `path` is lossy and for humans | **judgement, not measured** — every name sampled was pure ASCII, and the folders most likely to hold one were not fully walked | Cost of the check is nil; cost of being wrong is a silently unarchived file |
+| T27 | A non-UTF-8 filename is silently never archived | `path_b64` is MUST and authoritative; `path` is lossy and for humans | **judgement, not measured** — Stage 1 walked all six roots to unlimited depth, 48,704 files, zero non-UTF-8 names (`phase3_device_findings.md` §6) | **Accepted on prudence, signed off 2026-07-31 — see §5.9.** Cost of the check is nil; cost of being wrong is a silently unarchived file |
 | T28 | A depth-limited run reports a phone with no photos, successfully | Documented: all six roots have zero regular files at the top level | measured — 7 entries in `DCIM`, 8 in `Movies`, all directories | Not an error condition, so only documentation and a test guard it |
 | T29 | `ENOENT` is reported as proof a tree is gone | It is not authoritative — `adbd` returns `error=2` for paths it can see but not read | measured (`/data/data/com.android.providers.media`) | Affects wording shown to a human |
 | T30 | A fixture binary in a production path bypasses the allowlist | Fixture mode is behind a build tag, absent from the release binary, produces a differently-named binary, and reports a `+fixture` version visible in the first `probe` and in the audit log | judgement | The allowlist still applies to virtual paths, so a fixture binary is not itself an escape — only a remap |
@@ -310,6 +310,94 @@ Found while writing fixture mode: a local tree has no bind mount constructible w
 so reproducing the wire store's Lstat-only `dev` check faithfully would have left that check
 with no reachable test — which is what prompted looking at what it actually catches.
 
+### 5.8 Sign-off, 2026-07-31 — T7 is accepted, and cannot be tested from the host
+
+The phase-3 verification plan requires this to be a decision rather than an omission, so it is
+recorded here rather than left as a bare "Accepted" in a table cell.
+
+**What is accepted.** An adversary who can run code on the phone, timed against the broker's
+own request sequence, can substitute what a validated path resolves to between the `LST2` that
+named it and the `RECV` that reads it — swapping the regular file the listing saw for a symlink
+(or a different file) an instant before the read follows it. The broker will forward whatever
+bytes come back, labelled with the path it validated, hashed and recorded as if they were the
+bytes `LST2` described.
+
+**Why it cannot be tested.** Reproducing this race requires planting a binary on the phone and
+firing it at the moment between two specific sync-protocol exchanges — that is code execution on
+the device. Granting a test harness that capability and granting it to nothing else is not
+available: the whole reason this transport was chosen is that the broker never opens a shell or
+`exec:` channel to the phone, for anyone, including its own test suite. §8.5 already records this
+plainly: the case "needs a fixture that does not exist on this device." There is no host-side
+substitute for a race that only exists on the device's clock.
+
+**Why the risk is accepted rather than merely unaddressed.** The question that matters is not
+whether the race exists — it measurably does, `RECV` necessarily traverses two symlinks on every
+read — but what it hands an adversary who could not already get the same thing more directly.
+An attacker capable of timed code execution on the phone already has read and write access to
+its own app sandbox and to whatever shared storage will give it, which is most of what winning
+this race would buy. The broker's own controls still bound what is left:
+
+- **The volume pin is re-checked per step, not once per run.** `Volume.Contains` gates every
+  `dev` seen on every step of a fetch, so a substituted target still has to resolve to the
+  media volume's `dev` — it cannot pivot the race into `/data` or the root filesystem through
+  this binary. The race can swap *which file on the media volume* is read; it cannot use this
+  binary to walk off the volume.
+- **The symlink refusal below the root (§5.7) still governs what was ever listed.** The kind
+  check that makes T6 refuse a planted symlink outright is evaluated at `LST2` time, before the
+  race window opens. T7 is specifically about what changes *after* that check ran, which is why
+  it is a distinct threat rather than a second way to defeat the same one.
+- **The trailer digest is computed over the bytes actually forwarded.** Whatever `RECV`
+  returned, that is what was hashed and logged — the audit record does not claim the broker read
+  what `LST2` promised, only what it forwarded in this invocation.
+
+**What is NOT covered — stated plainly.** The trailer digest is not end-to-end device
+verification. It proves the broker forwarded what it received from `RECV`; it proves nothing
+about whether that matches what `LST2` reported earlier, because the broker never re-reads the
+device to check the two against each other. `--verify-device` was removed for the identical
+reason this race cannot be closed (§7.4): verifying on the phone needs a shell, and a shell is
+the one channel this design refuses to open. So the residual exposure is real and is not
+papered over by the hash: within the media volume, a substitution timed against the broker's
+own request sequence is undetectable by this binary, and the record it produces will be
+internally consistent and wrong.
+
+**What would change the answer.** A sync-protocol primitive with `openat`-then-read-by-handle
+semantics — pinning the byte range read to the inode that was stat'd, rather than re-resolving
+the name at `RECV` time — would close this, and nothing in the current adb sync vocabulary
+offers it. Short of a protocol change, or moving off this transport entirely (§6.1's premise),
+the answer stands as accepted.
+
+### 5.9 Sign-off, 2026-07-31 — T27 stays on prudence; the negative result is strong but not proof
+
+Recorded here as a decision rather than a default, per the phase-3 verification plan.
+
+**What is accepted.** `path_b64` remains MUST and authoritative, and `path` remains lossy and
+for humans only, on the strength of an argument rather than an observed non-UTF-8 filename.
+
+**The evidence, cited rather than restated.** The Stage 1 device run walked all six allowlist
+roots to unlimited depth and found **48,704 regular files, zero non-UTF-8 names, zero symlinks,
+zero per-path errors** (`docs/phase3_device_findings.md` §6). That same document's "Still
+untested" list is explicit about what this does and does not establish: "None found among
+48,704, up from the discovery run's sample. The `path_b64` rule stays justified by prudence, and
+this is now a much stronger negative result." A strong negative result over a large sample is
+still a negative result — it describes this device, on this day, with these apps installed, and
+it says nothing about a different device, a different locale, or a different app writing a name
+that does not decode as UTF-8 tomorrow.
+
+**Why prudence is the right basis, not a weaker one.** Android filenames are byte strings by
+specification, not by convention — nothing in the platform guarantees UTF-8, so the absence of a
+counterexample here is a fact about this sample, not about the platform. The rule is kept
+because it costs nothing to keep: `path_b64` is computed for every entry regardless, and a
+consumer that decodes `path_b64` cannot construct a request for a file that does not exist —
+round-tripping through base64 never requires the underlying bytes to be valid UTF-8. There is no
+version of "drop the rule" that saves real cost, so 48,704 files with no counterexample is not a
+reason to relax it. It would only be a reason to relax it if keeping `path_b64` were expensive,
+and it is not.
+
+**What would change the answer.** Finding one non-UTF-8 name — on this device or another —
+would convert this from a prudence rule into a demonstrated requirement; that strengthens the
+decision, it does not reverse it. What would actually force a revision is a real cost to
+carrying `path_b64` (a downstream consumer that cannot decode it, or a size constraint on the
+field) — nothing of that kind is known today.
 
 ---
 
@@ -393,7 +481,9 @@ some.
 
 ### 7.3 Refusing all symlinks below the root may be too blunt
 
-It costs nothing today — zero symlinks among 1,778 files. A future device shipping a
+It costs nothing today — zero symlinks among 48,704 files, measured across all six roots to
+unlimited depth (`docs/phase3_device_findings.md` §6; the earlier 1,778 was the discovery
+run's bounded sample). A future device shipping a
 legitimate one shows up as *missing files*, not as an error, which is the failure direction
 this tool exists to prevent. The `list` summary counts refused non-regular entries
 specifically so the cost is visible rather than silent. Still genuinely open (spec, open

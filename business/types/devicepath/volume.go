@@ -34,18 +34,25 @@ type StatFunc func(path string) (dev, ino int64, mode uint32, err error)
 // literal, no setter, and no zero value that means anything, so a fetch attempted before
 // the volume was pinned cannot be expressed.
 //
-// The pin exists because the string rules in path.go cannot cover symlinks. Any app on
-// the phone can create /sdcard/Pictures/x as a symlink into /data/data/…, and a broker
-// that checks only the requested string has an allowlist any app can step around. An
-// earlier design said "refuse a symlink at every path component"; measured, that is
-// unimplementable, because /sdcard IS a symlink (mode 0o120644, dev=65034 ino=48, target
-// /storage/self/primary) and /storage/self/primary is a symlink too. Refusing symlinks at
-// every component rejects every path the allowlist exists to permit.
+// The pin exists because the string rules in path.go cannot cover what an app on the
+// phone can plant inside the tree: a symlink at /sdcard/Pictures/x pointing into
+// /data/data/…, or — with no symlink anywhere — a bind mount. A broker that checks only
+// the requested string has an allowlist either can step around. An earlier design said
+// "refuse a symlink at every path component"; measured, that is unimplementable, because
+// /sdcard IS a symlink (mode 0o120644, dev=65034 ino=48, target /storage/self/primary) and
+// /storage/self/primary is a symlink too. Refusing symlinks at every component rejects
+// every path the allowlist exists to permit.
 //
-// So the rule compares filesystems instead of spellings. A symlink or bind mount leading
-// off the media volume lands on a different dev — measured, the media volume is dev=190,
-// /data is dev=65088, the root filesystem is dev=65034 — and is caught by where it
-// actually leads rather than by what it is named.
+// It does NOT close the symlink case — that is the kind check's job, elsewhere, and the
+// two are not redundant. LIST_V2 carries lstat semantics, so the dev reported for a
+// symlink is that of the symlink's own inode, not its target: a symlink planted at
+// /sdcard/Pictures/x has its inode on the media volume it was created on and reports
+// dev=190, matching the pin, regardless of where it points — measured. The dev check
+// alone would pass it. What the pin does catch is a bind mount, which is a genuine
+// directory and so passes the kind check untouched: comparing filesystems lands it on a
+// dev that does not match — measured, the media volume is dev=190, /data is dev=65088,
+// the root filesystem is dev=65034. See docs/THREAT_MODEL.md §5.7 for the full division
+// of labour.
 type Volume struct {
 	dev      int64
 	ino      int64
@@ -108,10 +115,12 @@ func (v Volume) IsZero() bool { return !v.resolved }
 // cannot tell them apart. Enforcing ino would therefore defend against /sdcard being
 // re-pointed at another user's storage, which requires privilege on the PHONE, which the
 // threat model puts explicitly out of scope; this device has no second user. dev alone
-// catches what IS in scope: a symlink or bind mount leading off the media volume, to
-// /data (dev=65088) or the root filesystem (dev=65034). Enforcing ino as well would be a
-// control against a threat already declared out of scope, so ino is carried as
-// provenance only.
+// catches what IS in scope on this axis: a bind mount leading off the media volume, to
+// /data (dev=65088) or the root filesystem (dev=65034). A symlink leading off the volume
+// is not caught here — its dev matches the pin regardless of target — and is refused by
+// the kind check instead; see the Volume doc comment and docs/THREAT_MODEL.md §5.7.
+// Enforcing ino as well would be a control against a threat already declared out of
+// scope, so ino is carried as provenance only.
 //
 // An unpinned Volume contains nothing, so a caller that skipped ResolveVolume cannot
 // authorise anything with it.
