@@ -10,82 +10,80 @@ one of them.
 
 ---
 
-## 0. Resume here (updated 2026-07-31 ~03:50 CEST)
+## 0. Status: all four waves complete (2026-07-31)
 
-**Waves 1 and 2 are complete. Wave 3 is in flight.** The gate is green across ten packages:
-`go build ./...`, `make test-unit` under `-race`, `make lint` in both build configurations,
-and `make deps-check`.
+**Every wave of this plan has landed and the gate is green in all three build
+configurations.** Thirteen packages, a working release binary, a working fixture binary, and
+a 19-test device manifest waiting on hardware.
 
-Landed and committed: `foundation/errs`, `foundation/adbwire`, `foundation/audit`,
-`foundation/journal`, `business/types/{devicepath,mtime,filekind,serial,errcode}`, and
-`business/domain/device/devicebus`.
+| Configuration | Command | State |
+|---|---|---|
+| release | `go vet ./...`, `staticcheck`, `make test-unit`, `make deps-check` | green |
+| fixture | `go vet -tags=fixture`, `staticcheck -tags=fixture`, `make test-fixture` | green |
+| device | `go vet -tags=device`, `staticcheck -tags=device`, `make test-device` | compiles; all 19 skip with the real reason named |
 
-In flight (wave 3): `stores/adbsyncdb` and `extensions/deviceaudit`.
-Remaining after that: wave 4 — `app/broker` + `cmd/adb-broker`, fixture mode behind the
-build tag, and the `device`-tagged manifest in §9.
+Also verified by hand: `make build` and `make build-fixture`, `gofmt` clean, and an
+end-to-end run of all four subcommands against a fixture tree — probe, list with a planted
+symlink correctly omitted, fetch, fetch of a zero-byte file returning the empty-input digest,
+a denied root recorded in the audit log, and `verify` re-hashing the chain.
 
-### The journal reader is no longer the project's biggest risk
+### What remains
 
-The plan assumed the real journal was unreadable here, so the reader could only be tested
-against synthetic fixtures — a circularity where a writer and reader sharing one wrong
-assumption both pass. That premise was **half wrong**. System files are denied, but
-`/var/log/journal/*/user-1003*.journal` carry an ACL and are readable by this uid. So the
-parser was diffed against `journalctl`'s own output: **29,367 entries, 29,367 of 29,367
-cursors byte-identical, 804,689 field values byte-identical**, with the only absent fields
-being zstd-compressed ones and their count matching the reported compressed-object count for
-every entry. Re-checked independently at integration time on one file, by MESSAGE_ID/UID/EXE
-triple: 138 and 114 entries, exact match.
+Nothing in this plan. The open items are the spec's own, plus what only hardware can settle:
 
-That procedure is recorded in `journal_integration_test.go`'s doc comment so it can be redone.
+1. **Run `make test-device` with the phone attached.** Nineteen tests. The one that matters
+   most is `TestDeviceRecvDoneArgumentWidthIsFourBytes` — the codebase's only unverified
+   protocol assumption. A failure there is a finding, not a broken test.
+2. **`make install` with the built binary**, so the setuid install is exercised for the first
+   time. `zarf/install.sh --binary bin/adb-broker` does it; needs root.
+3. **Spec-parked features**: `--prune`, `--fail-after`, `--inject-error`, `fetch-many`,
+   persistent mode, off-box anchoring.
+4. **Known limitations, recorded rather than fixed** — see the commit messages for detail:
+   anchors can only be compared at the tail, since `foundation/audit` exposes whole-chain
+   verification and the tail but not the hash at an arbitrary seq; `verify`'s journal-*file*
+   path is untested because `foundation/journal`'s file builder is test-only, so only
+   `--anchors -` is exercised; per-path errors in a `list` summary carry no `path_b64`
+   companion, so a failing path that is not valid UTF-8 cannot be round-tripped there, while
+   a *record* for the same path can; and the app's tests publish real journal datagrams,
+   because `deviceaudit`'s `writeAnchor` seam is unexported.
 
-### Operational notes for an unattended run
+### Operational notes
 
-- **`git push` fails under cron** with `Permission denied (publickey)`, because cron does not
-  export `SSH_AUTH_SOCK`. Fix: `export SSH_AUTH_SOCK=/run/user/1003/keyring/ssh` before
-  pushing. This works while the desktop session's keyring agent is alive; if it is not, the
-  on-disk key can be used directly with
-  `GIT_SSH_COMMAND='ssh -i ~/.ssh/id_ed25519 -o IdentitiesOnly=yes'`. Commits always succeed;
-  only the push needs this.
-- Do not have an interactive session on the same conversation open when a scheduled resume
-  fires.
-
-### Corrections already folded into the other documents
-
-`adb_experiment.md` gained Phase 0c (the bare-`OKAY` asymmetry; the single-use host socket)
-and the `RECV` `DONE` argument width under *Still untested*. `ADB_BROKER.md` lost
-`devicepath.DevicePath`. Done in commit `9c624fc`.
-
-**Still exactly one unverified assumption in the codebase**: `RECV`'s `DONE` carries a 4-byte
-argument rather than `LIS2`'s 72-byte dirent body. Top item on the device manifest in §9.
-
----
-
-## 1. Where we are
-
-Done and committed:
-
-| | |
-|---|---|
-| `docs/` | Spec, threat model, and two experiment records. 8.1 answered and closed. |
-| `zarf/install.sh` | Written, run, verified. Broker uid 995, both audit controls confirmed on ext4. |
-
-Done, uncommitted, from the go-ahead to lay foundations:
-
-| | |
-|---|---|
-| `go.mod` | `github.com/jroedel/adb-broker`, `go 1.26`, no `require` block. |
-| `Makefile` | Targets below. Tooling pinned via `go run pkg@version` so the module graph stays empty. |
-| `foundation/errs` | `FieldError`, `FieldErrors`, `Add`/`Addf`/`Empty`/`Fields`/`Error`/`Unwrap`/`ErrorOrNil`, plus `IsFieldErrors`. Tests pass, `staticcheck` clean. |
-
-`make` targets: `build build-fixture vet fmt lint vuln-check deps-check test-unit
-test-integration test-fixture test-device test cover install verify-install clean`.
-
-`deps-check` fails the build if anything non-stdlib enters the graph. That is the
-stdlib-only rule made mechanical rather than remembered.
-
-**Not started:** every other package.
+- **`git push` fails under cron** — no `SSH_AUTH_SOCK`. Use
+  `export SSH_AUTH_SOCK=/run/user/1003/keyring/ssh`. Commits are unaffected.
+- **The unattended relaunch script is `local/adb-broker-resume.sh`**, and `local/` is
+  gitignored because the script hardcodes this machine's session id, uid and keyring socket.
+  `--at HH:MM` arms it, `--run` is what cron invokes, `--status` reports, `--disarm` removes
+  it. It disarms only on a verified success: process exit 0, a green gate, **and** an explicit
+  completion marker — because exit status, an advanced `HEAD` and a green gate were all true
+  of a run that stopped with two subagents still mid-flight. Recreating it means rewriting it;
+  read `--help`, which documents all of the above.
 
 ---
+
+## 1. What was built
+
+Thirteen packages, all committed. Kept here as the map of the finished shape; the sections
+below record the plan that produced it and are left as written, including the constraints and
+the frozen API, because they explain why the code looks the way it does.
+
+| Package | What it is |
+|---|---|
+| `foundation/adbwire` | adb host + `sync:` protocol. No exec path, compiled service vocabulary. |
+| `foundation/audit` | Hash-chained append-only log, canonical serialization, journald anchors. |
+| `foundation/journal` | Read-only journal file reader, verified against `journalctl` over 29,367 entries. |
+| `foundation/errs` | `FieldErrors` accumulation for App-layer validation. |
+| `business/types/devicepath` | `AuthorizedPath` + `Volume` — both halves of confinement. |
+| `business/types/{mtime,filekind,serial,errcode}` | Strong wrappers; `errcode` owns the `Coder`/`From` contract. |
+| `business/domain/device/devicebus` | Model, `Storer` port, `Business`, extension seam. |
+| `.../stores/adbsyncdb` | The `Storer` over the sync protocol: traversal, `dev` checks, reconnect. |
+| `.../stores/fixturedb` | Fixture `Storer` behind the `fixture` tag. |
+| `.../extensions/deviceaudit` | Audit decorator, one record per operation. |
+| `app/broker` + `cmd/adb-broker` | Four subcommands, the wire contract, fail-closed startup. |
+
+`zarf/install.sh` creates and verifies the audit identity. `make` targets: `build
+build-fixture vet fmt lint vuln-check deps-check test-unit test-integration test-fixture
+test-device test cover install verify-install clean`.
 
 ## 2. What "done" means for iteration 1
 
