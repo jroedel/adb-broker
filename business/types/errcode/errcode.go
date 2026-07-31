@@ -43,7 +43,9 @@ const (
 	CodeAuditUnavailable Code = "audit_unavailable"
 
 	// CodeVolumeUnresolved means a configured volume could not be resolved to
-	// a device path. Not fatal: the consumer aborts that source.
+	// a device path. Fatal: the consumer aborts the run. A remount fails
+	// every remaining source identically, so treating this as a per-source
+	// failure would only reproduce the same abort one source at a time.
 	CodeVolumeUnresolved Code = "volume_unresolved"
 
 	// CodeRootNotFound means a source's root could not be read.
@@ -114,11 +116,18 @@ func (c Code) String() string {
 
 // Fatal reports whether a consumer must abort the entire run on this code,
 // rather than skipping the affected source or path and continuing.
+//
+// CodeVolumeUnresolved is fatal even though a single unresolved volume sounds
+// like it should only end that one source: a remount fails every remaining
+// source the same way, on the same device, for the same reason, so treating
+// it as per-source just moves the abort one level up — a source-by-source
+// storm of volume_unresolved failures instead of one. Aborting the run here
+// is what actually solves the problem this taxonomy exists to solve.
 func (c Code) Fatal() bool {
 	switch c {
 	case CodeNoDevice, CodeUnauthorized, CodeOffline, CodeMultipleDevices,
 		CodeNoADBServer, CodeAuditUnavailable, CodeDeviceDisconnected,
-		CodeUnsupported, CodeInternal:
+		CodeUnsupported, CodeInternal, CodeVolumeUnresolved:
 		return true
 	default:
 		return false

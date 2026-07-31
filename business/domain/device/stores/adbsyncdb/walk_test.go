@@ -422,6 +422,17 @@ func TestListRootFailures(t *testing.T) {
 			want:  errcode.CodePermissionDenied,
 		},
 		{
+			// Neither ENOENT nor EACCES: an errno this broker has not measured (EIO,
+			// say). This is the case codeForErrno's old hardcoded default got wrong —
+			// it named the failure CodeTransferFailed, a code that means "one file's
+			// transfer failed," even though walkRoot never attempts a transfer at all.
+			// The root case wants the same code as errno 2: the root could not be
+			// read, whatever the specific errno.
+			name:  "unmeasured errno",
+			reply: adbwire.Stat{Errno: 5}, // EIO
+			want:  errcode.CodeRootNotFound,
+		},
+		{
 			name:  "regular file",
 			reply: regularStat(10, devMedia),
 			want:  errcode.CodeNotADirectory,

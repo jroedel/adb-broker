@@ -65,7 +65,15 @@ func (w *walker) walkRoot(ctx context.Context, root devicepath.AuthorizedPath) e
 		// Deliberate wording: the root could not be READ. Measured,
 		// /data/data/com.android.providers.media answers error=2 although it exists, so
 		// ENOENT from adbd is not evidence of absence and must never be reported as such.
-		return codeErr(codeForErrno(st.Errno, errcode.CodeRootNotFound), nil, "the listing root %q could not be read (the device answered errno %d, which does not prove the path is absent)", root.String(), st.Errno)
+		//
+		// notFound and unmeasured are the same code here, deliberately: walkRoot never
+		// transfers anything, so whatever the specific errno, what happened to THIS call
+		// is identical — the listing root could not be read. CodeRootNotFound's own
+		// doc says exactly that with no mention of a specific errno, so it already
+		// covers the unmeasured case; codeForErrno's old hardcoded default of
+		// CodeTransferFailed named a failure (a transfer) that a root listing never
+		// attempts.
+		return codeErr(codeForErrno(st.Errno, errcode.CodeRootNotFound, errcode.CodeRootNotFound), nil, "the listing root %q could not be read (the device answered errno %d, which does not prove the path is absent)", root.String(), st.Errno)
 
 	case !filekind.ParseKind(st.Mode).IsDir():
 		return codeErr(errcode.CodeNotADirectory, nil, "the listing root %q is a %s (mode 0o%o), not a directory", root.String(), filekind.ParseKind(st.Mode), st.Mode)
@@ -173,9 +181,13 @@ func (w *walker) classify(dir devicepath.AuthorizedPath, d adbwire.Dirent, mayDe
 			return devicepath.AuthorizedPath{}, false
 		}
 
+		// unmeasured stays CodeTransferFailed: this is a per-entry failure inside a
+		// listing, not the root of one, and a per-path failure that skips one entry and
+		// continues is close enough to "one file's transfer failed" that renaming it
+		// would be churn without a reader-visible improvement. See codeForErrno.
 		w.summary.Errors = append(w.summary.Errors, devicebus.PathError{
 			Path: child,
-			Code: codeForErrno(d.Errno, errcode.CodePathNotFound),
+			Code: codeForErrno(d.Errno, errcode.CodePathNotFound, errcode.CodeTransferFailed),
 		})
 
 		return devicepath.AuthorizedPath{}, false
@@ -288,9 +300,13 @@ func (w *walker) descend(ctx context.Context, child devicepath.AuthorizedPath, d
 		// Recorded and stepped over. A subdirectory this run may not read says nothing
 		// about its siblings, so ending the walk here would throw away the rest of the
 		// tree over one permission.
+		//
+		// unmeasured stays CodeTransferFailed, same reasoning as classify: this is one
+		// child among the parent's siblings, not a listing root, so a per-path skip is
+		// the right shape whatever the exact errno. See codeForErrno.
 		w.summary.Errors = append(w.summary.Errors, devicebus.PathError{
 			Path: child,
-			Code: codeForErrno(st.Errno, errcode.CodePathNotFound),
+			Code: codeForErrno(st.Errno, errcode.CodePathNotFound, errcode.CodeTransferFailed),
 		})
 
 		return nil

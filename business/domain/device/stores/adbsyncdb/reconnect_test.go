@@ -82,26 +82,56 @@ func TestFetchDoubleFailureJoinsBothCauses(t *testing.T) {
 		t.Errorf("dials = %d, want %d: the rebuild must still be attempted even though it is doomed", tr.dials, dialsBefore+1)
 	}
 
-	// What this test deliberately does NOT assert: a specific want for
-	// errcode.From(err).
-	//
-	// Reading adbsyncdb.go's Fetch (the errors.Join branch, and the `code`
-	// computed above it): `code` is computed from the RECV failure alone,
-	// BEFORE reconnectLocked is even attempted, and is never revisited once
-	// the rebuild's own outcome is known. So today this call reports
-	// errcode.CodeTransferFailed — "skip this file, keep going" — even though
-	// the rebuild it just ran has already discovered the device cannot be
-	// reached at all. Compare walk.go's listing failures, which fall back to
-	// errcode.CodeDeviceDisconnected (fatal) for the equivalent single-failure
-	// case, on the documented reasoning that a dead sync channel is different
-	// news for a listing than for one file. That reasoning does not extend to
-	// THIS call: here the store has not merely lost the channel, it has tried
-	// to rebuild it and failed, which is stronger evidence than either single
-	// failure alone and should not classify as the weaker of the two.
-	//
-	// Asserting CodeTransferFailed here would pin exactly that misclassification
-	// into a green test. See the task report for the recommendation (surface
-	// the reconnect failure's own classification, e.g. via codeForWire(rerr,
-	// errcode.CodeDeviceDisconnected), when rerr != nil).
-	t.Logf("errcode.From(err) = %s (see comment above: this is believed to be a misclassification, not asserted as correct)", errcode.From(err))
+	// The double failure must classify as fatal, not as transfer_failed. Fetch now
+	// derives `code` from the reconnect's own outcome once reconnectLocked has run: rerr
+	// here is a dial failure with no adbwire sentinel attached, so connectLocked's
+	// codeForWire(err, errcode.CodeInternal) falls through to its fallback, and that is
+	// what errcode.From reads back. Any of the rebuild's other failure modes
+	// (CodeNoADBServer, CodeUnauthorized, CodeOffline, CodeNoDevice, CodeMultipleDevices,
+	// CodeUnsupported) would equally satisfy "fatal" — this test pins the one this fixture
+	// actually produces.
+	if got := errcode.From(err); got != errcode.CodeInternal {
+		t.Errorf("errcode.From(err) = %s, want %s", got, errcode.CodeInternal)
+	}
+
+	if !errcode.From(err).Fatal() {
+		t.Error("a double failure (RECV failed AND the rebuild failed) must classify as fatal: the reconnect's own failure is evidence about the device or the server, not about the one file being fetched")
+	}
+}
+
+// TestFetchSingleFailureStillReportsTransferFailed is the contrasting half of the double
+// failure above: RECV fails but the automatic rebuild that follows it SUCCEEDS. This must
+// keep reporting errcode.CodeTransferFailed exactly as before — "skip this one file, keep
+// going" is the correct and only classification once the transport has proven it still
+// works. (TestFetchRecvFailureReconnectsOnce in adbsyncdb_test.go already covers this same
+// behaviour end to end; this copy lives here too because it is the fix's control case: it
+// is what would break if Fetch's new code-selection logic reached into the successful
+// reconnect branch instead of leaving it alone.)
+func TestFetchSingleFailureStillReportsTransferFailed(t *testing.T) {
+	st, tr := newTestStore()
+	vol := pinVolume(t, st)
+
+	const path = testRoot + "/Camera/IMG_0001.jpg"
+
+	tr.fs.lstat[path] = regularStat(10, devMedia)
+	tr.fs.recvErr[path] = errRecvGone
+
+	dialsBefore := tr.dials
+
+	_, err := st.Fetch(t.Context(), devicepath.MustParseAuthorizedPath(path), vol, io.Discard, nil)
+	if err == nil {
+		t.Fatal("Fetch: want an error when RECV fails, got nil")
+	}
+
+	if got := errcode.From(err); got != errcode.CodeTransferFailed {
+		t.Errorf("errcode.From(err) = %s, want %s: the rebuild succeeded, so this is still one file's failure, not the device's", got, errcode.CodeTransferFailed)
+	}
+
+	if st.reconnects != 1 {
+		t.Errorf("reconnects = %d, want exactly 1", st.reconnects)
+	}
+
+	if tr.dials != dialsBefore+1 {
+		t.Errorf("dials = %d, want %d", tr.dials, dialsBefore+1)
+	}
 }

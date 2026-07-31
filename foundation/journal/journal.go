@@ -872,8 +872,31 @@ func isMessageID(s string) bool {
 	return true
 }
 
-// readError maps a short read at the end of a file onto errTruncated, so a file
-// journald is still writing ends a traversal instead of failing it.
+// readError maps a short read at the end of a file onto errTruncated.
+//
+// This is not what guards a file journald is still writing. That case never reaches a
+// short read at all: jf.usedEnd is a snapshot taken once, at Open, and every read is
+// bounds-checked against it before this function ever runs (readObject's two range
+// checks) — an append-only file that has grown since Open just has more bytes past
+// usedEnd that this reader does not look at yet, and a still-unwritten object inside the
+// pre-allocated arena reads back as zeroes, which the type-0 check just above turns into
+// errTruncated on its own, with no read error involved.
+//
+// What this guards instead is narrower: the file shrinking after that snapshot was
+// taken — an external truncation of the still-open inode, racing between the bounds
+// check and the ReadAt call this wraps. journald itself never does this; rotation
+// unlinks or renames a file rather than truncating one still open, and POSIX keeps an
+// open fd's bytes intact regardless. Nothing in this codebase truncates it either. The
+// branch stays anyway, because this function is parsing a file this process does not
+// control, and asserting a narrower failure mode than the platform allows is the kind of
+// assumption that costs nothing to avoid.
+//
+// io.ErrUnexpectedEOF specifically is not reachable today: jf.file is a *os.File, whose
+// ReadAt converts a short read at EOF to io.EOF and never returns ErrUnexpectedEOF (that
+// value comes from io.ReadFull/ReadAtLeast, which nothing here calls). It is matched
+// anyway rather than dropped, on the same reasoning as the paragraph above: a defensive
+// check earns its keep by staying honest about what it guards, not by being provably
+// exercised.
 func readError(err error) error {
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return errTruncated

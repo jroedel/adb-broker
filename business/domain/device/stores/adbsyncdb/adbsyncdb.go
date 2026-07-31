@@ -374,7 +374,10 @@ func (s *Store) Fetch(ctx context.Context, p devicepath.AuthorizedPath, vol devi
 
 	switch {
 	case st.Errno != 0:
-		return devicebus.FetchResult{}, codeErr(codeForErrno(st.Errno, errcode.CodePathNotFound), nil, "lstat %q: the device answered errno %d", p.String(), st.Errno)
+		// unmeasured is CodeTransferFailed here, unlike walkRoot's LST2: this LST2 is the
+		// preflight of THIS call's own transfer, not a listing root, so a per-file
+		// failure is exactly what an unmeasured errno on it is.
+		return devicebus.FetchResult{}, codeErr(codeForErrno(st.Errno, errcode.CodePathNotFound, errcode.CodeTransferFailed), nil, "lstat %q: the device answered errno %d", p.String(), st.Errno)
 
 	case !filekind.ParseKind(st.Mode).IsRegular():
 		// Refused before RECV, and RECV is what would have followed the symlink.
@@ -397,6 +400,9 @@ func (s *Store) Fetch(ctx context.Context, p devicepath.AuthorizedPath, vol devi
 
 	n, err := sess.sc.Recv(ctx, path, io.MultiWriter(w, digest))
 	if err != nil {
+		// Defaults to the RECV failure's own classification. This is the code for the
+		// common case — RECV failed and the rebuild below repairs the transport — and it
+		// is overridden only if that rebuild ALSO fails.
 		code := codeForWire(err, errcode.CodeTransferFailed)
 
 		// Measured: every RECV failure observed killed the session, on a fresh channel,
@@ -405,6 +411,24 @@ func (s *Store) Fetch(ctx context.Context, p devicepath.AuthorizedPath, vol devi
 		// first run every unreadable file costs one full re-establishment, and that cost
 		// is deliberate.
 		if rerr := s.reconnectLocked(ctx); rerr != nil {
+			// The rebuild failed too, and that outranks the RECV failure it followed: a
+			// dead channel is one thing to lose, but failing to re-establish ANY channel
+			// on this device or server is evidence about the device or the server, not
+			// about the one file being fetched, and it is discovered by actually trying
+			// to reach both — stronger evidence than either failure alone. It must not be
+			// reported as the weaker transfer_failed.
+			//
+			// errcode.From(rerr) reads the classification back rather than recomputing
+			// one: reconnectLocked's error is already a codeErr built by connectLocked,
+			// which resolves to CodeNoADBServer, CodeUnauthorized, CodeOffline,
+			// CodeNoDevice, CodeMultipleDevices, CodeUnsupported or CodeInternal
+			// depending on which step of the rebuild failed — every one of those is
+			// Fatal in the taxonomy. Reclassifying rerr here a second time (e.g. via
+			// codeForWire(rerr, someFallback)) would risk silently downgrading a precise
+			// code like CodeUnsupported to a generic fallback whenever rerr's underlying
+			// error does not wrap one of adbwire's named sentinels; reading the code the
+			// rebuild already decided on avoids that.
+			code = errcode.From(rerr)
 			err = errors.Join(err, rerr)
 		}
 
@@ -553,13 +577,19 @@ func codeForWire(err error, fallback errcode.Code) errcode.Code {
 
 // codeForErrno translates an in-band device errno into the taxonomy. notFound is the code
 // for ENOENT, which differs by position: a missing root ends one source, a missing file
-// during a fetch ends one file.
+// during a fetch ends one file. unmeasured is the code for every other errno this broker
+// has not measured — EIO, a TOCTOU ENOTDIR, ELOOP and the rest — and it differs by position
+// for the same reason notFound does, the way codeForWire's fallback parameter already does
+// one level up: a caller checking a listing ROOT has not attempted any transfer, so a
+// hardcoded CodeTransferFailed there would report a failure that never happened. Both
+// codes are non-fatal in the taxonomy, so getting the choice wrong is a message-quality
+// mistake, not a decision-quality one — the run's shape does not change either way.
 //
 // Measured trap: ENOENT does not prove absence.
 // /data/data/com.android.providers.media answers error=2 although it exists — adbd hides
 // existence rather than admitting a permission failure. So neither code may be presented
 // to a human as proof a path is gone; the wording must say the path could not be read.
-func codeForErrno(errno uint32, notFound errcode.Code) errcode.Code {
+func codeForErrno(errno uint32, notFound, unmeasured errcode.Code) errcode.Code {
 	switch errno {
 	case errnoENOENT:
 		return notFound
@@ -568,8 +598,8 @@ func codeForErrno(errno uint32, notFound errcode.Code) errcode.Code {
 		return errcode.CodePermissionDenied
 
 	default:
-		// An errno this broker has not measured is a per-path failure, not a fatal one:
-		// the channel survived it, so one odd path must not end a run.
-		return errcode.CodeTransferFailed
+		// The channel survived this errno — it arrived in-band, same as ENOENT and
+		// EACCES — so whatever ended is exactly as contained as those two, and no more.
+		return unmeasured
 	}
 }

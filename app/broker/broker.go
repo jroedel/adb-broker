@@ -80,7 +80,14 @@ const (
 	// output, so it is a success.
 	exitOK = 0
 
-	// exitError means an error object was written and no usable output was produced.
+	// exitError means the operation failed and no usable output reached the consumer.
+	// Usually that is because an error object was written to stdout, but not always: four
+	// call sites report exitError having written NO object there at all — env.emit and
+	// runList's errStdout branch, because stdout itself failed the write and there is
+	// nowhere left to report it; env.writeFailed and env.transferFailedMidStream,
+	// because the stream already has a byte count committed to it and an error object
+	// appended now would be indistinguishable from more of that content. Either way,
+	// stderr carries what stdout could not.
 	exitError = 1
 
 	// exitUsage means this binary could not interpret the invocation at all: no
