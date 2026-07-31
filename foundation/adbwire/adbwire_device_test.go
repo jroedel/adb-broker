@@ -99,7 +99,7 @@ func requireDevice(t *testing.T) deviceFixture {
 
 	entry := entries[0]
 	if entry.State != "device" {
-		t.Skipf("the attached device %q is in state %q, not %q", entry.Serial, entry.State, "device")
+		t.Skipf("the attached device %s is in state %q, not %q", redactSerial(entry.Serial), entry.State, "device")
 	}
 
 	return deviceFixture{serial: entry.Serial}
@@ -614,4 +614,19 @@ func TestDeviceErrnoIsInBandAndChannelSurvives(t *testing.T) {
 	if _, err := sc.Stat(ctx, root); err != nil {
 		t.Errorf("Stat(%q) after the ENOENT: %v, want the channel to still be usable", root, err)
 	}
+}
+
+// redactSerial shortens a device serial for test output.
+//
+// This repository has a standing rule that a device serial is never recorded in full: it is
+// a durable, unique handle to a specific physical phone, and the docs were once corrected
+// because an experiment record set that rule and then broke it six times. Test output ends up
+// pasted into commit messages and findings documents, so the rule applies here too.
+func redactSerial(s string) string {
+	const keep = 4
+	if len(s) <= keep {
+		return "…"
+	}
+
+	return s[:keep] + "…"
 }

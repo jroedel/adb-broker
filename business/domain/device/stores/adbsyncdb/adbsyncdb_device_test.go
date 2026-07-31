@@ -85,7 +85,7 @@ func requireDeviceStore(t *testing.T) (*Store, serial.Serial) {
 
 	entry := entries[0]
 	if entry.State != "device" {
-		t.Skipf("the attached device %q is in state %q, not %q", entry.Serial, entry.State, "device")
+		t.Skipf("the attached device %s is in state %q, not %q", redactSerial(entry.Serial), entry.State, "device")
 	}
 
 	ser, err := serial.ParseSerial(entry.Serial)
@@ -426,4 +426,19 @@ func TestDeviceStoreNoSymlinksFoundBelowTheRoots(t *testing.T) {
 	}
 
 	t.Logf("walked %d roots to depth %d: %d regular files, %d entries refused as non-regular or off-volume", len(devicepath.Roots()), boundedDepth, totalFiles, totalRefused)
+}
+
+// redactSerial shortens a device serial for test output.
+//
+// This repository has a standing rule that a device serial is never recorded in full: it is
+// a durable, unique handle to a specific physical phone, and the docs were once corrected
+// because an experiment record set that rule and then broke it six times. Test output ends up
+// pasted into commit messages and findings documents, so the rule applies here too.
+func redactSerial(s string) string {
+	const keep = 4
+	if len(s) <= keep {
+		return "…"
+	}
+
+	return s[:keep] + "…"
 }
