@@ -29,12 +29,14 @@
 package broker
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"time"
 
 	"github.com/jroedel/adb-broker/business/domain/device/devicebus"
 	"github.com/jroedel/adb-broker/business/domain/device/devicebus/extensions/deviceaudit"
@@ -165,6 +167,19 @@ func Main(args []string, stdout, stderr io.Writer) int {
 		return e.failUsage(fmt.Errorf("unknown subcommand %q; run \"adb-broker help\" for the list", name))
 	}
 
+	// verify is exempt from the fail-closed check, and this is the one exemption.
+	//
+	// audit.Open validates the log's tail and refuses to proceed if it does not verify.
+	// Gating verify on that makes the tool that exists to diagnose a damaged log unable to
+	// open one — the diagnostic refuses precisely when it is needed. verify also never
+	// appends: it reads a log named by --log and journal anchors, touches no device and
+	// opens nothing for writing, so there is no unauditable read for the check to prevent.
+	//
+	// Every other subcommand reads the phone, so every other subcommand is gated.
+	if name == "verify" {
+		return run(e, rest)
+	}
+
 	log, err := openAuditLog()
 	if err != nil {
 		// Every failure audit.Open reports wraps ErrAuditUnavailable. Anything else would
@@ -243,6 +258,61 @@ func (e env) emit(v any) int {
 // fail writes the error object for err, classified by whatever code err carries, and
 // reports exitError. path is the caller's own path for the operation, or "" when the
 // failure names none.
+// validClientLabel returns raw if it is an acceptable --client label, and empty otherwise.
+//
+// Used only when recording a refusal, where the label may be the very thing that was
+// rejected.
+func validClientLabel(raw string) string {
+	label, err := toClientLabel(raw)
+	if err != nil {
+		return ""
+	}
+
+	return label
+}
+
+// denyBeforeBus records a refusal that never reached the Business layer, then reports it.
+//
+// A denial at the flag boundary — a --root outside the allowlist, a --client label that is
+// not a valid label — is refused by a converter before any bus exists, so the audit
+// extension never sees it and would never write a record. That is precisely the case the
+// log exists for: a caller repeatedly asking for paths it has no business reading is the
+// pattern an audit trail is supposed to make visible, and it is the one a decorator on the
+// bus structurally cannot capture.
+//
+// The record is written here rather than by widening the extension, because the extension
+// decorates operations and this is the refusal of one. op names the attempted subcommand;
+// pathB64 is the base64 of the raw requested bytes when there was a path, so an
+// unparseable or non-UTF-8 request is still recorded faithfully.
+//
+// A failure to write the record does not change what is reported to the caller. The
+// operation was refused either way, and inventing a different outcome because the log
+// write failed would misreport the refusal.
+func (e env) denyBeforeBus(op, rawPath, clientAsserted string, err error) int {
+	if e.log != nil {
+		_, _ = e.log.Append(audit.Record{
+			TS:        time.Now(),
+			Op:        op,
+			CallerUID: os.Getuid(),
+			// Only a label that passes validation is recorded. The field has documented
+			// bounds — at most maxClientBytes, a restricted charset — and writing
+			// arbitrary caller bytes into it would break the contract a reader relies on
+			// even while treating the value as untrusted. When the label itself is what
+			// was rejected, Result already says so.
+			ClientAsserted: validClientLabel(clientAsserted),
+			PathB64:        base64.StdEncoding.EncodeToString([]byte(rawPath)),
+			Decision:       "deny",
+			// requestCode, not errcode.From: a validation failure that carries no
+			// classification is unsupported — the caller asked for something this
+			// binary does not do — and the record must say the same thing the wire
+			// object says, or the log and the consumer would disagree about one event.
+			Result: requestCode(err).String(),
+		})
+	}
+
+	return e.failCode(requestCode(err), displayBytes(rawPath), err)
+}
+
 func (e env) fail(path string, err error) int {
 	return e.failCode(errcode.From(err), path, err)
 }

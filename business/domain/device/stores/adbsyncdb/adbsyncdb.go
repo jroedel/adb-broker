@@ -8,15 +8,22 @@
 //
 // Four rules here exist because of measured device behaviour rather than caution:
 //
-//   - Every entry's dev must equal the pinned volume's. A symlink or bind mount leading
-//     off shared storage lands on a different filesystem — measured, media is dev=190,
-//     /data is dev=65088, the root filesystem is dev=65034 — so an escape is caught by
-//     where it leads rather than by what it is named. That is the only form of the check a
-//     bind mount cannot step around, because no string rule can see a mount.
+//   - Every entry's dev must equal the pinned volume's. This catches a BIND MOUNT inside
+//     the tree, which introduces a foreign filesystem with no symlink involved and which no
+//     string rule could ever see — measured, media is dev=190, /data is dev=65088, the root
+//     filesystem is dev=65034.
 //   - Only regular files are emitted. Directories are descended into; symlinks, sockets,
-//     FIFOs, block and character devices are omitted and never followed. The dev check
-//     cannot catch a symlink that stays on the volume, and the kind check cannot catch a
-//     bind mount, so both run on every entry.
+//     FIFOs, block and character devices are omitted and never followed. This is what
+//     catches a SYMLINK ESCAPE.
+//
+// The two are not redundant, and the division of labour is worth stating because it is the
+// opposite of what it looks like. A LIST_V2 dirent carries lstat semantics, so for a symlink
+// the dev reported is the filesystem holding the SYMLINK INODE, not its target — measured on
+// /sdcard itself, LST2 says dev=65034 where STA2 says dev=190. A symlink planted inside the
+// media tree therefore reports the pinned dev no matter where it points, and the dev check
+// passes it. Only the kind check refuses it. Conversely a bind mount is a genuine directory,
+// so only the dev check sees it. Removing either as "redundant with the other" reopens one of
+// the two escapes.
 //   - The V2 sync commands are required, not preferred. Legacy STAT and LIST report size
 //     as 32 bits, so a video over 4 GiB would list with a silently wrong size. Refusing to
 //     start is worse for one run and better forever: the wrong size is found years later,

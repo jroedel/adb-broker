@@ -44,7 +44,10 @@ func runList(e env, args []string) int {
 	// serve must not cause a phone to be touched at all.
 	in, err := toBusListRequest(req)
 	if err != nil {
-		return e.failCode(requestCode(err), displayBytes(req.Root), err)
+		// A --root outside the allowlist is refused here, before any transport exists, so
+		// the audit extension never sees it. Recorded here instead: a caller probing trees
+		// it has no business reading is exactly what the log is for.
+		return e.denyBeforeBus("list", req.Root, req.Client, err)
 	}
 
 	emit := func(rec devicebus.FileRecord) error {

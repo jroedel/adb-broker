@@ -34,7 +34,8 @@ func runFetch(e env, args []string) int {
 
 	in, err := toBusFetchRequest(req)
 	if err != nil {
-		return e.failCode(requestCode(err), displayBytes(req.Path), err)
+		// Refused before the bus exists, so recorded here — see denyBeforeBus.
+		return e.denyBeforeBus("fetch", req.Path, req.Client, err)
 	}
 
 	bus := e.bus(in.client)

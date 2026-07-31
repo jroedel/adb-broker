@@ -22,7 +22,9 @@ func runProbe(e env, args []string) int {
 
 	in, err := toBusProbeRequest(req)
 	if err != nil {
-		return e.failCode(requestCode(err), "", err)
+		// Recorded even though it never reached the bus: a refusal is the kind of event
+		// the audit log most needs, and no decorator on the bus can see this one.
+		return e.denyBeforeBus("probe", "", req.Client, err)
 	}
 
 	dev, err := e.bus(in.client).Probe(context.Background(), in.serial)
