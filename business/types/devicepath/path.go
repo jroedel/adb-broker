@@ -29,12 +29,13 @@ package devicepath
 
 import (
 	"encoding/base64"
-	"errors"
 	"fmt"
 	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	"github.com/jroedel/adb-broker/business/types/errcode"
 )
 
 // VolumeRoot is the one accepted spelling of the device's shared storage root, and the
@@ -69,7 +70,29 @@ const VolumeRoot = "/sdcard"
 // path outside the compiled allowlist, an unaccepted spelling of shared storage, and a
 // rejected Child name. Callers match it with errors.Is and map it to the path_denied
 // audit outcome. The returned errors wrap it and add which rule fired.
-var ErrPathDenied error = errors.New("path denied")
+var ErrPathDenied error = &codedError{msg: "path denied", code: errcode.CodePathDenied}
+
+// codedError is a sentinel that carries its own classification from the broker's
+// taxonomy, satisfying errcode.Coder.
+//
+// The classification belongs on the error rather than in a table kept by each
+// consumer. Two layers already needed to ask "what code is this failure?" — a store
+// deciding what to report and the audit extension deciding what to record — and a
+// second, subtly different mapping is exactly how the broker's reason for existing
+// gets undone: the CLI adapter it replaces classified failures by matching English
+// in two places, which drifted apart.
+//
+// Identity is preserved, so errors.Is against the package's sentinels works exactly
+// as it did when they were errors.New values, and the messages are unchanged.
+type codedError struct {
+	msg  string
+	code errcode.Code
+}
+
+func (e *codedError) Error() string { return e.msg }
+
+// Code reports the taxonomy classification for this failure.
+func (e *codedError) Code() errcode.Code { return e.code }
 
 // compiledAllowlist is the complete set of locations this binary can ever reach on the
 // device. Everything else — /data, /proc, the root filesystem, and the rest of shared

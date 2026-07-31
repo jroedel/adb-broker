@@ -101,19 +101,17 @@ func (w *walker) walkDir(ctx context.Context, dir devicepath.AuthorizedPath, dep
 		return nil
 	}
 
-	// descend is decided per level rather than per entry: below the requested depth there
-	// is no reason to name a child path at all.
-	descend := w.maxDepth == 0 || depth < w.maxDepth
+	// Whether to descend is decided per level rather than per entry: below the requested
+	// depth there is no reason to name a child path at all.
+	mayDescend := w.maxDepth == 0 || depth < w.maxDepth
 
 	var (
-		children    []devicepath.AuthorizedPath
-		sawOffPin   bool
-		listErrHint = dir
+		children  []devicepath.AuthorizedPath
+		sawOffPin bool
 	)
 
 	err := w.sess.sc.List(ctx, toSyncPath(dir), func(d adbwire.Dirent) error {
-		child, keep := w.classify(dir, d, &sawOffPin)
-		if keep && descend {
+		if child, ok := w.classify(dir, d, mayDescend, &sawOffPin); ok {
 			children = append(children, child)
 		}
 
@@ -131,7 +129,7 @@ func (w *walker) walkDir(ctx context.Context, dir devicepath.AuthorizedPath, dep
 		// A listing that failed part way is not an empty listing. CodeDeviceDisconnected is
 		// fatal in the taxonomy, deliberately: a truncated listing reported as a per-file
 		// warning would let a consumer treat "half the tree" as "the whole tree".
-		return codeErr(codeForWire(err, errcode.CodeDeviceDisconnected), err, "listing %q", listErrHint.String())
+		return codeErr(codeForWire(err, errcode.CodeDeviceDisconnected), err, "listing %q", dir.String())
 	}
 
 	// Now that the listing has finished the session is usable again, so this is the first
@@ -158,7 +156,7 @@ func (w *walker) walkDir(ctx context.Context, dir devicepath.AuthorizedPath, dep
 // It runs inside the LIS2 callback, so it must not issue a sync command: the session's lock
 // is held by the listing. Anything needing a round trip is deferred to the caller — that is
 // what sawOffPin is for.
-func (w *walker) classify(dir devicepath.AuthorizedPath, d adbwire.Dirent, sawOffPin *bool) (devicepath.AuthorizedPath, bool) {
+func (w *walker) classify(dir devicepath.AuthorizedPath, d adbwire.Dirent, mayDescend bool, sawOffPin *bool) (devicepath.AuthorizedPath, bool) {
 	// adbd does not return "." or "..", measured. They are skipped anyway: relying on the
 	// device to filter the two names that mean "go back up" is relying on the wrong party.
 	if name := string(d.Name); name == "." || name == ".." {
@@ -194,11 +192,15 @@ func (w *walker) classify(dir devicepath.AuthorizedPath, d adbwire.Dirent, sawOf
 		return devicepath.AuthorizedPath{}, false
 	}
 
-	switch kind := filekind.ParseKind(d.Mode); kind {
+	switch filekind.ParseKind(d.Mode) {
 	case filekind.KindDir:
-		child, ok := w.childOf(dir, d)
+		if !mayDescend {
+			// Beyond the requested depth. Not refused and not an error — simply not
+			// visited, so it is not counted as either.
+			return devicepath.AuthorizedPath{}, false
+		}
 
-		return child, ok
+		return w.childOf(dir, d)
 
 	case filekind.KindRegular:
 		w.emit(dir, d)

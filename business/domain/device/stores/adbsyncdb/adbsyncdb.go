@@ -78,7 +78,7 @@ var requiredFeatures = [...]string{featureStatV2, featureLsV2, featureSendrecvV2
 // plain Linux errnos and are written out here because the value came off the wire from an
 // Android device rather than from this host's syscall package.
 const (
-	errnoENOENT = 2  // measured on the device; see codeForErrno for why it is not "absent"
+	errnoENOENT = 2 // measured on the device; see codeForErrno for why it is not "absent"
 	errnoEACCES = 13
 )
 
@@ -387,9 +387,19 @@ func (s *Store) Fetch(ctx context.Context, p devicepath.AuthorizedPath, vol devi
 		return devicebus.FetchResult{}, codeErr(code, err, "recv %q stopped after %d bytes", p.String(), n)
 	}
 
+	// Serial names the device the bytes actually came from. ExtBusiness.Fetch takes no
+	// serial — a fetch identifies only a path — so this store is the only layer that
+	// knows, and without it every fetch record in the audit log would say the bytes came
+	// from some unnamed phone. A parse failure here is not worth failing a completed
+	// transfer over: the session's serial came from host:devices and was already parsed
+	// once during probe, so the zero value can only mean a bug, and losing the whole
+	// fetch would be a worse outcome than a record with one field missing.
+	ser, _ := serial.ParseSerial(sess.row.serial)
+
 	return devicebus.FetchResult{
 		Bytes:  n,
 		SHA256: hex.EncodeToString(digest.Sum(nil)),
+		Serial: ser,
 	}, nil
 }
 

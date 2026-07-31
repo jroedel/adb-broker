@@ -7,6 +7,8 @@
 // message to guess.
 package errcode
 
+import "errors"
+
 // Code is one of the broker's error classifications.
 type Code string
 
@@ -121,4 +123,40 @@ func (c Code) Fatal() bool {
 	default:
 		return false
 	}
+}
+
+// Coder is implemented by an error that carries a classification from this
+// taxonomy.
+//
+// It lives here, in the package that owns the taxonomy, rather than in whichever
+// package happens to produce such an error. Two layers independently needed to
+// ask "what code is this failure?" — a store deciding what to report, and the
+// audit extension deciding what to record — and each had begun growing its own
+// answer. A second, slightly different mapping is exactly how the broker's whole
+// reason for existing gets undone: the CLI adapter this replaces classified
+// failures by matching English in two places that drifted apart.
+//
+// A producer satisfies it by defining an unexported error type with an exported
+// Code method. Nothing needs to import the producer.
+type Coder interface {
+	Code() Code
+}
+
+// From extracts the code an error carries, or CodeInternal if it carries none.
+//
+// CodeInternal is the safe direction: it is Fatal, so an unclassified failure
+// aborts rather than being quietly skipped. A nil error yields the empty Code,
+// which is not a classification and is never written to a record — callers report
+// success explicitly rather than treating "no code" as "ok".
+func From(err error) Code {
+	if err == nil {
+		return ""
+	}
+
+	var coded Coder
+	if errors.As(err, &coded) {
+		return coded.Code()
+	}
+
+	return CodeInternal
 }

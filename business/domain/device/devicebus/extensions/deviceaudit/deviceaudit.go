@@ -36,7 +36,6 @@ package deviceaudit
 import (
 	"context"
 	"encoding/hex"
-	"errors"
 	"io"
 	"time"
 
@@ -241,23 +240,35 @@ func decision(err error) string {
 // resultCode classifies err into the audit record's Result field: "ok" for
 // success, or else the errcode.Code the error unwraps to.
 //
-// Only the sentinels devicebus's own package doc documents its Business core
-// as raising — devicepath.ErrPathDenied and devicepath.ErrVolumeUnresolved —
-// are matched by name. Every other error, including one specific to whatever
-// Storer implementation a caller wired underneath devicebus (a package this
-// extension does not import and must not couple itself to), degrades to
-// errcode.CodeInternal. That mirrors errcode.ParseCode's own fail-safe
-// default for an unrecognised code, applied here to an unrecognised error
-// instead of an unrecognised string.
+// The classification is read through errcode.Coder, which is the contract the
+// taxonomy package owns, so this extension neither imports nor knows about
+// whichever Storer implementation produced the failure. It deliberately does not
+// reclassify: a second mapping, subtly different from the store's, is exactly how
+// the broker's reason for existing gets undone — the CLI adapter this replaces
+// classified failures by matching English in two places, and they drifted apart.
+//
+// An error carrying no classification becomes errcode.CodeInternal, which mirrors
+// errcode.ParseCode's fail-safe default for an unrecognised code and is Fatal, so
+// an unclassified failure aborts rather than being quietly skipped.
 func resultCode(err error) string {
 	switch {
 	case err == nil:
 		return "ok"
-	case errors.Is(err, devicepath.ErrPathDenied):
-		return errcode.CodePathDenied.String()
-	case errors.Is(err, devicepath.ErrVolumeUnresolved):
-		return errcode.CodeVolumeUnresolved.String()
+
+	// errcode.From reads the classification the failing layer already decided on,
+	// through the errcode.Coder contract. This package deliberately does not
+	// reclassify: a second mapping, slightly different from the store's, is how the
+	// broker's whole reason for existing gets undone — the CLI adapter it replaces
+	// classified failures in two places that drifted apart. An unclassified error
+	// becomes CodeInternal, which is Fatal, so it aborts rather than being skipped.
 	default:
+		if code := errcode.From(err); code != "" {
+			return code.String()
+		}
+
+		// Reached only if From says an error carries no code at all, which it does
+		// not do for a non-nil error. Kept as a belt-and-braces default rather than
+		// letting an empty Result reach the log, where it would read as "no failure".
 		return errcode.CodeInternal.String()
 	}
 }

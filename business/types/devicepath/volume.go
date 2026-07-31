@@ -1,8 +1,9 @@
 package devicepath
 
 import (
-	"errors"
 	"fmt"
+
+	"github.com/jroedel/adb-broker/business/types/errcode"
 )
 
 // Device-side mode bits. These describe the file type field of a mode as the device's
@@ -18,7 +19,7 @@ const (
 // does not yield a directory. The device is not presenting shared storage in the shape
 // this broker understands, and guessing is not an option, so the invocation aborts before
 // any path is served.
-var ErrVolumeUnresolved error = errors.New("volume unresolved")
+var ErrVolumeUnresolved error = &codedError{msg: "volume unresolved", code: errcode.CodeVolumeUnresolved}
 
 // StatFunc is everything ResolveVolume needs from a transport, and all it needs. The
 // implementation issues the sync protocol's STA2 — which FOLLOWS symlinks, exactly what
