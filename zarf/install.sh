@@ -416,6 +416,26 @@ verify_binary() {
 		fail "setuid bit is NOT set — the broker would run as its caller's uid"
 	fi
 
+	# Build provenance, reported rather than asserted.
+	#
+	# THREAT_MODEL.md 8.2 notes that nothing establishes what was built: no signature, no
+	# attestation, so a rebuilt binary installed by root is indistinguishable from a reviewed
+	# one. Go's VCS stamping does not close that -- an attacker who rebuilds controls the stamp
+	# too -- but it does turn "unknown" into "recorded", which is enough to notice an
+	# accidental install of a dirty tree or of the wrong commit.
+	if command -v go >/dev/null 2>&1; then
+		local rev dirty
+		rev="$(go version -m "${target}" 2>/dev/null | awk '$2=="vcs.revision"{print substr($3,1,12)}')"
+		dirty="$(go version -m "${target}" 2>/dev/null | awk '$2=="vcs.modified"{print $3}')"
+
+		case "${rev}:${dirty}" in
+		:*) note "warn    ${target} carries no VCS stamp; provenance is unknown" ;;
+		*:true) fail "${target} was built from a MODIFIED tree (revision ${rev})" ;;
+		*:false) pass "built from revision ${rev}, clean tree" ;;
+		*) note "warn    ${target} revision ${rev}, modified state unknown" ;;
+		esac
+	fi
+
 	# A setuid binary its own uid can rewrite is not a boundary: the broker could
 	# replace itself with anything and keep the uid.
 	if as_broker sh -c "test -w '${target}'"; then
