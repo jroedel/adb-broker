@@ -42,8 +42,8 @@ No root, no service account, no install script.
 Linux, `amd64` and `arm64`. Substitute the version you want — pin one, don't track `latest`.
 
 ```sh
-curl -fsSLO https://github.com/jroedel/adb-broker/releases/download/v0.1.0-rc1/adb-broker-linux-amd64
-curl -fsSLO https://github.com/jroedel/adb-broker/releases/download/v0.1.0-rc1/SHA256SUMS
+curl -fsSLO https://github.com/jroedel/adb-broker/releases/download/v0.1.0-rc2/adb-broker-linux-amd64
+curl -fsSLO https://github.com/jroedel/adb-broker/releases/download/v0.1.0-rc2/SHA256SUMS
 sha256sum --ignore-missing -c SHA256SUMS
 install -D -m 0755 adb-broker-linux-amd64 ~/.local/bin/adb-broker
 adb-broker version
@@ -51,8 +51,14 @@ adb-broker version
 
 ```
 adb-broker-linux-amd64: OK
-{"proto":1,"status":"ok","broker":"0.1.0-rc1","revision":"a336b590ff9c3fb9dbfb3505ee1756b4f8ed2382","modified":false}
+{"proto":1,"status":"ok","broker":"0.1.0-rc2","revision":"8e80245cf1146d9837f0ae345f16cfd01f4c50e9","modified":false}
 ```
+
+> **`v0.1.0-rc1` is withdrawn — do not use it.** That build derives its audit log path from
+> `$HOME` on any host whose uid has no passwd entry (LDAP, SSSD, AD, or a container with an
+> unmapped uid), defeating the rule that no environment variable can move the log. Reproduced
+> against the published artifact, not merely suspected. `v0.1.0-rc2` is the first usable tag;
+> `zarf/repro-passwd-fallback.sh` distinguishes the two and needs no privileges.
 
 Two optional checks. The release carries a provenance attestation:
 
@@ -60,8 +66,8 @@ Two optional checks. The release carries a provenance attestation:
 gh attestation verify adb-broker-linux-amd64 --repo jroedel/adb-broker
 ```
 
-and the build is reproducible — clone the repo, `git checkout v0.1.0-rc1`, `make dist
-VERSION=0.1.0-rc1`, and you get the published bytes exactly. That one requires trusting nobody
+and the build is reproducible — clone the repo, `git checkout v0.1.0-rc2`, `make dist
+VERSION=0.1.0-rc2`, and you get the published bytes exactly. That one requires trusting nobody
 at all, which is why it is worth knowing about even if you never run it.
 
 There is no macOS or Windows build. Windows does not compile; macOS is left out deliberately,

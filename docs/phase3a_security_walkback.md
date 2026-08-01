@@ -240,6 +240,13 @@ possible place to discover a mistake in the thing that makes releases:
    `go version -m` cannot catch it — it records the commit but never `-ldflags`. The only reader
    that can is the binary itself, which is what B built.
 
+### Releases
+
+| Tag | Status |
+|---|---|
+| `v0.1.0-rc1` | **Withdrawn. Do not use.** Derives the audit log path from `$HOME` where the uid has no passwd entry — see A. The release was deleted; the tag may survive, and its Sigstore attestation is in a public transparency log permanently and cannot be removed at all |
+| `v0.1.0-rc2` | The first usable tag. `8e80245`, verified from the published assets: sums check, `{"broker":"0.1.0-rc2","revision":"8e80245c…","modified":false}`, attestation verifies, and `zarf/repro-passwd-fallback.sh` passes against the **downloaded** artifact |
+
 ### Run end to end, on `v0.1.0-rc1`
 
 Tagged 2026-08-01 as a shakedown rather than a production release. Every step ran: the ancestry
@@ -442,9 +449,7 @@ quietly testing the host instead.
 - The normative contract is `docs/ADB_BROKER.md`. `README.md` is the consumer-facing guide and
   was written by running the binary rather than transcribing the spec, so where it gives an
   example, that example was observed.
-- Next action: **cut a tag carrying the `auditLogPath` fix.** `v0.1.0-rc1` resolves the audit log
-  path from `$HOME` on any host whose uid has no passwd entry; that is the one thing outstanding
-  that a released artifact gets wrong.
-- Then: **implement the install contract in `photos`.** A through E are done in this repository;
+- Next action: **implement the install contract in `photos`.** A through E are done in this
+  repository, and `v0.1.0-rc2` is a good artifact to build against;
   `ADB_BROKER.md` → **The consumer install contract** is the specification to build against, and
   `foundation/source/adbbroker` is where it lands.
