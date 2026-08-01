@@ -72,7 +72,7 @@ purpose: a different anchor sink, or an explicit refusal to run where it cannot 
 | Consumer-facing `README.md` | **Done**, `231f56e` |
 | `foundation/adbwire` test flake | **Fixed**, `9f59ce0` — the gate is trustworthy, which C depends on |
 | **B** — version identity | **Done**, `7db15f7` |
-| **C** — release workflow | **Done**, `2eeb8e2` — rehearsed locally, not yet run on a tag |
+| **C** — release workflow | **Done**, `2eeb8e2`. Rehearsed locally, then run for real on `v0.1.0-rc1` and `v0.1.0-rc2`; the dry run, the ancestry guard, the artifact check, the attestation and `gh release create` have all now executed |
 | **D** — consumer install contract | **Specified**, `ADB_BROKER.md` → *The consumer install contract*. Not implemented — the consumer is a separate repository |
 | **E** — docs | **Done** — `README.md`, `ADB_BROKER.md`, `THREAT_MODEL.md` |
 
@@ -446,9 +446,8 @@ quietly testing the host instead.
 
 1. ~~**Reproduce the `$HOME` fallback** on a host with an unresolvable uid before calling A
    verified.~~ Done 2026-08-01, and it found that the fix did not work. See A, and
-   `zarf/repro-passwd-fallback.sh`. **`v0.1.0-rc1` carries the defect** — it is a pre-release
-   shakedown that nothing consumes, deliberately left in place, and the next tag carries the
-   fix. (A)
+   `zarf/repro-passwd-fallback.sh`. `v0.1.0-rc1` carried the defect and is **withdrawn** —
+   release deleted, `retract`ed in `go.mod`; see *Releases*. (A)
 2. ~~**Does the VCS revision become a `probe` member, or stay in the audit record?**~~ Closed by
    B: `version` reports it, `probe` does not, and the audit record never carried a version to
    stay in. (B)
