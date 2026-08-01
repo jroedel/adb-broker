@@ -240,6 +240,32 @@ possible place to discover a mistake in the thing that makes releases:
    `go version -m` cannot catch it — it records the commit but never `-ldflags`. The only reader
    that can is the binary itself, which is what B built.
 
+### Releases
+
+| Tag | Status |
+|---|---|
+| `v0.1.0-rc1` | **Withdrawn. Do not use.** Derives the audit log path from `$HOME` where the uid has no passwd entry — see A |
+| `v0.1.0-rc2` | Verified good, and superseded only because rc3 carries the retraction. `8e80245`, checked from the published assets: sums, `{"broker":"0.1.0-rc2","revision":"8e80245c…","modified":false}`, attestation verifies, and `zarf/repro-passwd-fallback.sh` passes against the **downloaded** artifact |
+| `v0.1.0-rc3` | rc2 plus `retract v0.1.0-rc1` in `go.mod`. No code difference |
+
+**Withdrawing a version takes three steps and none of them is complete on its own.** Worth
+writing down, because the first two look sufficient and are not:
+
+1. **Delete the release.** Done — the binaries return 404. This is the step that matters most,
+   since a downloaded binary is how anyone actually gets one.
+2. **Delete the tag.** Optional, and it removes less than it appears to (below).
+3. **`retract` it in `go.mod`.** This is the one that closes the real remaining hole.
+   `proxy.golang.org` had already cached the version — measured, `@v/v0.1.0-rc1.info` returns
+   200 — and that cache is **immutable**. So `go install …@v0.1.0-rc1` went on working and
+   building the defective source after the release was deleted, and would have gone on working
+   after the tag was deleted too. A retraction is honoured from the go.mod of the *latest*
+   version, which is why rc3 exists at all.
+
+Two records cannot be withdrawn by any of it: the module proxy's copy of the source, and the
+Sigstore provenance attestation in the public transparency log. Someone holding an rc1 binary
+can still verify it genuinely came from this repository — which is precisely why the README says
+plainly not to use it. **Provenance was never the problem; the binary was.**
+
 ### Run end to end, on `v0.1.0-rc1`
 
 Tagged 2026-08-01 as a shakedown rather than a production release. Every step ran: the ancestry
@@ -442,9 +468,7 @@ quietly testing the host instead.
 - The normative contract is `docs/ADB_BROKER.md`. `README.md` is the consumer-facing guide and
   was written by running the binary rather than transcribing the spec, so where it gives an
   example, that example was observed.
-- Next action: **cut a tag carrying the `auditLogPath` fix.** `v0.1.0-rc1` resolves the audit log
-  path from `$HOME` on any host whose uid has no passwd entry; that is the one thing outstanding
-  that a released artifact gets wrong.
-- Then: **implement the install contract in `photos`.** A through E are done in this repository;
+- Next action: **implement the install contract in `photos`.** A through E are done in this
+  repository, and `v0.1.0-rc2` is a good artifact to build against;
   `ADB_BROKER.md` → **The consumer install contract** is the specification to build against, and
   `foundation/source/adbbroker` is where it lands.
