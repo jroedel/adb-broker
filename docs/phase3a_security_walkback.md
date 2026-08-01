@@ -3,7 +3,7 @@
 **Status as of 2026-08-01. This is the current working plan and it supersedes
 `phase-3-verification-plan.md` entirely — see *What this replaces* below.**
 
-Branch `feature/adb-broker-plan`, pushed through `9f59ce0`.
+Merged to `main` through `06c7ed2`. Current release `v0.1.0-rc3`.
 
 We used to have the pretension to protect the binary in another user account. In the end we have
 developed this plan to walk back that design decision to make it more straightforward. We want
@@ -72,9 +72,12 @@ purpose: a different anchor sink, or an explicit refusal to run where it cannot 
 | Consumer-facing `README.md` | **Done**, `231f56e` |
 | `foundation/adbwire` test flake | **Fixed**, `9f59ce0` — the gate is trustworthy, which C depends on |
 | **B** — version identity | **Done**, `7db15f7` |
-| **C** — release workflow | **Done**, `2eeb8e2` — rehearsed locally, not yet run on a tag |
-| **D** — consumer install contract | **Specified**, `ADB_BROKER.md` → *The consumer install contract*. Not implemented — the consumer is a separate repository |
+| **C** — release workflow | **Done**, `2eeb8e2`. Rehearsed locally, then run for real on three tags; the dry run, the ancestry guard, the artifact check, the attestation and `gh release create` have all executed |
+| **D** — consumer install contract | **Specified**, `ADB_BROKER.md` → *The consumer install contract*. Not implemented — the consumer is a separate repository, deliberately out of scope here |
 | **E** — docs | **Done** — `README.md`, `ADB_BROKER.md`, `THREAT_MODEL.md` |
+
+**Phase 3a is complete.** `v0.1.0-rc3` is the current release; see *Releases*. What is left is
+listed under **What is not done** below — none of it is phase 3a work.
 
 ---
 
@@ -246,7 +249,7 @@ possible place to discover a mistake in the thing that makes releases:
 |---|---|
 | `v0.1.0-rc1` | **Withdrawn. Do not use.** Derives the audit log path from `$HOME` where the uid has no passwd entry — see A |
 | `v0.1.0-rc2` | Verified good, and superseded only because rc3 carries the retraction. `8e80245`, checked from the published assets: sums, `{"broker":"0.1.0-rc2","revision":"8e80245c…","modified":false}`, attestation verifies, and `zarf/repro-passwd-fallback.sh` passes against the **downloaded** artifact |
-| `v0.1.0-rc3` | rc2 plus `retract v0.1.0-rc1` in `go.mod`. No code difference |
+| `v0.1.0-rc3` | **Current.** `06c7ed2` — rc2 plus `retract v0.1.0-rc1` in `go.mod`, no code difference. Verified from the published assets: sums, `{"broker":"0.1.0-rc3","revision":"06c7ed21…","modified":false}` |
 
 **Withdrawing a version takes three steps and none of them is complete on its own.** Worth
 writing down, because the first two look sufficient and are not:
@@ -259,12 +262,23 @@ writing down, because the first two look sufficient and are not:
    200 — and that cache is **immutable**. So `go install …@v0.1.0-rc1` went on working and
    building the defective source after the release was deleted, and would have gone on working
    after the tag was deleted too. A retraction is honoured from the go.mod of the *latest*
-   version, which is why rc3 exists at all.
+   version, which is why rc3 exists at all and is its entire content.
+
+**Verified, and note what the verification had to separate.** Against the repository directly,
+`go list -m -versions` offers `v0.1.0-rc2 v0.1.0-rc3` and no longer offers rc1 — the directive
+is correct and effective. Against `proxy.golang.org` at the same moment it still offered
+`v0.1.0-rc1 v0.1.0-rc2`, because the proxy caches its version list and had not yet fetched rc3.
+That is latency, not failure, and it is worth knowing before someone concludes the retraction
+did not work: **check with `GOPROXY=direct` first.**
 
 Two records cannot be withdrawn by any of it: the module proxy's copy of the source, and the
 Sigstore provenance attestation in the public transparency log. Someone holding an rc1 binary
 can still verify it genuinely came from this repository — which is precisely why the README says
 plainly not to use it. **Provenance was never the problem; the binary was.**
+
+The rc1 **tag** was deliberately left in place. Once the release is deleted and the version
+retracted it carries nothing a user can reach, and deleting it would not remove the proxy's copy
+of the source either — so it stays as a historical marker of what `a336b59` was published as.
 
 ### Run end to end, on `v0.1.0-rc1`
 
@@ -442,13 +456,51 @@ quietly testing the host instead.
 
 ---
 
+## What is not done
+
+Phase 3a is finished. Everything below is either another phase's work or a deliberate
+non-goal, collected here so the next reader does not have to reconstruct it from the sections
+above.
+
+**The consumer.** The install contract is specified and implemented nowhere.
+`ADB_BROKER.md` → **The consumer install contract** is what to build against;
+`foundation/source/adbbroker` in the `photos` repository is where it lands. Its adapter today
+runs a broker it locates via `broker_path` or `PATH` and installs nothing. `v0.1.0-rc3` is a good
+artifact to pin against. Note that all five contract rules fail *silently* when broken, which is
+the shape that hid three separate defects during this phase — see below.
+
+**The `go fix` rewrite in `app/broker/wire_test.go`** (`typ.Fields()` over `typ.NumField()`),
+still unapplied because its output includes an awkward `field := field`. Its own commit if
+wanted; nothing depends on it.
+
+**Everything in `ADB_BROKER.md` → Open questions**, unchanged by this phase. Numbers 7–9 are the
+ones with teeth, and they share a subject: `verify` degrades as a host accumulates journal
+history — the linear entry-array walk, a possible `--since` bound, and journal rotation. None is
+phase 3a business, and none is urgent until a host has been running the broker for a while.
+
+**What this phase learned about its own record-keeping**, because it happened three times and
+will happen again:
+
+- The `$HOME` fix that changed which function was called and not what happened, and was
+  described as done for four months (A).
+- The fail-closed test whose fourth case was reading the host's real audit log rather than the
+  one it substituted, passing everywhere and asserting nothing (E).
+- `THREAT_MODEL.md` §6.6 declaring supply chain out of scope, months after this project started
+  publishing attestations and producing reproducible builds (E).
+
+Each read as current and was not. Each was found by *running* something rather than reading it —
+a reproduction, an installed binary, a shipped release. **A claim nothing executes is a claim
+nobody checks**, and this document has now been wrong about its own contents twice by the same
+mechanism.
+
+---
+
 ## Open questions
 
 1. ~~**Reproduce the `$HOME` fallback** on a host with an unresolvable uid before calling A
    verified.~~ Done 2026-08-01, and it found that the fix did not work. See A, and
-   `zarf/repro-passwd-fallback.sh`. **`v0.1.0-rc1` carries the defect** — it is a pre-release
-   shakedown that nothing consumes, deliberately left in place, and the next tag carries the
-   fix. (A)
+   `zarf/repro-passwd-fallback.sh`. `v0.1.0-rc1` carried the defect and is **withdrawn** —
+   release deleted, retracted in `go.mod`; see *Releases*. (A)
 2. ~~**Does the VCS revision become a `probe` member, or stay in the audit record?**~~ Closed by
    B: `version` reports it, `probe` does not, and the audit record never carried a version to
    stay in. (B)
@@ -468,7 +520,9 @@ quietly testing the host instead.
 - The normative contract is `docs/ADB_BROKER.md`. `README.md` is the consumer-facing guide and
   was written by running the binary rather than transcribing the spec, so where it gives an
   example, that example was observed.
-- Next action: **implement the install contract in `photos`.** A through E are done in this
-  repository, and `v0.1.0-rc2` is a good artifact to build against;
-  `ADB_BROKER.md` → **The consumer install contract** is the specification to build against, and
-  `foundation/source/adbbroker` is where it lands.
+- Cutting a release: tag `vX.Y.Z` on a commit reachable from `main` and push it. The workflow
+  does the rest, and refuses a tag that does not descend from `main`. Rehearse first with the
+  `workflow_dispatch` dry run — but see *Releases* for why a dry run cannot produce the tagged
+  build's bytes.
+- **Phase 3a is done.** See **What is not done** for what is not, and why none of it belongs to
+  this phase.
