@@ -72,8 +72,8 @@ purpose: a different anchor sink, or an explicit refusal to run where it cannot 
 | Consumer-facing `README.md` | **Done**, `231f56e` |
 | `foundation/adbwire` test flake | **Fixed**, `9f59ce0` — the gate is trustworthy, which C depends on |
 | **B** — version identity | **Done**, `7db15f7` |
-| **C** — release workflow | **Not started. Do this next.** |
-| **D** — consumer install contract | Not started; depends on C |
+| **C** — release workflow | **Done**, `2eeb8e2` — rehearsed locally, not yet run on a tag |
+| **D** — consumer install contract | **Not started. Do this next.** |
 | **E** — docs | Not started; do with D |
 
 ---
@@ -166,18 +166,46 @@ worktree build as a defect.
 
 ## C — release workflow
 
-A **new** workflow file, not an edit to `ci.yml`: the existing gate is `permissions: contents:
-read` and should stay that way.
+`.github/workflows/release.yml`, a **new** file rather than an edit to `ci.yml`: that one is
+`permissions: contents: read` at the top of the file and stays that way. The new file grants
+nothing at the top either — each job asks for what it needs, so the job running the test suite
+cannot write a release.
 
-- Trigger on `v*` tags. Run the full `make test` gate first, so nothing is published from a tree
-  that fails it. (This is why the flake in `9f59ce0` had to be fixed first — it would have failed
-  releases at random.)
-- Build `linux/amd64` and `linux/arm64` by calling `make build-release` once per architecture —
-  B put `CGO_ENABLED=0`, `-trimpath` and the stamp there so the workflow does not restate them:
-  `make build-release VERSION=${TAG#v} RELEASE_GOARCH=arm64 OUT=dist/adb-broker-linux-arm64`.
-- `actions/attest-build-provenance`, which needs `id-token: write` and `attestations: write`,
-  plus `contents: write` to publish.
-- Publish the two binaries, a `SHA256SUMS`, and the attestation.
+- Triggers on `v*` tags, and on `workflow_dispatch` for a dry run.
+- The gate is the full `make test`, **including `vuln-check`**, which `ci.yml` deliberately
+  leaves out of its required set. Not a contradiction: that argument is about not blocking
+  merges on a moving target, and publishing an artifact is exactly when a live advisory should
+  stop the run. (This is also why the flake in `9f59ce0` had to be fixed first — it would have
+  failed releases at random.)
+- **`make dist` is where a release is defined**, not the YAML: both architectures,
+  `CGO_ENABLED=0`, `-trimpath`, the stamp, and the `SHA256SUMS` over them. So a rehearsal on a
+  laptop produces the same set of artifacts a tag does, and there is one place to edit when that
+  set changes.
+- `actions/attest-build-provenance@v4` (`id-token: write`, `attestations: write`), then
+  `gh release create` with `contents: write`. `gh` rather than a third-party action: this
+  module's build graph is stdlib-only and the same instinct applies to the pipeline. A tag
+  carrying a pre-release identifier publishes as a pre-release.
+
+Three guards, because there are no tags in this repository yet and a first release is the worst
+possible place to discover a mistake in the thing that makes releases:
+
+1. **The dry run.** `workflow_dispatch` builds, checksums and checks exactly what a tag would,
+   publishes nothing, and leaves the artifacts on the run. Run it before cutting a tag.
+2. **A tag must descend from `main`**, or the run fails before anything is built. A tag on a
+   feature branch would ship code that never went through a pull request.
+3. **`.github/scripts/check-artifact.sh`** runs the built binary and refuses to publish unless
+   it reports the tag's version, the commit being released, and a clean tree. This is the one
+   with teeth. The stamp is a linker flag in a Makefile variable: a typo produces a perfectly
+   good binary that lies about what it is, nothing else in the pipeline would notice, and
+   `go version -m` cannot catch it — it records the commit but never `-ldflags`. The only reader
+   that can is the binary itself, which is what B built.
+
+**Rehearsed, not yet run on a tag.** Verified from a clean clone at `2eeb8e2`: both artifacts
+build, the amd64 one reports `1.2.0` at that commit with `"modified":false`, and
+`sha256sum -c SHA256SUMS` passes. Both failure arms of the check script were exercised too — a
+version that does not match, and a build from a dirty tree. What has *not* been exercised is
+GitHub's side: the attestation step, `gh release create`, and the ancestry guard all run for the
+first time on the first real tag. Cut it with the dry run first.
 
 ---
 
@@ -289,4 +317,5 @@ only a comment.
 - The normative contract is `docs/ADB_BROKER.md`. `README.md` is the consumer-facing guide and
   was written by running the binary rather than transcribing the spec, so where it gives an
   example, that example was observed.
-- Next action: **C**, then **D** with **E**.
+- Next action: **D**, with **E**. Before either, run the release workflow's `workflow_dispatch`
+  dry run once: C is rehearsed locally but nothing in it has met GitHub yet.

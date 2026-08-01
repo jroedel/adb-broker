@@ -520,6 +520,7 @@ You do not need to interact with it, but three facts affect how a deployment is 
 ```sh
 make build              # binary into bin/; VERSION=1.2.0 sets what `version` reports
 make build-release      # the exact configuration a published artifact is built in
+make dist               # every published artifact plus SHA256SUMS, into dist/
 make build-fixture      # fixture binary, absent from the release build
 make test               # unit tests, fixture build, lint, dependency and vuln checks
 make test-integration   # adds tests needing a running adb server, no device attached
