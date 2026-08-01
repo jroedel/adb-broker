@@ -26,8 +26,13 @@ import (
 //
 // Two things make a fixture binary in a production path visible rather than
 // indistinguishable: it is named adb-broker-fixture, and it reports a broker version with a
-// +fixture suffix, which appears in the first probe response and in every audit record it
-// writes.
+// +fixture suffix, which appears in the first probe response and in the version subcommand's
+// output.
+//
+// An earlier version of this comment said the suffix also appeared "in every audit record it
+// writes". It does not, and no audit record carries a broker version at all — audit.Record has
+// no such field. What keeps fixture traffic out of a real chain is the next section, not the
+// suffix.
 //
 // # Why the audit log moves
 //
@@ -44,10 +49,17 @@ import (
 //
 // How the release path is derived stays in broker.go and is unreachable from here.
 func init() {
-	// The +fixture suffix is NOT applied here. fixturedb.NewStore already appends it to the
-	// broker version it reports, and that value is the one that reaches probe's response and
-	// every audit record. Adding it in both places produced "0.1.0+fixture+fixture".
+	// The +fixture suffix is NOT applied to version here. fixturedb.NewStore already
+	// appends it to the broker version it reports, and that value is the one that reaches
+	// probe's response. Adding it in both places produced "0.1.0+fixture+fixture".
+	//
+	// versionSuffix is the one exception, and it is not a second application of the same
+	// mark: the version subcommand answers without building a Store, so nothing appends
+	// anything for it, and a fixture binary asked what it is would otherwise answer with
+	// the plain release version. It reads versionSuffix and no other path does, so the two
+	// cannot both fire on one string. The constant is fixturedb's either way.
 	globalFlags = parseFixtureFlag
+	versionSuffix = fixturedb.VersionSuffix
 
 	// All three read their package vars at call time, because none is known until the
 	// flags are parsed.

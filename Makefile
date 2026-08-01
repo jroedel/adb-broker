@@ -10,21 +10,55 @@ BIN     := bin
 BINARY  := $(BIN)/adb-broker
 FIXTURE := $(BIN)/adb-broker-fixture
 
+# VERSION is what the binary reports as `broker`. The default matches app/broker's compiled-in
+# default, so an unstamped build and a `make build` agree: 0.0.0+dev orders below every real tag
+# and is never mistaken for a release. The release workflow passes the tag with its leading "v"
+# stripped — v1.2.0 becomes 1.2.0 — because the wire format's `broker` member has always been a
+# bare semver and a consumer comparing versions should not have to strip a prefix.
+#
+# The commit is NOT passed here. The toolchain records vcs.revision, vcs.time and vcs.modified
+# in the build info by itself, and `adb-broker version` reads them back from there. Stamping a
+# second copy would create one that could disagree.
+VERSION ?= 0.0.0+dev
+LDFLAGS := -X $(MODULE)/app/broker.version=$(VERSION)
+
+# The release build's platform and output path, used by build-release only. They are separate
+# variables rather than GOOS/GOARCH so that setting one on the command line cannot silently
+# cross-compile every other target in this file.
+RELEASE_GOOS   ?= linux
+RELEASE_GOARCH ?= $(shell go env GOARCH)
+OUT            ?= $(BINARY)
+
 .DEFAULT_GOAL := help
 
 ## help: list available targets
 help:
 	@grep -E '^## ' $(MAKEFILE_LIST) | sed 's/^## /  /'
 
-## build: compile the release binary into bin/
+## build: compile the binary into bin/. Override the reported version with VERSION=1.2.0
 build:
 	@mkdir -p $(BIN)
-	go build -o $(BINARY) ./cmd/adb-broker
+	go build -trimpath -ldflags "$(LDFLAGS)" -o $(BINARY) ./cmd/adb-broker
+
+## build-release: the exact configuration a published artifact is built in, for one platform.
+## CGO_ENABLED=0 for a static, portable binary — which is also the configuration os/user
+## behaves differently in, so it is the one test-nocgo covers. The release workflow calls this
+## once per architecture rather than restating the build in YAML, so there is exactly one
+## definition of how a shipped binary is built:
+##
+##   make build-release VERSION=1.2.0 RELEASE_GOARCH=arm64 OUT=dist/adb-broker-linux-arm64
+##
+## Linux only, deliberately: Windows does not compile, and macOS compiles but has no journald,
+## so the anchor would silently never publish. See docs/phase3a_security_walkback.md.
+build-release:
+	@mkdir -p $(dir $(OUT))
+	CGO_ENABLED=0 GOOS=$(RELEASE_GOOS) GOARCH=$(RELEASE_GOARCH) \
+		go build -trimpath -ldflags "$(LDFLAGS)" -o $(OUT) ./cmd/adb-broker
 
 ## build-fixture: compile the fixture binary, which is absent from the release build
 build-fixture:
 	@mkdir -p $(BIN)
-	go build -tags=fixture -o $(FIXTURE) ./cmd/adb-broker
+	go build -trimpath -tags=fixture -ldflags "$(LDFLAGS)" -o $(FIXTURE) ./cmd/adb-broker
 
 ## vet: quick compile-level check, over both build configurations
 vet:
@@ -100,6 +134,6 @@ install: build
 clean:
 	rm -rf $(BIN) coverage.out
 
-.PHONY: help build build-fixture vet fmt lint vuln-check deps-check \
+.PHONY: help build build-release build-fixture vet fmt lint vuln-check deps-check \
 	test-unit test-integration test-fixture test-nocgo test-device test cover \
 	install clean

@@ -243,6 +243,7 @@ func TestEveryObjectIsOneLine(t *testing.T) {
 	// indented would break every consumer at once.
 	for _, v := range []any{
 		ProbeResponse{},
+		VersionResponse{},
 		FileRecordResponse{Path: "/sdcard/DCIM/a.JPG"},
 		ListSummaryResponse{Errors: []PathErrorResponse{{Code: "permission_denied", Path: "/sdcard/DCIM/b"}}},
 		FetchHeader{},
@@ -270,6 +271,7 @@ func TestRequestStructsHoldPrimitivesOnly(t *testing.T) {
 func TestResponseStructsHoldPrimitivesOnly(t *testing.T) {
 	for _, res := range []any{
 		ProbeResponse{},
+		VersionResponse{},
 		FileRecordResponse{},
 		PathErrorResponse{},
 		ListSummaryResponse{},
