@@ -25,7 +25,7 @@ next. Concretely:
   without re-reading `ADB_BROKER.md` → **Installation** → *What was withdrawn, and why*.
 - Its **Stages 1, 3, 4, 6 and 7** are done — hardware validation, the four confirmed defects,
   the `pr-review` run, the coverage gaps, CI, and the T7/T27 sign-offs. Their outcomes live in
-  `phase3_device_findings.md`, `.reviews/phase3/`, and the git history, which are the durable
+  `DEVICE_FINDINGS.md`, `.reviews/phase3/`, and the git history, which are the durable
   records. The plan file adds nothing to them.
 - Its **Stage 5 — Wire photos to the broker** is the one live thread it still described, and it
   is now **section D** here, changed by everything below: the consumer downloads a release

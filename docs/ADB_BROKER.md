@@ -137,7 +137,7 @@ across 11 source roots, ~10 ms process spawn, 21 MB/s, "under 3%" — that appea
 pre-broker CLI adapter; this broker has six. The 21 MB/s contradicts the experiment's own
 39.5 MiB/s. The numbers were carried over from the tool this one replaces.
 
-Measured properly on 2026-07-31, with the built binary (`phase3_device_findings.md`):
+Measured properly on 2026-07-31, with the built binary (`DEVICE_FINDINGS.md`):
 
 | | Measured |
 |---|---|
@@ -620,7 +620,7 @@ hard-coded `190` would be a latent, silent failure the first time the phone rebo
 **What this costs on a real device: nothing.** The discovery run's bounded 12-directory walk
 found 1,778 regular files, all on `dev=190`, and zero symlinks. The Stage 1 full six-root walk
 to unlimited depth superseded that sample at scale: **48,704 regular files, zero symlinks, zero
-entries refused as non-regular or off-volume** (`phase3_device_findings.md` §6). Refusing
+entries refused as non-regular or off-volume** (`DEVICE_FINDINGS.md` §6). Refusing
 symlinks below the root does not exclude any real content on this phone.
 
 #### `LST2` does not follow symlinks; `STA2` does
@@ -1453,7 +1453,7 @@ returns.
 **But it is not silent either, and the first install shipped exactly that mistake.** It
 wrote every audit record and published not one genuine anchor, and nothing said so, because the
 error was simply discarded — `verify` could only report that a truncated tail "could not be
-ruled out," the guarantee going unenforced quietly (the Stage 2 finding, `phase3_device_findings.md`
+ruled out," the guarantee going unenforced quietly (the Stage 2 finding, `DEVICE_FINDINGS.md`
 §8). The failure is now reported on stderr, once per process, naming the wrapped reason —
 once, because a permanently broken socket would otherwise produce roughly 20,000 identical
 lines and bury every other message an operator is reading stderr for, including the per-operation
@@ -2180,7 +2180,7 @@ a narrower class of tampering and does not."
 **And the one control that survives never worked under it.** This is the part that turns a
 close trade into an obvious one, and it was already in the tree before this revision was
 contemplated: Stage 2 installed the setuid binary, ran it end to end, and found that **not a
-single genuine anchor had been published** (`phase3_device_findings.md` §8). Every one of the
+single genuine anchor had been published** (`DEVICE_FINDINGS.md` §8). Every one of the
 3,365 anchor entries in the journal came from uid 1003 — test binaries and the deliberate
 forgery — and none from the service account at uid 995. The cause was never diagnosed; one of
 the three candidates was that `SOCK_DGRAM` sends from a setuid process are dropped somewhere.

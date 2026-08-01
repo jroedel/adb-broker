@@ -256,7 +256,7 @@ allowlist plus the volume pin — carrying more than it was credited with.
 | T24 | An empty file is treated as a failure | Zero `DATA` packets is success | measured — one such file exists on the device | None |
 | T25 | The run hangs forever | Deadlines on every read and write | measured — an over-sized length prefix blocks with no reply, no timeout, ever | None |
 | T26 | `mtime` is "corrected" and every cheap-path comparison breaks | `mtime.Mtime` wraps `int64` seconds and exposes no timezone conversion, no `time.Time`, no arithmetic | measured — camera files and screenshots disagree about what `mtime` means | The helpful mistake is not available to write |
-| T27 | A non-UTF-8 filename is silently never archived | `path_b64` is MUST and authoritative; `path` is lossy and for humans | **judgement, not measured** — Stage 1 walked all six roots to unlimited depth, 48,704 files, zero non-UTF-8 names (`phase3_device_findings.md` §6) | **Accepted on prudence, signed off 2026-07-31 — see §5.9.** Cost of the check is nil; cost of being wrong is a silently unarchived file |
+| T27 | A non-UTF-8 filename is silently never archived | `path_b64` is MUST and authoritative; `path` is lossy and for humans | **judgement, not measured** — Stage 1 walked all six roots to unlimited depth, 48,704 files, zero non-UTF-8 names (`DEVICE_FINDINGS.md` §6) | **Accepted on prudence, signed off 2026-07-31 — see §5.9.** Cost of the check is nil; cost of being wrong is a silently unarchived file |
 | T28 | A depth-limited run reports a phone with no photos, successfully | Documented: all six roots have zero regular files at the top level | measured — 7 entries in `DCIM`, 8 in `Movies`, all directories | Not an error condition, so only documentation and a test guard it |
 | T29 | `ENOENT` is reported as proof a tree is gone | It is not authoritative — `adbd` returns `error=2` for paths it can see but not read | measured (`/data/data/com.android.providers.media`) | Affects wording shown to a human |
 | T30 | A fixture binary in a production path bypasses the allowlist | Fixture mode is behind a build tag, absent from the release binary, produces a differently-named binary, and reports a `+fixture` version visible in the first `probe` and in the audit log | judgement | The allowlist still applies to virtual paths, so a fixture binary is not itself an escape — only a remap |
@@ -362,7 +362,7 @@ So state it by adversary:
 **One thing the retreat improves, which belongs next to what it costs.** Under the setuid
 install the anchor was not merely narrower — it was, as far as anyone measured, absent. Stage 2
 ran the installed binary end to end and found no anchor had ever been published by the service
-account (`phase3_device_findings.md` §8; undiagnosed, one candidate being that `SOCK_DGRAM`
+account (`DEVICE_FINDINGS.md` §8; undiagnosed, one candidate being that `SOCK_DGRAM`
 sends from a setuid process are dropped). T13 and T31 were therefore documented controls with
 no observed instance behind them. Running as the invoking user is the configuration in which
 anchoring is measured working, thousands of times over. A control whose filter is half as
@@ -505,7 +505,7 @@ for humans only, on the strength of an argument rather than an observed non-UTF-
 
 **The evidence, cited rather than restated.** The Stage 1 device run walked all six allowlist
 roots to unlimited depth and found **48,704 regular files, zero non-UTF-8 names, zero symlinks,
-zero per-path errors** (`docs/phase3_device_findings.md` §6). That same document's "Still
+zero per-path errors** (`docs/DEVICE_FINDINGS.md` §6). That same document's "Still
 untested" list is explicit about what this does and does not establish: "None found among
 48,704, up from the discovery run's sample. The `path_b64` rule stays justified by prudence, and
 this is now a much stronger negative result." A strong negative result over a large sample is
@@ -645,7 +645,7 @@ some.
 ### 7.3 Refusing all symlinks below the root may be too blunt
 
 It costs nothing today — zero symlinks among 48,704 files, measured across all six roots to
-unlimited depth (`docs/phase3_device_findings.md` §6; the earlier 1,778 was the discovery
+unlimited depth (`docs/DEVICE_FINDINGS.md` §6; the earlier 1,778 was the discovery
 run's bounded sample). A future device shipping a
 legitimate one shows up as *missing files*, not as an error, which is the failure direction
 this tool exists to prevent. The `list` summary counts refused non-regular entries
@@ -740,7 +740,7 @@ compiled into it.
 
 One qualification, because the loss here is smaller than it looks and the fix is cheap. Stage 2
 added a provenance check: `verify-install` read Go's VCS stamp and failed on a binary built
-from a modified tree (`phase3_device_findings.md` §8). The *stamp* is still there — the Go
+from a modified tree (`DEVICE_FINDINGS.md` §8). The *stamp* is still there — the Go
 toolchain embeds it, and nothing about the retreat removes it. What went is the thing that read
 it. Restoring that costs a subcommand or a line in `probe`, needs no privilege, and would
 answer more of this question than the service account ever did.

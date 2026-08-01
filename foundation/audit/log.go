@@ -292,7 +292,7 @@ func descriptorFlags(f *os.File) (int, error) {
 // The cost is real and measured: roughly 1-5 ms per record. A first archiving
 // run on the measured device is 48,704 files, so on the order of a minute added
 // to a run that already pays about 329 s in protocol setup alone
-// (docs/phase3_device_findings.md §5). The trade is deliberate. The log's only
+// (docs/DEVICE_FINDINGS.md §5). The trade is deliberate. The log's only
 // value is being believed, and a record reported durable that is not is worse
 // than a slow log.
 //
