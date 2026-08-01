@@ -159,14 +159,40 @@ func openOrCreateLogAt(path string) (*audit.Log, bool, error) {
 	}
 }
 
-// version is this binary's own version, reported as the broker member of a probe response
-// and recorded on the Device the audit log sees. It is not read from the device and it is
-// not read from the environment.
+// version is this binary's own version, reported as the broker member of a probe response and
+// of a version response. It is not read from the device and it is not read from the
+// environment.
 //
-// It is a var rather than a const only so the fixture build can mark itself: a fixture
-// binary reports a version with a suffix, so one sitting in a production path is visible in
-// the first probe response rather than being indistinguishable from the real thing.
-var version = "0.1.0"
+// It reaches exactly those two stdout objects and nowhere else. In particular it is NOT in the
+// audit record: audit.Record has no version field, and adding one would change the canonical
+// form the hash chain is computed over — see foundation/audit.Canonical, and decodeLine, which
+// rejects unknown members, so a chain written by a binary with an extra field does not verify
+// under one without it. An earlier version of this comment claimed the value was "recorded on
+// the Device the audit log sees", which reads as though it were logged. Device does carry it,
+// and the audit extension does see that Device, and the extension writes none of it down.
+//
+// It is a var rather than a const for two reasons. The release build is stamped at link time
+// with -X …/app/broker.version=<version>, so a downloaded artifact reports the tag it was cut
+// from rather than whatever was last written here. And the fixture build marks itself through
+// versionSuffix below.
+//
+// The unstamped default is deliberately not a plausible release. A build with no -X reports
+// 0.0.0+dev, which orders below every real tag under semver and can never be mistaken for one:
+// leaving it at a released-looking number would make a hand-built binary indistinguishable on
+// the wire from the artifact carrying that same number.
+var version = "0.0.0+dev"
+
+// versionSuffix marks a build whose reported version must not be read as the plain article.
+// The release build appends nothing; the fixture build sets it to fixturedb.VersionSuffix.
+//
+// It is read only by runVersion, and that narrowness is the point. Every other path reports the
+// version through a Storer — fixturedb.Store.Probe appends the same suffix to the version it is
+// constructed with — so applying it here too would produce "0.0.0+dev+fixture+fixture", which
+// is the bug this seam is shaped to avoid. runVersion builds no Storer, because answering
+// without contacting a device is its whole reason for existing, so it is the one caller that
+// has to apply the mark itself. Both halves take the string from the same constant, so they
+// cannot drift into disagreeing about what a fixture binary is called.
+var versionSuffix = ""
 
 // The process exit statuses. The exit code is a COARSE signal and the JSON status member is
 // authoritative — a consumer that branches on the exit code alone cannot tell a partial
@@ -239,9 +265,9 @@ var (
 //
 // The order of operations is load bearing:
 //
-//  1. The subcommand name is resolved. A help request and an unknown subcommand are
-//     answered here, without opening the audit log, because printing usage is not an
-//     operation and must work on a host where nothing has been set up yet.
+//  1. The subcommand name is resolved. A help request, a version request and an unknown
+//     subcommand are answered here, without opening the audit log, because none of the three
+//     is an operation and all three must work on a host where nothing has been set up yet.
 //  2. The audit log is opened — created, on a first run for this account, and anchored at
 //     seq 0 — and its tail verified. If that fails, an audit_unavailable error object is
 //     written and the invocation ends, having done nothing else.
@@ -299,6 +325,23 @@ func Main(args []string, stdout, stderr io.Writer) int {
 		usage(stderr)
 
 		return exitOK
+
+	case "version":
+		// Answered here, with help, rather than through subcommandFor: it must work on a
+		// host where nothing has been set up, which means before openAuditLog and not
+		// after it. That is not the verify exemption reargued. verify is exempt because
+		// gating the tool that diagnoses a damaged log on that log opening cleanly makes
+		// the diagnostic refuse exactly when it is needed; version is not exempt from the
+		// check so much as outside it — it reads no log, contacts no device, appends
+		// nothing, and states a fact compiled into the binary. Nothing it reports could
+		// have been recorded, so there is no unauditable read for the check to prevent.
+		//
+		// An installer deciding whether to replace the binary already at the canonical
+		// path runs this against a stranger's build, on a machine where that binary's
+		// account may never have run it. Requiring a healthy audit log first would make
+		// the version of a broker unreadable precisely when its log is the thing that is
+		// wrong.
+		return runVersion(e, rest)
 	}
 
 	run, ok := subcommandFor(name)
@@ -362,6 +405,11 @@ type runFunc func(e env, args []string) int
 // subcommandFor resolves a subcommand name. There are four, matching the Business port plus
 // the operator-run verify, and there is no alias table: a name this binary does not know is
 // an error rather than a guess.
+//
+// version is deliberately absent from this table. Everything resolved here receives an env
+// carrying an audit log whose tail has already been verified — that is what runFunc's contract
+// promises — and version has to answer before there is one. Main handles it next to help,
+// where the same reasoning already applies.
 func subcommandFor(name string) (runFunc, bool) {
 	switch name {
 	case "probe":
@@ -635,7 +683,7 @@ func flush(w io.Writer) error {
 	return nil
 }
 
-// usage describes the four subcommands. It goes to stderr, always.
+// usage describes the four operations plus version. It goes to stderr, always.
 //
 // The journalctl line interpolates audit.MessageID rather than spelling it out. An operator
 // copies that command verbatim, so a hard-coded copy that drifted from the constant would
@@ -649,6 +697,13 @@ usage:
   adb-broker list   --root <path> [--max-depth <n>] [--serial <id>] [--client <name>]
   adb-broker fetch  --path <path> [--serial <id>] [--client <name>]
   adb-broker verify [--log <path>] --anchors <file|glob|->
+  adb-broker version
+
+version reports this binary's own identity — the release it was built from and the commit — as
+one JSON object on stdout. It reads no log, contacts no device and takes no flags, so it answers
+on a host where nothing has been set up. It is how an installer decides whether the binary
+already in place is older than the one it is about to write, since the build stamp is not
+readable from the outside: "go version -m" records the commit but never the version.
 
 verify compares the audit log against the anchors published to the journal, which is the only
 check that detects a truncated tail. Run it AS THE ACCOUNT THAT RUNS THE BACKUPS, never as

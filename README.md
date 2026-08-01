@@ -82,9 +82,10 @@ refuse to run against a major version you do not know.
 
 ## Subcommands
 
-All four take flags only — a stray positional argument is a usage error. `--serial <id>` pins
-a device; `--client <name>` is a caller-asserted label recorded in the audit log (at most 64
-bytes of `[A-Za-z0-9._-]`, rejected outright otherwise).
+The four below take flags only — a stray positional argument is a usage error. `--serial <id>`
+pins a device; `--client <name>` is a caller-asserted label recorded in the audit log (at most
+64 bytes of `[A-Za-z0-9._-]`, rejected outright otherwise). `version`, described last, takes
+nothing at all.
 
 ### `probe` — is a device reachable
 
@@ -242,6 +243,30 @@ Read the outcome like this:
 `verify` is the one subcommand exempt from the fail-closed startup check: gating the tool that
 diagnoses a damaged log on that log opening cleanly would make it refuse precisely when it is
 needed. It never appends, touches no device, and opens nothing for writing.
+
+### `version` — what is this binary
+
+```sh
+adb-broker version
+```
+
+```json
+{"proto":1,"status":"ok","broker":"1.2.0","revision":"7db15f766ed07bc512633453f1a9d8d0a85e9760","modified":false}
+```
+
+Takes no flags, reads no log, contacts no device, and answers before the fail-closed check — so
+it works on a fresh host, and on one whose audit log is missing or damaged. That matters if you
+automate installs: the version of the binary already at `~/.local/bin/adb-broker` may have been
+put there by a different consumer, and this is the only way to read it. **Comparing SHA-256
+digests cannot tell you whether the installed copy is older** — a mismatch says "different" and
+never "older" — and the build stamp is invisible from outside the process, since `go version -m`
+records the commit but not the version.
+
+`broker` is the release the binary was built from. A build you made yourself reports
+`0.0.0+dev`, which sorts below every real tag and can never be confused with one; a fixture
+binary appends `+fixture`. `revision` and `modified` describe the build, not the release, and
+are always present — `revision` is empty for a build made from an extracted archive rather than
+a checkout, and, measured, for one made in a linked `git worktree`.
 
 ---
 
@@ -487,11 +512,15 @@ You do not need to interact with it, but three facts affect how a deployment is 
 - **New `code` values are compatible**, because an unrecognized code degrades to `internal`,
   which is fatal — a consumer cannot be broken by a value it fails safe on.
 - `proto` is currently `1`.
+- `broker` (on `probe` and on `version`) is the binary's own release, stamped at build time. It
+  is not the protocol version and is not what you check compatibility against — `proto` is.
 
 ## Building and testing
 
 ```sh
-make build              # release binary into bin/
+make build              # binary into bin/; VERSION=1.2.0 sets what `version` reports
+make build-release      # the exact configuration a published artifact is built in
+make dist               # every published artifact plus SHA256SUMS, into dist/
 make build-fixture      # fixture binary, absent from the release build
 make test               # unit tests, fixture build, lint, dependency and vuln checks
 make test-integration   # adds tests needing a running adb server, no device attached

@@ -132,6 +132,34 @@ type ProbeResponse struct {
 	Allowlist []string `json:"allowlist"`
 }
 
+// VersionResponse is the single object the version subcommand writes to stdout.
+//
+// It exists because a release binary's identity has to be readable without a phone. Broker is
+// otherwise reported only by probe, which needs a running adb server and a device to answer at
+// all, and the build-time stamp is not recoverable from outside the process either: `go version
+// -m` records vcs.revision, vcs.time, vcs.modified and -trimpath, but NOT -ldflags, so the value
+// passed to -X is invisible to every reader except this binary. An installer that must decide
+// whether the binary already at the canonical path is older than the one it carries has nothing
+// else to ask.
+//
+// Revision and Modified come from debug.ReadBuildInfo's vcs settings, which the toolchain
+// records automatically. They are build provenance and a consumer does not branch on them;
+// they are here, rather than on ProbeResponse, so that the object every consumer parses keeps
+// only the members it acts on.
+//
+// Both are always present. Revision is "" on a build with no VCS stamp — a build from an
+// extracted archive rather than a checkout — for the same reason ListSummaryResponse.Errors is
+// [] rather than absent: a reader must never have to tell a missing member from an empty value.
+// Modified reports that the tree was dirty at build time, which for a release artifact must be
+// false and for a developer's build usually is not.
+type VersionResponse struct {
+	Proto    int    `json:"proto"`
+	Status   string `json:"status"`
+	Broker   string `json:"broker"`
+	Revision string `json:"revision"`
+	Modified bool   `json:"modified"`
+}
+
 // FileRecordResponse is one NDJSON record in a list stream: one regular file, written as it
 // is discovered.
 //

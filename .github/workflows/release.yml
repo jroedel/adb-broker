@@ -1,0 +1,183 @@
+# Publishes a tagged release: two Linux binaries, a SHA256SUMS, and a build
+# provenance attestation.
+#
+# This is a SEPARATE workflow from ci.yml on purpose. That one is the gate for
+# every push and pull request and holds `permissions: contents: read` at the
+# top of the file; it must keep holding it. Publishing needs write access to
+# contents, an OIDC token and attestation write, and the way to add those
+# without widening the gate is another file, not another job in that one.
+#
+# What gets built is NOT described here. `make dist` is the definition — two
+# architectures, CGO_ENABLED=0, -trimpath, the version stamped with -X — so a
+# dry run on a laptop produces the same set of artifacts a tag does, and there
+# is one place to change when that set changes. See docs/ADB_BROKER.md.
+#
+# Linux only, and macOS is excluded deliberately rather than pending. It
+# compiles and runs, but there is no journald, so the anchor write fails; that
+# failure is by design non-fatal, so every read would succeed while the only
+# remaining tamper-evidence control was silently absent, and `verify` would
+# then report "no anchors found" as "partial" and exit 0 — the result that
+# reads as a pass. Windows does not compile at all (syscall.SYS_FCNTL in
+# foundation/audit/log.go). See docs/phase3a_security_walkback.md.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+  # A dry run that builds and checksums exactly what a tag would, and publishes
+  # nothing. This repo had no tags at all when the workflow was written, which
+  # makes the first real release the worst imaginable place to discover a typo
+  # in it. Run this first; the artifacts land on the workflow run.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to stamp into the dry-run build, without a leading v"
+        required: false
+        default: "0.0.0-dryrun"
+
+# Nothing by default. Each job asks for exactly what it needs, so the token in
+# the job that runs the test suite cannot write a release.
+permissions: {}
+
+jobs:
+  # A tag that does not descend from main would publish code that never went
+  # through a pull request. This is the cheapest possible check for that and it
+  # runs before anything is built.
+  tag-descends-from-main:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The ancestry check needs history. The default shallow fetch has
+          # none, and `merge-base --is-ancestor` against a grafted commit
+          # answers wrongly rather than failing.
+          fetch-depth: 0
+      - run: |
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::tag ${GITHUB_REF_NAME} points at ${GITHUB_SHA}, which is not reachable from main"
+            echo "tag on main after merging; releasing from a branch would ship unreviewed code"
+            exit 1
+          fi
+          echo "${GITHUB_REF_NAME} -> ${GITHUB_SHA} is reachable from main"
+
+  # The full gate, not a subset of it, so nothing is published from a tree that
+  # would fail `make test` on a developer's machine.
+  #
+  # This INCLUDES vuln-check, where ci.yml deliberately excludes it from the
+  # required set. The reasoning there — govulncheck runs against @latest, so a
+  # newly published advisory can turn the gate red with no change on our side —
+  # is an argument about blocking merges on a moving target. It is not an
+  # argument about shipping a binary: publishing an artifact is exactly when a
+  # known advisory should stop the run, and the fix for a red release is to
+  # update and tag again.
+  gate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          # The go directive out of go.mod, exactly as ci.yml resolves it, so
+          # the release toolchain cannot drift from the tested one.
+          go-version-file: go.mod
+      - run: make test
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [tag-descends-from-main, gate]
+    runs-on: ubuntu-latest
+    permissions:
+      # Create the release and upload its assets.
+      contents: write
+      # The OIDC token the attestation is signed against, and the write that
+      # records it. Both are required by actions/attest-build-provenance.
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      # The tag with its leading v removed. `broker` has always been a bare
+      # semver on the wire, and a consumer comparing versions should not have
+      # to strip a prefix first.
+      - name: Derive the version from the tag
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - run: make dist VERSION="$VERSION"
+
+      - name: Check the artifact reports what the tag says
+        run: ./.github/scripts/check-artifact.sh "$VERSION" "$GITHUB_SHA"
+
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            dist/adb-broker-linux-amd64
+            dist/adb-broker-linux-arm64
+
+      # gh, not a third-party action. This module's build graph is the standard
+      # library and nothing else, and the same instinct applies to the supply
+      # chain that produces it: gh ships on the runner and needs no pin.
+      #
+      # A tag carrying a pre-release identifier (v1.2.0-rc1) is published as a
+      # pre-release, so it does not become the repository's "latest".
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prerelease=""
+          case "$VERSION" in
+            *-*) prerelease="--prerelease" ;;
+          esac
+
+          gh release create "$GITHUB_REF_NAME" \
+            dist/adb-broker-linux-amd64 \
+            dist/adb-broker-linux-arm64 \
+            dist/SHA256SUMS \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            $prerelease
+
+  # Everything the release job does up to the point of publishing, with none of
+  # its permissions. Run this before cutting a tag.
+  dry-run:
+    if: github.event_name == 'workflow_dispatch'
+    needs: gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      # The input reaches the shell through the environment, never through
+      # ${{ }} interpolated into the script body. Only someone who can already
+      # dispatch this workflow could set it, so the exposure is small — but an
+      # expression pasted into a shell line is a command injection whatever the
+      # blast radius, and there is no reason to write one.
+      - name: Build and check
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          make dist VERSION="$VERSION"
+          ./.github/scripts/check-artifact.sh "$VERSION" "$GITHUB_SHA"
+
+      # So the binaries and the sums can be inspected without a release
+      # existing. Note that the executable bit does not survive this round
+      # trip; it does not survive a release asset download either, which is
+      # why the install contract chmods.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-dry-run
+          path: dist/
+          if-no-files-found: error

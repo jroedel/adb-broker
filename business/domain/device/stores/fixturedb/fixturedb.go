@@ -98,11 +98,21 @@ import (
 // bad input.
 const fixtureSerial = "fixture-device"
 
-// fixtureVersionSuffix is appended to the caller-supplied broker version on every Probe, so
-// a fixture binary that somehow ran in a production path is visible in the very first probe
-// response and in whatever audit log records it, rather than being indistinguishable from a
-// real device session.
-const fixtureVersionSuffix = "+fixture"
+// VersionSuffix is appended to the caller-supplied broker version on every Probe, so a
+// fixture binary that somehow ran in a production path is visible in the very first probe
+// response rather than being indistinguishable from a real device session.
+//
+// It is not in the audit log, and an earlier version of this comment said it was. The broker
+// version reaches stdout and nothing else: audit.Record has no version field, so a fixture
+// binary's records are marked by nothing here. What does distinguish them is the log they are
+// written to — fixture mode keeps its own chain inside the fixture directory, so they never
+// join a real one. See app/broker/fixture.go.
+//
+// It is exported for one caller: app/broker's version subcommand answers without building a
+// Store, so it cannot pick the suffix up from Probe the way every other path does, and it must
+// still mark itself. Both readers take the string from here so that a fixture binary cannot end
+// up with two names.
+const VersionSuffix = "+fixture"
 
 // fixtureFeatures is the V2 feature set this store reports, so the capability gate a real
 // Probe applies (see adbsyncdb's requireV2) passes against a fixture exactly as it would
@@ -155,7 +165,7 @@ func WithInjectError(code errcode.Code) Option {
 var _ devicebus.Storer = (*Store)(nil)
 
 // NewStore constructs a Store serving dir as the device's filesystem. brokerVersion is
-// reported on Probe with fixtureVersionSuffix appended.
+// reported on Probe with VersionSuffix appended.
 func NewStore(dir, brokerVersion string, opts ...Option) *Store {
 	st := &Store{
 		dir:           dir,
@@ -198,7 +208,7 @@ func (s *Store) localPath(p devicepath.AuthorizedPath) string {
 }
 
 // Probe reports this store's one synthetic device: state "device", the caller's broker
-// version with fixtureVersionSuffix appended, and the V2 feature set the capability gate
+// version with VersionSuffix appended, and the V2 feature set the capability gate
 // requires. It reports no model, matching adbsyncdb; see adbsyncdb.Store.Probe for why.
 //
 // AttachedDevices is 1, and it is a fact about this store rather than a stub: a fixture
@@ -221,7 +231,7 @@ func (s *Store) Probe(_ context.Context, ser serial.Serial) (devicebus.Device, e
 	return devicebus.Device{
 		Serial:          s.serial,
 		State:           "device",
-		BrokerVersion:   s.brokerVersion + fixtureVersionSuffix,
+		BrokerVersion:   s.brokerVersion + VersionSuffix,
 		ServerVersion:   "fixture",
 		Features:        features,
 		AttachedDevices: 1,

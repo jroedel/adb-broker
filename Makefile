@@ -10,21 +10,78 @@ BIN     := bin
 BINARY  := $(BIN)/adb-broker
 FIXTURE := $(BIN)/adb-broker-fixture
 
+# VERSION is what the binary reports as `broker`. The default matches app/broker's compiled-in
+# default, so an unstamped build and a `make build` agree: 0.0.0+dev orders below every real tag
+# and is never mistaken for a release. The release workflow passes the tag with its leading "v"
+# stripped — v1.2.0 becomes 1.2.0 — because the wire format's `broker` member has always been a
+# bare semver and a consumer comparing versions should not have to strip a prefix.
+#
+# The commit is NOT passed here. The toolchain records vcs.revision, vcs.time and vcs.modified
+# in the build info by itself, and `adb-broker version` reads them back from there. Stamping a
+# second copy would create one that could disagree.
+VERSION ?= 0.0.0+dev
+LDFLAGS := -X $(MODULE)/app/broker.version=$(VERSION)
+
+# The release build's platform and output path, used by build-release only. They are separate
+# variables rather than GOOS/GOARCH so that setting one on the command line cannot silently
+# cross-compile every other target in this file.
+RELEASE_GOOS   ?= linux
+RELEASE_GOARCH ?= $(shell go env GOARCH)
+OUT            ?= $(BINARY)
+
 .DEFAULT_GOAL := help
 
 ## help: list available targets
 help:
 	@grep -E '^## ' $(MAKEFILE_LIST) | sed 's/^## /  /'
 
-## build: compile the release binary into bin/
+## build: compile the binary into bin/. Override the reported version with VERSION=1.2.0
 build:
 	@mkdir -p $(BIN)
-	go build -o $(BINARY) ./cmd/adb-broker
+	go build -trimpath -ldflags "$(LDFLAGS)" -o $(BINARY) ./cmd/adb-broker
+
+## build-release: the exact configuration a published artifact is built in, for one platform.
+## CGO_ENABLED=0 for a static, portable binary — which is also the configuration os/user
+## behaves differently in, so it is the one test-nocgo covers. The release workflow calls this
+## once per architecture rather than restating the build in YAML, so there is exactly one
+## definition of how a shipped binary is built:
+##
+##   make build-release VERSION=1.2.0 RELEASE_GOARCH=arm64 OUT=dist/adb-broker-linux-arm64
+##
+## Linux only, deliberately: Windows does not compile, and macOS compiles but has no journald,
+## so the anchor would silently never publish. See docs/phase3a_security_walkback.md.
+build-release:
+	@mkdir -p $(dir $(OUT))
+	CGO_ENABLED=0 GOOS=$(RELEASE_GOOS) GOARCH=$(RELEASE_GOARCH) \
+		go build -trimpath -ldflags "$(LDFLAGS)" -o $(OUT) ./cmd/adb-broker
+
+## dist: build every published artifact and the SHA256SUMS over them, into dist/.
+## This is what a release IS — the release workflow calls this one target rather than looping
+## over architectures in YAML, so the set of published artifacts is defined here and a dry run
+## on a laptop produces the same set as a tag does.
+##
+## Pass the version: make dist VERSION=1.2.0. Without it every artifact reports 0.0.0+dev.
+##
+## The sums are written from inside dist/ so the file names in it are bare, which is what lets
+## a consumer run `sha256sum -c SHA256SUMS` in the directory it downloaded into.
+DIST        := dist
+DIST_ARCHES := amd64 arm64
+
+dist:
+	@mkdir -p $(DIST)
+	rm -f $(DIST)/adb-broker-linux-* $(DIST)/SHA256SUMS
+	for arch in $(DIST_ARCHES); do \
+		$(MAKE) --no-print-directory build-release \
+			VERSION=$(VERSION) RELEASE_GOARCH=$$arch \
+			OUT=$(DIST)/adb-broker-linux-$$arch || exit 1; \
+	done
+	cd $(DIST) && sha256sum adb-broker-linux-* > SHA256SUMS
+	@cat $(DIST)/SHA256SUMS
 
 ## build-fixture: compile the fixture binary, which is absent from the release build
 build-fixture:
 	@mkdir -p $(BIN)
-	go build -tags=fixture -o $(FIXTURE) ./cmd/adb-broker
+	go build -trimpath -tags=fixture -ldflags "$(LDFLAGS)" -o $(FIXTURE) ./cmd/adb-broker
 
 ## vet: quick compile-level check, over both build configurations
 vet:
@@ -98,8 +155,8 @@ install: build
 
 ## clean: remove build and coverage artifacts
 clean:
-	rm -rf $(BIN) coverage.out
+	rm -rf $(BIN) $(DIST) coverage.out
 
-.PHONY: help build build-fixture vet fmt lint vuln-check deps-check \
+.PHONY: help build build-release dist build-fixture vet fmt lint vuln-check deps-check \
 	test-unit test-integration test-fixture test-nocgo test-device test cover \
 	install clean
