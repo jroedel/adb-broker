@@ -4,7 +4,6 @@ import (
 	"encoding/base64"
 	"errors"
 	"os"
-	"os/user"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -465,23 +464,24 @@ func TestTheAuditLogPathIsThisUsersOwnAndIsNotTakenFromTheEnvironment(t *testing
 
 	// $HOME is the input this must not take, in either of the two outcomes below: a caller that
 	// can move the audit log has removed the guarantee without removing the appearance of one.
-	// os.UserHomeDir would read it outright. user.Current, which this derivation used to call,
-	// reads it in one case that matters more than it looks — see auditLogPath — which is why
-	// the environment is hijacked here BEFORE the first assertion rather than halfway down.
-	// TestPackageSourceReadsNoEnvironment and
+	// os.UserHomeDir would read it outright. os/user reads it in one case that matters more than
+	// it looks — see auditLogPath, and note that BOTH user.Current and user.LookupId do so —
+	// which is why the environment is hijacked here BEFORE the first assertion rather than
+	// halfway down. TestPackageSourceReadsNoEnvironment and
 	// TestPackageSourceNeverResolvesTheHomeDirectoryFromTheEnvironment enforce the rule
-	// statically; this one proves it about the value actually produced.
+	// statically, and TestAuditLogPathRefusesAUidWithNoPasswdEntry proves the refusal against a
+	// fixture database; this one proves the value actually produced on the host it runs on.
 	hijacked := filepath.Join(t.TempDir(), "not-the-real-home")
 	t.Setenv("HOME", hijacked)
 
 	// An account this binary cannot resolve is the case that must be REFUSED rather than
-	// answered out of the environment, and it is the whole reason the derivation moved off
-	// user.Current: under CGO_ENABLED=0 that call answers an unresolvable uid from $HOME and
-	// reports success. There is no path to compare in that configuration, so the assertion is
-	// the refusal itself, and that it is still a refusal with $HOME pointing somewhere
-	// writable. Reached on a host whose uid is absent from /etc/passwd — LDAP, SSSD, AD, or a
-	// container with an unmapped uid — and skipped elsewhere, rather than failing a suite for
-	// running somewhere legitimate.
+	// answered out of the environment, and it is the whole reason the derivation uses no part of
+	// os/user: under CGO_ENABLED=0 both user.Current and user.LookupId answer an unresolvable
+	// uid from $HOME and report success. There is no path to compare in that case, so the
+	// assertion is the refusal itself, and that it is still a refusal with $HOME pointing
+	// somewhere writable. Reached on a host whose uid is absent from /etc/passwd — LDAP, SSSD,
+	// AD, or a container with an unmapped uid — and skipped elsewhere, rather than failing a
+	// suite for running somewhere legitimate.
 	if err != nil {
 		if _, again := auditLogPath(); again == nil {
 			t.Fatalf("auditLogPath() refused uid %d, then answered once $HOME was set to %q: the fallback is back",
@@ -492,15 +492,40 @@ func TestTheAuditLogPathIsThisUsersOwnAndIsNotTakenFromTheEnvironment(t *testing
 			os.Getuid(), err)
 	}
 
-	// The oracle is LookupId on the real uid — the same lookup the implementation performs, and
-	// deliberately not user.Current, so that a regression back to user.Current cannot make this
-	// comparison agree with itself by moving both sides at once.
-	u, err := user.LookupId(strconv.Itoa(os.Getuid()))
+	// The oracle is a second, deliberately naive scan of /etc/passwd, written out here rather
+	// than shared with the implementation.
+	//
+	// It used to be user.LookupId, on the stated grounds that using it — rather than
+	// user.Current — meant "a regression back to user.Current cannot make this comparison agree
+	// with itself by moving both sides at once". That protection did not exist. LookupId
+	// short-circuits to Current whenever the uid asked for is the current one, which here it
+	// always is, so both sides would have moved together exactly as feared. Nothing from
+	// os/user can be an independent oracle for this derivation.
+	//
+	// Two implementations that must agree is the pattern foundation/audit already uses for the
+	// canonical record form, and it applies for the same reason: the naivety is the point. If
+	// this and homeDirFromPasswdLine ever disagree about a line, that disagreement is worth a
+	// test failure rather than a shrug.
+	passwd, err := os.ReadFile("/etc/passwd")
 	if err != nil {
-		t.Fatalf("user.LookupId: %v", err)
+		t.Fatalf("read /etc/passwd for the oracle: %v", err)
 	}
 
-	if want := filepath.Join(u.HomeDir, ".local", "state", "adb-broker", "audit.log"); got != want {
+	want := ""
+	for line := range strings.SplitSeq(string(passwd), "\n") {
+		fields := strings.Split(line, ":")
+		if len(fields) >= 6 && fields[2] == strconv.Itoa(os.Getuid()) {
+			want = filepath.Join(fields[5], ".local", "state", "adb-broker", "audit.log")
+
+			break
+		}
+	}
+
+	if want == "" {
+		t.Fatalf("uid %d resolved for auditLogPath but the oracle cannot find it in /etc/passwd", os.Getuid())
+	}
+
+	if got != want {
 		t.Errorf("auditLogPath() = %q, want %q", got, want)
 	}
 

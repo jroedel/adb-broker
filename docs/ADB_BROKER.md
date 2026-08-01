@@ -199,6 +199,16 @@ copies append to the same per-uid log, and only their anchors diverge. Nothing e
 `verify` under either path reports a log longer than that path's own anchors claim — which is
 the one outcome the tool treats as unremarkable (see **Fail closed**). One installed path.
 
+**The one-path rule gained a second consumer on 2026-08-01, and it is not the same argument.**
+Until then this was about discovery: wherever a consumer *finds* the binary, there must be only
+one of it. A consumer that *installs* the binary is a stronger case, because it can create the
+second copy rather than merely stumble on one — and because two consumers now share the file.
+Hence rules 1, 4 and 5 of **The consumer install contract**: one canonical path, an atomic
+replacement so a half-written binary is never at it, and a refusal to downgrade so two consumers
+pinning different versions do not flip it under each other. Anchors carry the publishing binary's
+`_EXE`, which is a path and not a hash, so upgrading in place at a stable path keeps one anchor
+identity across every version — the property all three rules exist to preserve.
+
 ---
 
 ## Transport
@@ -1691,42 +1701,61 @@ truncation check that never ran is exactly the confident pass an adversary wants
 ~/.local/state/adb-broker/audit.log   <invoking uid> 0600  — opened O_WRONLY|O_APPEND
 ```
 
-**The path is per-uid and derived at runtime, not configured.** It is built from
-`user.LookupId` on the real uid from `os.Getuid` — the passwd entry for the running account,
-*not* `$HOME` — so it remains true that no environment variable, flag or file can move the audit
-log, and the package's zero-environment-reads test stands unchanged. That is also the uid the
-record carries as `caller_uid`, so the log's location and its contents name the same account by
-construction. Two different users running the same binary keep two separate chains, which is the
-correct shape: their anchors already carry different `_UID`s, and one chain shared between two
-uids would be a chain either of them could rewrite behind the other.
+**The path is per-uid and derived at runtime, not configured.** It is built by reading the
+passwd database directly — `app/broker/passwd.go`, keyed on the real uid from `os.Getuid` — *not*
+from `$HOME`, so no environment variable, flag or file can move the audit log. That is also the
+uid the record carries as `caller_uid`, so the log's location and its contents name the same
+account by construction. Two different users running the same binary keep two separate chains,
+which is the correct shape: their anchors already carry different `_UID`s, and one chain shared
+between two uids would be a chain either of them could rewrite behind the other.
 
-**Amended 2026-08-01: this specified `os/user.Current()`, which made the claim above conditional
-on a build flag rather than true.** Under `CGO_ENABLED=0` — the configuration a *distributed*
-release artifact is built in — `os/user` compiles `lookup_stubs.go`, whose `current()` attempts
-the passwd lookup and, when it fails, builds a user from `os.UserHomeDir()` and `$USER` and
-returns it **with a nil error**. So on a host whose uid is absent from `/etc/passwd` — an LDAP,
-SSSD or AD directory, or a container started with an unmapped uid — `user.Current` would have
-derived this path from `$HOME` and reported success: the log relocated to wherever the caller
-pointed it, the rule above defeated, and nothing anywhere saying so. `user.LookupId` has no such
-fallback in either configuration — NSS with cgo, `/etc/passwd` without it, an error rather than a
-guess in both — so an account the broker cannot resolve is `audit_unavailable`, which is the
-direction every other control here fails in.
+**This has been wrong twice, and both attempts are recorded because the second one looked
+right.** Until 2026-08-01 it specified `os/user.Current()`. Under `CGO_ENABLED=0` — the
+configuration a *distributed* release artifact is built in — `os/user` compiles
+`lookup_stubs.go`, whose `current()` attempts the passwd lookup and, when it fails, builds a user
+from `os.UserHomeDir()` and `$USER` and returns it **with a nil error**. On a host whose uid is
+absent from `/etc/passwd` — LDAP, SSSD, AD, or a container with an unmapped uid — the path came
+from `$HOME` and the run reported success.
 
-**Status of that finding: read off the standard library's source and build tags, not
-reproduced.** A runtime demonstration needs a host where the invoking uid has no passwd entry,
-which is trivial to arrange with a user namespace and was not available where this was found.
-It should be reproduced before the correction is called measured. The reason it is acted on
-anyway is that the sentence it undermines — *no environment variable can move the audit log* —
-is quoted as a property in three other places in this document, and for one build configuration
-it was not one. Nothing about it mattered while the binary was something its operator compiled;
-it became load bearing the moment a release artifact was proposed.
+It was then changed to `user.LookupId`, on the stated grounds that it "has no such fallback in
+either configuration." **That was false and the correction changed nothing:**
 
-The guard against a regression is static rather than behavioural, and it has to be:
-`TestPackageSourceNeverResolvesTheHomeDirectoryFromTheEnvironment` refuses both `user.Current`
-and `os.UserHomeDir` anywhere in this package's source, because a test that calls the derivation
-cannot see the fallback on a host whose uid *does* resolve — which is every host that runs CI.
-`make test-nocgo` covers the shipped configuration for the same reason: a control with two build
-modes gets tested in one of them.
+```go
+func LookupId(uid string) (*User, error) {
+	if u, err := Current(); err == nil && u.Uid == uid { return u, err }
+	return lookupUserId(uid)
+}
+```
+
+The derivation asks for the *current* uid by construction, so the fast path always fires and
+`LookupId` returns exactly what `Current` would have. **Reproduced 2026-08-01** against the
+published `v0.1.0-rc1` artifact — a uid absent from the passwd file the process read, `$HOME`
+pointing at a decoy, and a complete chained audit log created under the decoy. The control run,
+same binary and same decoy `$HOME` but a normal passwd file, wrote nothing: the missing entry is
+what unlocks it, exactly as the analysis said, against the function the analysis recommended.
+
+The derivation therefore uses no part of `os/user`. `passwd.go` reads the database itself, with
+no shortcut to poison, in **both** build configurations — so the behaviour under test is the
+behaviour that ships. That costs a cgo build the ability to resolve an account that exists only
+in a directory service; such an account is refused by the release binary regardless, since a
+static binary cannot consult NSS at all, and `audit_unavailable` is the direction every control
+here fails in.
+
+**Reproducing it:** `zarf/repro-passwd-fallback.sh`, which needs no privileges. It binds a copy
+of `/etc/passwd` with the invoking uid's line removed, using `proot`; the uid stays genuinely
+real and the kernel is told nothing false. Note for anyone retracing this — `unshare -U`
+*succeeds* here and the `uid_map` write is what fails, because
+`kernel.apparmor_restrict_unprivileged_userns=1` returns a namespace without `CAP_SETUID`.
+
+The regression guards are now two, and the second only became possible with the rewrite.
+`TestPackageSourceNeverResolvesTheHomeDirectoryFromTheEnvironment` refuses the **`os/user`
+import** outright rather than naming particular functions — naming the safe members of an unsafe
+package is precisely what failed, since it required the guard to stay ahead of every path
+through it and it did not. And `TestAuditLogPathRefusesAUidWithNoPasswdEntry` asserts the failing
+case behaviourally, by pointing the derivation at a fixture database that omits the running uid.
+That test could not be written while the lookup went through `os/user`, which is the deeper
+reason the defect survived: the rule was enforceable only by spelling, and the spelling was
+wrong. `make test-nocgo` still covers the shipped configuration.
 
 What this costs, plainly: the file is owned by the account that writes it, and that account can
 truncate it, delete it, or replace it with a chain of its own. `chattr +a`, the root-owned
@@ -2034,6 +2063,93 @@ install -D -m 0755 bin/adb-broker ~/.local/bin/adb-broker
 
 `make install` is exactly that and needs no privilege. There is no `make verify-install`
 any more, because there are no install-time properties left to check.
+
+### Installing from a release
+
+Tagged releases publish `adb-broker-linux-amd64`, `adb-broker-linux-arm64` and a `SHA256SUMS`,
+plus a provenance attestation. **Linux only, `amd64` and `arm64`.** Windows does not compile
+(`syscall.SYS_FCNTL`). macOS is excluded on purpose rather than pending: it compiles and runs,
+but there is no journald, so the anchor write fails — and that failure is by design non-fatal,
+so every read would succeed while the only remaining tamper-evidence control was silently
+absent, and `verify` would then report `no anchors found` → `"status":"partial"` → exit `0`,
+which is the result that reads as a pass. A macOS artifact would ship a broker whose audit story
+is quietly gone. Supporting it needs a decision on purpose — a different anchor sink, or an
+explicit refusal to run where it cannot anchor — not a build matrix entry.
+
+```
+curl -fsSLO https://github.com/jroedel/adb-broker/releases/download/vX.Y.Z/adb-broker-linux-amd64
+curl -fsSLO https://github.com/jroedel/adb-broker/releases/download/vX.Y.Z/SHA256SUMS
+sha256sum --ignore-missing -c SHA256SUMS
+install -D -m 0755 adb-broker-linux-amd64 ~/.local/bin/adb-broker
+```
+
+Two further checks, neither required to install and both worth knowing exist:
+
+```
+gh attestation verify adb-broker-linux-amd64 --repo jroedel/adb-broker
+```
+
+names the workflow, ref and commit the artifact was built by. And the build is **reproducible** —
+a clean clone at the tag plus `make dist VERSION=X.Y.Z` produces the published bytes exactly,
+verified on `v0.1.0-rc1` for both architectures on a machine other than the one that built them.
+That is the strongest of the three, because it requires trusting nobody: not GitHub, not the
+signing infrastructure, not this project. It is also the one nobody runs, which is why the digest
+is what the contract below actually mandates.
+
+### The consumer install contract
+
+Normative, for a consumer that installs the broker for its user rather than asking them to.
+`photos` is the originating one; these rules bind any of them. Each exists because getting it
+wrong fails *quietly* — none of these produces an error at the time.
+
+1. **One canonical path, `~/.local/bin/adb-broker`, shared by every consumer.** Never a private
+   copy beside a consumer's own executable. See **Discovery**, where the reason is argued: two
+   copies split the anchor trail in two and nothing errors.
+
+2. **Pin an exact version. Never `latest`.** The consumer owns the `proto` check, and pinning is
+   what makes that check mean anything — a floating version can change `proto` under a consumer
+   that has already decided it is compatible.
+
+3. **Embed the expected SHA-256 for the pinned version, and verify before installing.** The
+   digest ships *inside* the consumer, never fetched alongside the binary; a digest downloaded
+   from the same place as the artifact is a checksum, not a control. Verification needs nothing
+   but `crypto/sha256`, works offline, and is the only one of the three mechanisms above a
+   consumer can perform at install time.
+
+   Take the digest from the published `SHA256SUMS`, or reproduce it from the tag. **Never from a
+   dry run of the release workflow** — Go derives the main module's version from a VCS tag
+   pointing at HEAD, so the same commit built before and after tagging embeds a different `mod`
+   line and hashes differently. Measured on `v0.1.0-rc1`: 8 bytes, and everything else in the
+   build info identical.
+
+4. **Install atomically.** Download to a temporary file *in the destination directory*, verify
+   the digest, `chmod 0755`, then `rename(2)` into place. Never write the final path directly: a
+   consumer interrupted mid-download otherwise leaves a truncated binary at the path every other
+   consumer on the machine executes.
+
+5. **Refuse to downgrade.** Read what is already there with `adb-broker version` — that
+   subcommand exists for this, and answers with no device and no audit log, which matters
+   because the copy in place may have been installed by another consumer on a host that has
+   never run it. A digest comparison cannot substitute: a mismatch says *different*, never
+   *older*. Two consumers pinning different versions must not flip the binary under each other.
+
+6. **Run `probe` immediately after installing**, and surface `no_adb_server` and `unauthorized`
+   with instructions. This carries more weight than it looks. The broker neither ships nor
+   locates `adb`, so both host preconditions are entirely the user's to satisfy, and they are
+   the ones that cost the most time when wrong — particularly that USB-debugging authorization
+   is per *adb-server RSA key*, i.e. per account, and misreads as "USB debugging is off".
+
+What the contract deliberately does **not** ask for: verifying the attestation at install time.
+Doing so means either shelling out to `gh` — not present on an end-user machine — or linking
+`sigstore-go`, and it needs network access to a transparency log. It is the right thing to
+*publish* and the wrong thing to depend on. If shipping broker releases faster than consumer
+releases ever becomes the binding constraint, the stdlib-only alternative is an Ed25519
+(minisign-style) signature with the public key compiled into the consumer, verified with
+`crypto/ed25519`, at the cost of managing a signing key in Actions secrets.
+
+**None of this survives the binary being overwritten afterwards.** The installed file and the
+account that could replace it are the same uid; `THREAT_MODEL.md` §4.4 T34 accepts that
+explicitly, and no install-time check has anything to say about it.
 
 ### What was withdrawn, and why
 
