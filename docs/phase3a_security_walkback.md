@@ -52,7 +52,7 @@ and installs it to one canonical path.**
 | Install path | **One canonical `~/.local/bin/adb-broker`, shared by every consumer.** Never a per-app private copy. |
 | Download verification | **Publish GitHub artifact attestations** *and* **embed the expected SHA-256 in the consumer** — see D for why both. |
 | Does the consumer locate or ship `adb`? | **No.** It relies on the OS/user having the adb server running already. |
-| Build configuration | `CGO_ENABLED=0`, static and portable, with the `LookupId` fix that makes it fail closed where it cannot resolve the account. |
+| Build configuration | `CGO_ENABLED=0`, static and portable. The account is resolved by reading the passwd database directly (`app/broker/passwd.go`), which fails closed where it cannot resolve one — see A, and note that the `os/user` route recorded here previously did not. |
 
 **Why macOS is excluded rather than "not yet supported".** It compiles and runs, and there is no
 journald, so the anchor write fails. That failure is by design non-fatal — reported once on
@@ -68,7 +68,7 @@ purpose: a different anchor sink, or an explicit refusal to run where it cannot 
 
 | Step | State |
 |---|---|
-| **A** — the `$HOME` fallback fix | **Done**, `0733ba6` |
+| **A** — the `$HOME` fallback fix | **Done properly on 2026-08-01.** `0733ba6` did not fix it — see below. Now reproduced, refixed, and covered behaviourally |
 | Consumer-facing `README.md` | **Done**, `231f56e` |
 | `foundation/adbwire` test flake | **Fixed**, `9f59ce0` — the gate is trustworthy, which C depends on |
 | **B** — version identity | **Done**, `7db15f7` |
@@ -78,7 +78,7 @@ purpose: a different anchor sink, or an explicit refusal to run where it cannot 
 
 ---
 
-## A — the `$HOME` fallback. Done (`0733ba6`)
+## A — the `$HOME` fallback. Reproduced and actually fixed, 2026-08-01
 
 **The finding.** `auditLogPath` derived the audit log path from `user.Current()`. Under
 `CGO_ENABLED=0` — the configuration a portable release artifact is built in — `os/user` compiles
@@ -92,25 +92,65 @@ a container started with `docker run -u 4242` — would have derived the audit l
 can move the log, silently. It mattered only because the binary stopped being something its
 operator compiled.
 
-**The fix.** `user.LookupId(strconv.Itoa(os.Getuid()))`. No env fallback in either build
-configuration — NSS with cgo, `/etc/passwd` without it, an error rather than a guess in both — so
-an unresolvable account is now `audit_unavailable`, the direction every other control here fails
-in. The uid is the real uid, the same one the record carries as `caller_uid`.
+**The first fix, `0733ba6`, did not work.** It replaced `user.Current()` with
+`user.LookupId(strconv.Itoa(os.Getuid()))`, on the stated grounds that `LookupId` "has no env
+fallback in either build configuration". That sentence was the whole argument, it was in the
+code comment, in the guard test's comment, in `ADB_BROKER.md` and in this file — and it is false:
 
-**Why the guard is static, which is the part worth remembering.** Reverting the fix and running
-the suite, the *behavioural* test still passed. On a host whose uid resolves, the fallback is
-never reached, so no test that calls the derivation can see the bug — and every host that runs CI
-is such a host. `TestPackageSourceNeverResolvesTheHomeDirectoryFromTheEnvironment` therefore walks
-the package's syntax tree and refuses both `user.Current` and `os.UserHomeDir`. Both arms were
-mutation-tested. `make test-nocgo` runs the suite at `CGO_ENABLED=0` and is in the gate and in CI,
-because a control with two build modes gets tested in one of them and the shipped one was the
-untested one.
+```go
+func LookupId(uid string) (*User, error) {
+	if u, err := Current(); err == nil && u.Uid == uid { return u, err }
+	return lookupUserId(uid)
+}
+```
 
-**Unfinished business: the finding is source-derived, not reproduced.** A runtime demonstration
-needs a host where the invoking uid has no passwd entry; user namespaces were denied in the
-sandbox where it was found, so `unshare` and `bwrap` both refused. **Reproduce it before calling
-the correction measured** — `docker run -u 4242` on a normal host is the cheapest way. This
-caveat is also recorded in `ADB_BROKER.md` → **Where it lives**.
+The derivation asks for the *current* uid by construction, so the fast path always fires and
+`LookupId` returns precisely what `Current` would have returned, `$HOME` fallback included. The
+correction changed which function was called and not what happened.
+
+**Reproduced 2026-08-01, against the published `v0.1.0-rc1` artifact.**
+
+| Run | Result |
+|---|---|
+| Control — normal `/etc/passwd`, `$HOME` redirected | nothing written under `$HOME` |
+| uid absent from the passwd file, `$HOME` redirected | `$HOME/.local/state/adb-broker/audit.log`, created, chained, with a real `probe` record |
+
+So the documented invariant — *no environment variable can move the log* — was false for the
+shipped binary, on exactly the hosts the original finding named, four months after it was
+supposedly fixed.
+
+**How, since this file said it could not be done.** It said "user namespaces were denied … so
+`unshare` and `bwrap` both refused." Half right. `unshare -U` **succeeds**; the `uid_map` write
+fails, because `kernel.apparmor_restrict_unprivileged_userns=1` hands back a namespace with no
+`CAP_SETUID`. Docker needs the `docker` group, which is root-equivalent. What works needs no
+privilege at all: `apt-get download proot`, unpack the `.deb` in place, and bind a copy of
+`/etc/passwd` with the invoking uid's line removed. The uid stays genuinely real; the process
+just reads a passwd file that does not list it — which is exactly what a directory-backed host
+looks like to a static binary, since `CGO_ENABLED=0` cannot consult NSS at all. Committed as
+`zarf/repro-passwd-fallback.sh`; it passes against the current tree and fails against
+`v0.1.0-rc1`.
+
+**The real fix.** `app/broker/passwd.go` reads the passwd database itself, mirroring `os/user`'s
+own line-acceptance rules, with no shortcut to poison. `os/user` is not used at all. Both build
+configurations behave identically, so the behaviour under test is the behaviour that ships — at
+the accepted cost that a cgo build no longer resolves an account existing only in LDAP/SSSD/AD,
+which the release binary cannot resolve either.
+
+**Why the guard was static, and why that was the actual defect.** The old note here explained
+that the fallback is unreachable on a host whose uid resolves, so no behavioural test could see
+it, so the rule had to be enforced by walking the AST for `user.Current` and `os.UserHomeDir`.
+That reasoning was correct and its conclusion was the trap: a guard that names the *safe members
+of an unsafe package* has to stay ahead of every path through that package, and it did not —
+`LookupId` was on the allowed side of the list and carried the bug. The guard now refuses the
+`os/user` **import**. And because `passwd.go` takes its database path from a seam,
+`TestAuditLogPathRefusesAUidWithNoPasswdEntry` asserts the failing case *behaviourally*, on any
+host: it points the derivation at a fixture that omits the running uid and requires an error.
+Mutation-tested by restoring `user.LookupId` — both guards fire.
+
+**Rule of thumb this leaves behind:** when a control can only be enforced by spelling, the
+spelling is load bearing and nobody checks it. Restructure until the thing can be tested, then
+test it. "This cannot be tested behaviourally" is a statement about the current design, not
+about the world.
 
 ---
 
@@ -378,8 +418,11 @@ quietly testing the host instead.
 
 ## Open questions
 
-1. **Reproduce the `$HOME` fallback** on a host with an unresolvable uid before calling A
-   verified. (A)
+1. ~~**Reproduce the `$HOME` fallback** on a host with an unresolvable uid before calling A
+   verified.~~ Done 2026-08-01, and it found that the fix did not work. See A, and
+   `zarf/repro-passwd-fallback.sh`. **`v0.1.0-rc1` carries the defect** — it is a pre-release
+   shakedown that nothing consumes, deliberately left in place, and the next tag carries the
+   fix. (A)
 2. ~~**Does the VCS revision become a `probe` member, or stay in the audit record?**~~ Closed by
    B: `version` reports it, `probe` does not, and the audit record never carried a version to
    stay in. (B)
@@ -399,10 +442,9 @@ quietly testing the host instead.
 - The normative contract is `docs/ADB_BROKER.md`. `README.md` is the consumer-facing guide and
   was written by running the binary rather than transcribing the spec, so where it gives an
   example, that example was observed.
-- Next action: **implement the install contract in `photos`.** A through E are done in this
-  repository; `ADB_BROKER.md` → **The consumer install contract** is the specification to build
-  against, and `foundation/source/adbbroker` is where it lands. Nothing in this repository is
-  blocking it.
-- Still open from A: the `$HOME` fallback is source-derived and has never been reproduced at
-  runtime. `docker run -u 4242` on a normal host is the way; user namespaces are denied in this
-  sandbox, confirmed again on 2026-08-01 when a browser launch failed the same way.
+- Next action: **cut a tag carrying the `auditLogPath` fix.** `v0.1.0-rc1` resolves the audit log
+  path from `$HOME` on any host whose uid has no passwd entry; that is the one thing outstanding
+  that a released artifact gets wrong.
+- Then: **implement the install contract in `photos`.** A through E are done in this repository;
+  `ADB_BROKER.md` → **The consumer install contract** is the specification to build against, and
+  `foundation/source/adbbroker` is where it lands.

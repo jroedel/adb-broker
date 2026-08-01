@@ -36,9 +36,7 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/user"
 	"path/filepath"
-	"strconv"
 	"time"
 
 	"github.com/jroedel/adb-broker/business/domain/device/devicebus"
@@ -66,42 +64,56 @@ import (
 // os.Environ. That test was mandatory when this binary was setuid, since a setuid binary
 // inherits its caller's environment unsanitized. It is merely correct now, and it is kept.
 //
-// And NOT user.Current, which this called until the release-artifact work went looking at it.
-// user.Current reads $HOME on exactly the hosts a downloaded binary is most likely to meet.
-// Under CGO_ENABLED=0 — the configuration a portable release artifact is built in — os/user
-// compiles lookup_stubs.go, whose current() attempts the passwd lookup and, WHEN IT FAILS,
-// builds a User from os.UserHomeDir() and $USER and returns it with a nil error. So on a host
-// whose uid is absent from /etc/passwd — an LDAP, SSSD or AD directory, or a container started
-// with an unmapped uid — user.Current would have derived this path from $HOME and reported
-// success: the audit log moved to wherever the caller pointed it, the rule above defeated, and
-// nothing anywhere saying so.
+// And NOT os/user, in any of its forms. That package cannot answer this question safely in the
+// configuration this binary ships in, and the history is worth keeping because the second
+// attempt looked correct and was not.
 //
-// user.LookupId has no such fallback in either build configuration. With cgo it resolves
-// through NSS, so a directory-backed account still works; without cgo it reads /etc/passwd;
-// and both report an error rather than guessing. An account this binary cannot resolve is
-// therefore audit_unavailable — loud, and refusing to touch the phone — which is the direction
-// every other control here fails in.
+// This called user.Current until 2026-08-01. Under CGO_ENABLED=0 — the configuration a portable
+// release artifact is built in — os/user compiles lookup_stubs.go, whose current() attempts the
+// passwd lookup and, WHEN IT FAILS, builds a User from os.UserHomeDir() and $USER and returns it
+// with a nil error. So on a host whose uid is absent from /etc/passwd — an LDAP, SSSD or AD
+// directory, or a container started with an unmapped uid — the path came from $HOME and the run
+// reported success.
 //
-// The uid is the REAL uid, from os.Getuid, which is the one user.Current read as well. It is
-// also the uid the audit record carries as caller_uid, so the log's location and the records
-// inside it name the same account by construction rather than by coincidence.
+// It was then changed to user.LookupId, on the stated grounds that LookupId "has no such
+// fallback in either build configuration". **That was wrong, and the correction changed
+// nothing.** LookupId short-circuits:
+//
+//	func LookupId(uid string) (*User, error) {
+//		if u, err := Current(); err == nil && u.Uid == uid { return u, err }
+//		return lookupUserId(uid)
+//	}
+//
+// This derivation asks for the current uid by construction, so the fast path always fires and
+// LookupId returns exactly what Current would have. Reproduced 2026-08-01 against the published
+// v0.1.0-rc1 artifact — a uid absent from the passwd file it read, $HOME pointing at a decoy,
+// and an audit log created under the decoy. Both attempts are recorded rather than tidied away
+// because the failure was a plausible reading of the standard library, and the next person
+// reaching for os/user here deserves to know it was already tried twice.
+//
+// homeDirForUID reads the passwd database itself, with no shortcut to poison. See passwd.go for
+// why that is the right answer and not a workaround, and for what it costs a cgo build.
+//
+// The uid is the REAL uid, from os.Getuid. It is also the uid the audit record carries as
+// caller_uid, so the log's location and the records inside it name the same account by
+// construction rather than by coincidence.
 //
 // Two users running this binary keep two separate chains. That is the intended shape: their
 // anchors already carry different journald-stamped _UIDs, and one chain shared between two
 // accounts would be a chain either could rewrite behind the other.
 func auditLogPath() (string, error) {
-	uid := strconv.Itoa(os.Getuid())
+	uid := os.Getuid()
 
-	u, err := user.LookupId(uid)
+	home, err := homeDirForUID(uid)
 	if err != nil {
-		return "", fmt.Errorf("read the passwd entry for uid %s, whose audit log this is: %w", uid, err)
+		return "", fmt.Errorf("read the passwd entry for uid %d, whose audit log this is: %w", uid, err)
 	}
 
-	if u.HomeDir == "" {
-		return "", fmt.Errorf("uid %s has no home directory, so there is nowhere to keep an audit log", u.Uid)
+	if home == "" {
+		return "", fmt.Errorf("uid %d has no home directory, so there is nowhere to keep an audit log", uid)
 	}
 
-	return filepath.Join(u.HomeDir, ".local", "state", "adb-broker", "audit.log"), nil
+	return filepath.Join(home, ".local", "state", "adb-broker", "audit.log"), nil
 }
 
 // openOrCreateAuditLog opens the invoking user's audit log, creating it when this is the

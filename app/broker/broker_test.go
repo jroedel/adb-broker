@@ -1203,24 +1203,39 @@ func TestPackageSourceNeverResolvesTheHomeDirectoryFromTheEnvironment(t *testing
 	// standard library, not in this package's source, so a grep or an AST walk looking for
 	// os.Getenv finds nothing to report.
 	//
-	// os.UserHomeDir reads $HOME outright. user.Current is the subtle one, and it is the one
-	// this derivation used to call. Under CGO_ENABLED=0 — the configuration a portable release
-	// artifact is built in — os/user compiles lookup_stubs.go, whose current() attempts the
-	// passwd lookup and, when it fails, builds a User from os.UserHomeDir() and $USER and
-	// returns it with a NIL error. On a host whose uid is absent from /etc/passwd (LDAP, SSSD,
-	// AD, or a container with an unmapped uid) that puts the audit log wherever $HOME points
-	// and reports success. user.LookupId has no fallback in either build configuration: with
-	// cgo it resolves through NSS, without cgo it reads /etc/passwd, and both return an error
-	// rather than guessing.
+	// os.UserHomeDir reads $HOME outright. os/user is the subtle one, and this guard used to
+	// forbid only user.Current while recommending user.LookupId as the safe alternative. That
+	// recommendation was wrong, the code took it, and the guard then passed over a derivation
+	// with the original defect still in it for as long as it stood.
+	//
+	// Under CGO_ENABLED=0 — the configuration a portable release artifact is built in — os/user
+	// compiles lookup_stubs.go, whose current() attempts the passwd lookup and, when it fails,
+	// builds a User from os.UserHomeDir() and $USER and returns it with a NIL error. LookupId is
+	// no escape from that, because it short-circuits:
+	//
+	//	if u, err := Current(); err == nil && u.Uid == uid { return u, err }
+	//
+	// and this derivation asks for the current uid by construction, so the fast path always
+	// fires. Reproduced against the published v0.1.0-rc1 artifact on 2026-08-01: an audit log
+	// created under $HOME on a host whose uid the passwd file did not contain.
+	//
+	// So the guard is now on the IMPORT, not on a list of function names. Naming the safe
+	// members of an unsafe package is what failed: it required this test to stay ahead of every
+	// path through os/user, and it did not. The package is simply not used here — passwd.go
+	// reads the database directly — and a guard on the import cannot be defeated by a member
+	// nobody thought of.
 	//
 	// TestTheAuditLogPathIsThisUsersOwnAndIsNotTakenFromTheEnvironment asserts the produced
-	// value, but only where it can: on a host whose uid does resolve, the fallback is never
-	// reached and the bug is invisible. This check does not depend on where it runs.
-	//
-	// Matched by selector name, exactly as the environment test above matches, so that an
-	// aliased import of os or os/user cannot hide the call.
-	forbidden := map[string]string{
-		"Current":     "user.Current answers an unresolvable uid from $HOME under CGO_ENABLED=0; use user.LookupId",
+	// value, and TestAuditLogPathRefusesAUidWithNoPasswdEntry now asserts the failing case
+	// directly, which became possible only once the lookup had a seam. This check does not
+	// depend on where it runs.
+	forbiddenImports := map[string]string{
+		`"os/user"`: "os/user answers an unresolvable uid from $HOME under CGO_ENABLED=0, through Current AND through LookupId; passwd.go reads the database directly",
+	}
+
+	// os.UserHomeDir stays matched by selector name, exactly as the environment test above
+	// matches, so that an aliased import of os cannot hide the call.
+	forbiddenCalls := map[string]string{
 		"UserHomeDir": "os.UserHomeDir reads $HOME, which must never decide where the audit log lives",
 	}
 
@@ -1231,10 +1246,16 @@ func TestPackageSourceNeverResolvesTheHomeDirectoryFromTheEnvironment(t *testing
 				t.Fatalf("parse %s: %v", path, err)
 			}
 
+			for _, imp := range file.Imports {
+				if why, bad := forbiddenImports[imp.Path.Value]; bad {
+					t.Errorf("%s imports %s: %s", path, imp.Path.Value, why)
+				}
+			}
+
 			ast.Inspect(file, func(n ast.Node) bool {
 				sel, ok := n.(*ast.SelectorExpr)
 				if ok {
-					if why, bad := forbidden[sel.Sel.Name]; bad {
+					if why, bad := forbiddenCalls[sel.Sel.Name]; bad {
 						t.Errorf("%s calls %s: %s", path, sel.Sel.Name, why)
 					}
 				}
@@ -1242,6 +1263,77 @@ func TestPackageSourceNeverResolvesTheHomeDirectoryFromTheEnvironment(t *testing
 				return true
 			})
 		}
+	}
+}
+
+// TestAuditLogPathRefusesAUidWithNoPasswdEntry is the test that could not be written before.
+//
+// The whole finding — twice over — was that the derivation answered an unresolvable account out
+// of $HOME instead of failing. No behavioural test could see it, because the fallback is
+// unreachable on any host whose uid resolves, and every host that runs this suite is such a
+// host. So the rule was enforced statically, by a guard that named the wrong functions, and the
+// defect survived a correction that was supposed to remove it.
+//
+// passwdFile is a seam for exactly this. Pointed at a database that does not contain the running
+// uid, the derivation must return an error — with $HOME set to somewhere obvious, so that a
+// regression produces a path under it rather than a subtle wrong answer.
+func TestAuditLogPathRefusesAUidWithNoPasswdEntry(t *testing.T) {
+	decoy := t.TempDir()
+	t.Setenv("HOME", decoy)
+
+	// Every line but this uid's, so the file is a realistic database rather than an empty one:
+	// a parser that gave up on the first non-matching line would otherwise pass by accident.
+	passwd := filepath.Join(t.TempDir(), "passwd")
+	contents := "root:x:0:0:root:/root:/bin/bash\n" +
+		"daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n" +
+		"# a comment\n" +
+		"+::::::\n" +
+		"nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n"
+
+	if err := os.WriteFile(passwd, []byte(contents), 0o600); err != nil {
+		t.Fatalf("write the fixture passwd: %v", err)
+	}
+
+	swap(t, &passwdFile, passwd)
+
+	got, err := auditLogPath()
+
+	switch {
+	case err == nil:
+		t.Fatalf("auditLogPath() = %q with no error; an unresolvable uid must be refused", got)
+
+	case got != "":
+		t.Errorf("auditLogPath() returned %q alongside its error; it must return no path at all", got)
+
+	case strings.Contains(err.Error(), decoy):
+		t.Errorf("the error names $HOME (%s), so the derivation reached the environment: %v", decoy, err)
+	}
+}
+
+// TestAuditLogPathReadsTheHomeDirectoryOutOfThePasswdDatabase is the other half: the value must
+// come from the database and from nothing else, including when $HOME disagrees with it.
+func TestAuditLogPathReadsTheHomeDirectoryOutOfThePasswdDatabase(t *testing.T) {
+	t.Setenv("HOME", filepath.Join(t.TempDir(), "not-the-real-home"))
+
+	home := t.TempDir()
+	passwd := filepath.Join(t.TempDir(), "passwd")
+	contents := fmt.Sprintf("root:x:0:0:root:/root:/bin/bash\nsomebody:x:%d:%d::%s:/bin/sh\n",
+		os.Getuid(), os.Getgid(), home)
+
+	if err := os.WriteFile(passwd, []byte(contents), 0o600); err != nil {
+		t.Fatalf("write the fixture passwd: %v", err)
+	}
+
+	swap(t, &passwdFile, passwd)
+
+	got, err := auditLogPath()
+	if err != nil {
+		t.Fatalf("auditLogPath: %v", err)
+	}
+
+	want := filepath.Join(home, ".local", "state", "adb-broker", "audit.log")
+	if got != want {
+		t.Errorf("auditLogPath() = %q, want %q", got, want)
 	}
 }
 
