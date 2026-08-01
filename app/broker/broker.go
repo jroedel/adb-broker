@@ -38,6 +38,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/jroedel/adb-broker/business/domain/device/devicebus"
@@ -58,21 +59,42 @@ import (
 // chain, at a location no invocation can argue with, so that the anchors published under that
 // account's uid and the log they describe cannot be pointed at different files.
 //
-// The path comes from user.Current(), which reads the passwd database for the running uid.
-// NOT os.UserHomeDir, which reads $HOME: a value the caller sets is exactly the input this
-// must not take, and using it would also break TestPackageSourceReadsNoEnvironment, which
-// fails if any non-test file in this package or in cmd/adb-broker mentions os.Getenv,
-// os.LookupEnv or os.Environ. That test was mandatory when this binary was setuid, since a
-// setuid binary inherits its caller's environment unsanitized. It is merely correct now, and
-// it is kept.
+// The path comes from the passwd entry for the running uid, read by user.LookupId. NOT
+// os.UserHomeDir, which reads $HOME: a value the caller sets is exactly the input this must
+// not take, and using it would also break TestPackageSourceReadsNoEnvironment, which fails if
+// any non-test file in this package or in cmd/adb-broker mentions os.Getenv, os.LookupEnv or
+// os.Environ. That test was mandatory when this binary was setuid, since a setuid binary
+// inherits its caller's environment unsanitized. It is merely correct now, and it is kept.
+//
+// And NOT user.Current, which this called until the release-artifact work went looking at it.
+// user.Current reads $HOME on exactly the hosts a downloaded binary is most likely to meet.
+// Under CGO_ENABLED=0 — the configuration a portable release artifact is built in — os/user
+// compiles lookup_stubs.go, whose current() attempts the passwd lookup and, WHEN IT FAILS,
+// builds a User from os.UserHomeDir() and $USER and returns it with a nil error. So on a host
+// whose uid is absent from /etc/passwd — an LDAP, SSSD or AD directory, or a container started
+// with an unmapped uid — user.Current would have derived this path from $HOME and reported
+// success: the audit log moved to wherever the caller pointed it, the rule above defeated, and
+// nothing anywhere saying so.
+//
+// user.LookupId has no such fallback in either build configuration. With cgo it resolves
+// through NSS, so a directory-backed account still works; without cgo it reads /etc/passwd;
+// and both report an error rather than guessing. An account this binary cannot resolve is
+// therefore audit_unavailable — loud, and refusing to touch the phone — which is the direction
+// every other control here fails in.
+//
+// The uid is the REAL uid, from os.Getuid, which is the one user.Current read as well. It is
+// also the uid the audit record carries as caller_uid, so the log's location and the records
+// inside it name the same account by construction rather than by coincidence.
 //
 // Two users running this binary keep two separate chains. That is the intended shape: their
 // anchors already carry different journald-stamped _UIDs, and one chain shared between two
 // accounts would be a chain either could rewrite behind the other.
 func auditLogPath() (string, error) {
-	u, err := user.Current()
+	uid := strconv.Itoa(os.Getuid())
+
+	u, err := user.LookupId(uid)
 	if err != nil {
-		return "", fmt.Errorf("determine the invoking user, whose audit log this is: %w", err)
+		return "", fmt.Errorf("read the passwd entry for uid %s, whose audit log this is: %w", uid, err)
 	}
 
 	if u.HomeDir == "" {

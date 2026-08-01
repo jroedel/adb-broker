@@ -1646,12 +1646,41 @@ truncation check that never ran is exactly the confident pass an adversary wants
 ```
 
 **The path is per-uid and derived at runtime, not configured.** It is built from
-`os/user.Current()` — the passwd entry for the running uid, *not* `$HOME` — so it remains true
-that no environment variable, flag or file can move the audit log, and the package's
-zero-environment-reads test stands unchanged. Two different users running the same binary keep
-two separate chains, which is the correct shape: their anchors already carry different `_UID`s,
-and one chain shared between two uids would be a chain either of them could rewrite behind the
-other.
+`user.LookupId` on the real uid from `os.Getuid` — the passwd entry for the running account,
+*not* `$HOME` — so it remains true that no environment variable, flag or file can move the audit
+log, and the package's zero-environment-reads test stands unchanged. That is also the uid the
+record carries as `caller_uid`, so the log's location and its contents name the same account by
+construction. Two different users running the same binary keep two separate chains, which is the
+correct shape: their anchors already carry different `_UID`s, and one chain shared between two
+uids would be a chain either of them could rewrite behind the other.
+
+**Amended 2026-08-01: this specified `os/user.Current()`, which made the claim above conditional
+on a build flag rather than true.** Under `CGO_ENABLED=0` — the configuration a *distributed*
+release artifact is built in — `os/user` compiles `lookup_stubs.go`, whose `current()` attempts
+the passwd lookup and, when it fails, builds a user from `os.UserHomeDir()` and `$USER` and
+returns it **with a nil error**. So on a host whose uid is absent from `/etc/passwd` — an LDAP,
+SSSD or AD directory, or a container started with an unmapped uid — `user.Current` would have
+derived this path from `$HOME` and reported success: the log relocated to wherever the caller
+pointed it, the rule above defeated, and nothing anywhere saying so. `user.LookupId` has no such
+fallback in either configuration — NSS with cgo, `/etc/passwd` without it, an error rather than a
+guess in both — so an account the broker cannot resolve is `audit_unavailable`, which is the
+direction every other control here fails in.
+
+**Status of that finding: read off the standard library's source and build tags, not
+reproduced.** A runtime demonstration needs a host where the invoking uid has no passwd entry,
+which is trivial to arrange with a user namespace and was not available where this was found.
+It should be reproduced before the correction is called measured. The reason it is acted on
+anyway is that the sentence it undermines — *no environment variable can move the audit log* —
+is quoted as a property in three other places in this document, and for one build configuration
+it was not one. Nothing about it mattered while the binary was something its operator compiled;
+it became load bearing the moment a release artifact was proposed.
+
+The guard against a regression is static rather than behavioural, and it has to be:
+`TestPackageSourceNeverResolvesTheHomeDirectoryFromTheEnvironment` refuses both `user.Current`
+and `os.UserHomeDir` anywhere in this package's source, because a test that calls the derivation
+cannot see the fallback on a host whose uid *does* resolve — which is every host that runs CI.
+`make test-nocgo` covers the shipped configuration for the same reason: a control with two build
+modes gets tested in one of them.
 
 What this costs, plainly: the file is owned by the account that writes it, and that account can
 truncate it, delete it, or replace it with a chain of its own. `chattr +a`, the root-owned

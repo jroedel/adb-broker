@@ -3,9 +3,11 @@ package broker
 import (
 	"encoding/base64"
 	"errors"
+	"os"
 	"os/user"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -460,25 +462,47 @@ func TestTheAuditLogPathIsThisUsersOwnAndIsNotTakenFromTheEnvironment(t *testing
 	// home directory, which is what makes a chain and the anchors published beside it
 	// describe the same file.
 	got, err := auditLogPath()
+
+	// $HOME is the input this must not take, in either of the two outcomes below: a caller that
+	// can move the audit log has removed the guarantee without removing the appearance of one.
+	// os.UserHomeDir would read it outright. user.Current, which this derivation used to call,
+	// reads it in one case that matters more than it looks — see auditLogPath — which is why
+	// the environment is hijacked here BEFORE the first assertion rather than halfway down.
+	// TestPackageSourceReadsNoEnvironment and
+	// TestPackageSourceNeverResolvesTheHomeDirectoryFromTheEnvironment enforce the rule
+	// statically; this one proves it about the value actually produced.
+	hijacked := filepath.Join(t.TempDir(), "not-the-real-home")
+	t.Setenv("HOME", hijacked)
+
+	// An account this binary cannot resolve is the case that must be REFUSED rather than
+	// answered out of the environment, and it is the whole reason the derivation moved off
+	// user.Current: under CGO_ENABLED=0 that call answers an unresolvable uid from $HOME and
+	// reports success. There is no path to compare in that configuration, so the assertion is
+	// the refusal itself, and that it is still a refusal with $HOME pointing somewhere
+	// writable. Reached on a host whose uid is absent from /etc/passwd — LDAP, SSSD, AD, or a
+	// container with an unmapped uid — and skipped elsewhere, rather than failing a suite for
+	// running somewhere legitimate.
 	if err != nil {
-		t.Fatalf("auditLogPath: %v", err)
+		if _, again := auditLogPath(); again == nil {
+			t.Fatalf("auditLogPath() refused uid %d, then answered once $HOME was set to %q: the fallback is back",
+				os.Getuid(), hijacked)
+		}
+
+		t.Skipf("uid %d has no passwd entry on this host, which auditLogPath refuses rather than answering from $HOME: %v",
+			os.Getuid(), err)
 	}
 
-	u, err := user.Current()
+	// The oracle is LookupId on the real uid — the same lookup the implementation performs, and
+	// deliberately not user.Current, so that a regression back to user.Current cannot make this
+	// comparison agree with itself by moving both sides at once.
+	u, err := user.LookupId(strconv.Itoa(os.Getuid()))
 	if err != nil {
-		t.Fatalf("user.Current: %v", err)
+		t.Fatalf("user.LookupId: %v", err)
 	}
 
 	if want := filepath.Join(u.HomeDir, ".local", "state", "adb-broker", "audit.log"); got != want {
 		t.Errorf("auditLogPath() = %q, want %q", got, want)
 	}
-
-	// $HOME is the input this must not take. os.UserHomeDir would read it, user.Current
-	// does not, and the difference is the whole reason the derivation is written the way it
-	// is: a caller that can move the audit log has removed the guarantee without removing
-	// the appearance of one. TestPackageSourceReadsNoEnvironment enforces the same rule
-	// statically; this one proves it about the value actually produced.
-	t.Setenv("HOME", filepath.Join(t.TempDir(), "not-the-real-home"))
 
 	after, err := auditLogPath()
 	if err != nil {

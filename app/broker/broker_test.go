@@ -1184,6 +1184,54 @@ func TestPackageSourceReadsNoEnvironment(t *testing.T) {
 	}
 }
 
+func TestPackageSourceNeverResolvesTheHomeDirectoryFromTheEnvironment(t *testing.T) {
+	// The sibling above cannot catch either of these, and that is the reason this test is
+	// separate rather than another entry in its map: the environment read happens inside the
+	// standard library, not in this package's source, so a grep or an AST walk looking for
+	// os.Getenv finds nothing to report.
+	//
+	// os.UserHomeDir reads $HOME outright. user.Current is the subtle one, and it is the one
+	// this derivation used to call. Under CGO_ENABLED=0 — the configuration a portable release
+	// artifact is built in — os/user compiles lookup_stubs.go, whose current() attempts the
+	// passwd lookup and, when it fails, builds a User from os.UserHomeDir() and $USER and
+	// returns it with a NIL error. On a host whose uid is absent from /etc/passwd (LDAP, SSSD,
+	// AD, or a container with an unmapped uid) that puts the audit log wherever $HOME points
+	// and reports success. user.LookupId has no fallback in either build configuration: with
+	// cgo it resolves through NSS, without cgo it reads /etc/passwd, and both return an error
+	// rather than guessing.
+	//
+	// TestTheAuditLogPathIsThisUsersOwnAndIsNotTakenFromTheEnvironment asserts the produced
+	// value, but only where it can: on a host whose uid does resolve, the fallback is never
+	// reached and the bug is invisible. This check does not depend on where it runs.
+	//
+	// Matched by selector name, exactly as the environment test above matches, so that an
+	// aliased import of os or os/user cannot hide the call.
+	forbidden := map[string]string{
+		"Current":     "user.Current answers an unresolvable uid from $HOME under CGO_ENABLED=0; use user.LookupId",
+		"UserHomeDir": "os.UserHomeDir reads $HOME, which must never decide where the audit log lives",
+	}
+
+	for _, dir := range []string{".", filepath.Join("..", "..", "cmd", "adb-broker")} {
+		for _, path := range goSourceFiles(t, dir) {
+			file, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.SkipObjectResolution)
+			if err != nil {
+				t.Fatalf("parse %s: %v", path, err)
+			}
+
+			ast.Inspect(file, func(n ast.Node) bool {
+				sel, ok := n.(*ast.SelectorExpr)
+				if ok {
+					if why, bad := forbidden[sel.Sel.Name]; bad {
+						t.Errorf("%s calls %s: %s", path, sel.Sel.Name, why)
+					}
+				}
+
+				return true
+			})
+		}
+	}
+}
+
 // goSourceFiles lists the non-test Go files in dir.
 func goSourceFiles(t *testing.T, dir string) []string {
 	t.Helper()

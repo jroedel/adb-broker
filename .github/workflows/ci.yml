@@ -66,6 +66,22 @@ jobs:
       - run: make test-unit
       - run: make test-fixture
 
+  # The release configuration, CGO_ENABLED=0, as its own job for the same reason deps-check is
+  # one: it fails for a reason none of the others can. os/user takes a different code path
+  # without cgo — user.Current answers an unresolvable uid out of $HOME there, which is the bug
+  # auditLogPath's use of user.LookupId exists to prevent — so the build that gets published
+  # must be a build that runs the suite. Note that this runner's uid IS in /etc/passwd, so the
+  # fallback is not reachable here; what this job protects is the compile and the static guard
+  # in TestPackageSourceNeverResolvesTheHomeDirectoryFromTheEnvironment.
+  test-nocgo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - run: make test-nocgo
+
   # Asserts the build graph is stdlib-only. Deliberately its own job so a
   # dependency creeping in fails loudly and separately from lint/test/build.
   deps-check:

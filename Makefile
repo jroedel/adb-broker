@@ -64,12 +64,21 @@ test-integration:
 test-fixture:
 	go test -race -count=1 -tags=fixture ./...
 
+## test-nocgo: unit tests in the configuration a release artifact is built in, CGO_ENABLED=0.
+## Not a duplicate of test-unit: os/user behaves differently without cgo — user.Current answers
+## an unresolvable uid out of $HOME there, which is why auditLogPath uses user.LookupId — so the
+## configuration that ships has to be a configuration that is tested. -race is absent because
+## the race detector requires cgo.
+test-nocgo:
+	CGO_ENABLED=0 go test -count=1 ./...
+
 ## test-device: tests requiring a phone attached. Skipped everywhere else; see docs.
 test-device:
 	go test -race -count=1 -tags=device -v ./...
 
-## test: the full gate — unit tests, fixture build, lint, dependency and vuln checks
-test: test-unit test-fixture lint deps-check vuln-check
+## test: the full gate — unit tests in both build configurations, fixture build, lint,
+## dependency and vuln checks
+test: test-unit test-nocgo test-fixture lint deps-check vuln-check
 
 ## cover: unit tests with a coverage summary
 cover:
@@ -92,5 +101,5 @@ clean:
 	rm -rf $(BIN) coverage.out
 
 .PHONY: help build build-fixture vet fmt lint vuln-check deps-check \
-	test-unit test-integration test-fixture test-device test cover \
+	test-unit test-integration test-fixture test-nocgo test-device test cover \
 	install clean
