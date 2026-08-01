@@ -10,6 +10,12 @@ coverage.*
 /bin/
 /dist/
 
+# Local, per-machine working area: the unattended-resume script, its logs and its
+# state. Deliberately untracked -- it hardcodes this machine's session id, uid and
+# keyring socket, none of which are meaningful on another host. See
+# docs/build-out-plan.md for how to recreate it.
+local/
+
 # Local env
 .env
 .env.local
