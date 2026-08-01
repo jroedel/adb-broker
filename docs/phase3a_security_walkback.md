@@ -71,8 +71,8 @@ purpose: a different anchor sink, or an explicit refusal to run where it cannot 
 | **A** — the `$HOME` fallback fix | **Done**, `0733ba6` |
 | Consumer-facing `README.md` | **Done**, `231f56e` |
 | `foundation/adbwire` test flake | **Fixed**, `9f59ce0` — the gate is trustworthy, which C depends on |
-| **B** — version identity | **Not started.** Do this first. |
-| **C** — release workflow | Not started; depends on B |
+| **B** — version identity | **Done**, `7db15f7` |
+| **C** — release workflow | **Not started. Do this next.** |
 | **D** — consumer install contract | Not started; depends on C |
 | **E** — docs | Not started; do with D |
 
@@ -114,24 +114,53 @@ caveat is also recorded in `ADB_BROKER.md` → **Where it lives**.
 
 ---
 
-## B — version identity. Do this first
+## B — version identity. Done (`7db15f7`)
 
-Every tagged release would currently report `"broker":"0.1.0"` — in probe responses and in every
-audit record it writes. For binaries nobody built themselves, that is the gap to close first.
+Every tagged release would have reported `"broker":"0.1.0"`. Stamping alone did not close that,
+and two things found while doing it changed the shape of the step.
 
-- Stamp at build time:
-  `-ldflags "-X github.com/jroedel/adb-broker/app/broker.version=<tag>"`, plus `-trimpath`.
-  The existing `0.1.0` assertions are on struct literals the tests set themselves, not on the
-  package var, so stamping breaks nothing.
-- Go already embeds the VCS revision automatically — verified: `vcs.revision=95876c30…`,
-  `vcs.modified=false`, readable with `go version -m`. Nothing reads it in-process; that reader
-  went out with `verify-install`, and `ADB_BROKER.md` §8.2 already flags re-reading it as
-  reopened and cheap.
-- Keep the fixture build's `+fixture` suffix behaviour intact (`fixturedb.NewStore` appends it;
-  adding it twice previously produced `0.1.0+fixture+fixture`).
+**The premise was wrong in one place.** This section used to say the version appeared "in probe
+responses and in every audit record it writes". It has never been in an audit record.
+`audit.Record` has fourteen fields and none is a version; `deviceaudit.append` never sets one.
+Three comments in the tree said otherwise and are corrected. This matters beyond tidiness: it
+made the audit record look like a cheap home for the VCS revision, and it is the one place the
+revision cannot go — a new field changes the canonical form the hash chain is computed over, and
+`decodeLine` rejects unknown members, so binaries either side of the change stop verifying each
+other's logs.
 
-**Open decision:** does the VCS revision become a new `probe` member — additive, so compatible,
-`proto` stays `1` — or stay in the audit record only?
+**A stamp nobody can read is not identity.** `go version -m` records `vcs.revision`, `vcs.time`,
+`vcs.modified` and `-trimpath` — measured — but **not** `-ldflags`. So the value passed to `-X`
+is invisible to every reader except the process itself, and the only in-process reader was
+`probe`, which needs a device. D's *refuse to downgrade* rule is unimplementable on that
+footing: an installer cannot ask what is already at the canonical path, and digests answer
+"different", never "older".
+
+What shipped:
+
+- **The stamp**, `-X …/app/broker.version=<version>` with `-trimpath`, driven by `VERSION` in
+  the Makefile. The tag's leading `v` is stripped there, because `broker` has always been a bare
+  semver on the wire.
+- **`make build-release`**, the one definition of how a shipped binary is built — `CGO_ENABLED=0`,
+  `-trimpath`, stamped, per `RELEASE_GOARCH`, to `OUT`. C calls this rather than restating it in
+  YAML.
+- **The unstamped default moved from `0.1.0` to `0.0.0+dev`**, so a hand-built binary cannot
+  present itself as the release carrying that number.
+- **An `adb-broker version` subcommand**, answered next to `help` — before the fail-closed check,
+  not exempt from it — writing `{"proto":1,"status":"ok","broker":…,"revision":…,"modified":…}`.
+  No log, no device, no flags. `ProbeResponse` is byte-identical and `proto` stays `1`.
+- **`fixturedb.VersionSuffix` is exported**, for one caller. `version` builds no Store, so
+  nothing appends `+fixture` for it the way `Probe` does. One constant, two readers, no path
+  where both fire — the `0.1.0+fixture+fixture` bug stays fixed.
+
+**Open decision, closed:** the VCS revision is reported by `version` and nowhere else. Not a
+`probe` member — every consumer would parse a value none of them acts on — and not the audit
+record, for the reason above.
+
+**A build in a linked `git worktree` carries no revision.** Measured: the same commit reports
+`7db15f76…` built from a clone and `""` built from `git worktree add --detach`. A worktree's
+`.git` is a file rather than a directory and the toolchain's stamping does not follow it.
+Harmless for C, since `actions/checkout` clones — but do not read an empty `revision` from a
+worktree build as a defect.
 
 ---
 
@@ -143,7 +172,9 @@ read` and should stay that way.
 - Trigger on `v*` tags. Run the full `make test` gate first, so nothing is published from a tree
   that fails it. (This is why the flake in `9f59ce0` had to be fixed first — it would have failed
   releases at random.)
-- Build `linux/amd64` and `linux/arm64`, `CGO_ENABLED=0`, `-trimpath`, stamped version from B.
+- Build `linux/amd64` and `linux/arm64` by calling `make build-release` once per architecture —
+  B put `CGO_ENABLED=0`, `-trimpath` and the stamp there so the workflow does not restate them:
+  `make build-release VERSION=${TAG#v} RELEASE_GOARCH=arm64 OUT=dist/adb-broker-linux-arm64`.
 - `actions/attest-build-provenance`, which needs `id-token: write` and `attestations: write`,
   plus `contents: write` to publish.
 - Publish the two binaries, a `SHA256SUMS`, and the attestation.
@@ -181,7 +212,10 @@ The rest of the contract:
 - **Atomic install:** download to a temp file in the *same directory*, verify the digest,
   `chmod 0755`, then `rename(2)` into place. Never write the final path directly.
 - **Refuse to downgrade**, so two consumers pinning different versions do not flip the binary
-  under each other.
+  under each other. Read the installed binary's version with `adb-broker version`, which B added
+  for this: it answers with no device and no audit log, which is what makes it usable against a
+  copy some other consumer installed. A digest comparison cannot substitute — it reports
+  "different", never "older".
 - **Run `probe` straight after installing** and surface `no_adb_server` / `unauthorized` with
   instructions. This one carries more weight than it looks: the consumer does **not** ship or
   locate `adb`, so the two host preconditions are entirely the user's to satisfy, and they are
@@ -219,13 +253,26 @@ goroutine and no interleaving remain. Verified over 2,000 iterations under `-rac
 **Rule of thumb this leaves behind:** a fixture whose failure mode no real socket can produce is
 a broken fixture, not a flaky test to retry.
 
+**3. `go version -m` does not record `-ldflags`.** Measured on a `-trimpath` build: the build
+settings carry `-buildmode`, `-compiler`, `-trimpath`, `CGO_ENABLED`, `GOOS`/`GOARCH` and the
+`vcs.*` trio, and nothing about link flags. A version stamped with `-X` is therefore readable by
+exactly one program — the one it was stamped into. The plan assumed otherwise, and the
+assumption survives easily because `go version -m` *does* show the commit, which is the value
+people usually check.
+
+**Rule of thumb this leaves behind:** if a build stamp is meant to be read by anything other
+than the binary itself, the binary has to be able to say it out loud. Otherwise the stamp is
+only a comment.
+
 ---
 
 ## Open questions
 
 1. **Reproduce the `$HOME` fallback** on a host with an unresolvable uid before calling A
    verified. (A)
-2. **Does the VCS revision become a `probe` member, or stay in the audit record?** (B)
+2. ~~**Does the VCS revision become a `probe` member, or stay in the audit record?**~~ Closed by
+   B: `version` reports it, `probe` does not, and the audit record never carried a version to
+   stay in. (B)
 3. **`go fix` proposes one rewrite in `app/broker/wire_test.go`** (`typ.Fields()` over
    `typ.NumField()`), left unapplied — its output includes an awkward `field := field`. It
    belongs in its own commit if wanted.
@@ -242,4 +289,4 @@ a broken fixture, not a flaky test to retry.
 - The normative contract is `docs/ADB_BROKER.md`. `README.md` is the consumer-facing guide and
   was written by running the binary rather than transcribing the spec, so where it gives an
   example, that example was observed.
-- Next action: **B**, then **C**.
+- Next action: **C**, then **D** with **E**.

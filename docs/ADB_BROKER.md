@@ -678,6 +678,52 @@ different reason (see below) and the concern is genuinely cross-cutting.
 Three, matching the port exactly. Every subcommand accepts `--serial <id>` to pin a
 device, and `--json` is implied (there is no human output mode on stdout).
 
+`verify` and `version` are not operations and are documented elsewhere — the first under
+**Fail closed**, the second immediately below, because it is the one thing on stdout that says
+nothing about a phone.
+
+### 0. `version` — what is this binary
+
+```
+adb-broker version
+```
+
+```json
+{"proto":1,"status":"ok","broker":"1.2.0","revision":"7db15f766ed07bc512633453f1a9d8d0a85e9760","modified":false}
+```
+
+Reads no log, contacts no device, takes no flags, and answers before the fail-closed check —
+so it works on a host where nothing has been set up and where the audit log is missing or
+damaged. It is outside that check rather than exempt from it: there is no unauditable read to
+prevent, because it reports only what was compiled in.
+
+**Why it exists rather than leaving this to `probe`.** `probe` also reports `broker`, but only
+after reaching a device, so on a host with no phone attached it answers with an error object
+instead. And the version is unreadable from outside the process: `go version -m` records
+`vcs.revision`, `vcs.time`, `vcs.modified` and `-trimpath`, but **not** `-ldflags`, so the value
+stamped with `-X` is invisible to every reader except the binary itself. An installer choosing
+whether to replace what is already at the canonical path has nothing else to ask — a digest
+comparison tells it "different" and never "older".
+
+`broker` is the release the binary was built from, stamped at link time. An unstamped build —
+anything not produced by the release workflow — reports `0.0.0+dev`, which orders below every
+real tag under semver and cannot be mistaken for one. A fixture build appends `+fixture`, the
+same mark `probe` carries.
+
+`revision` and `modified` come from the build info the toolchain records by itself, and are
+build provenance rather than anything a consumer branches on — which is why they are here and
+not on `ProbeResponse`, whose members a consumer reads in order to decide how to *call* this
+binary. Both are always present: `revision` is `""` for a build made from an extracted archive
+rather than a checkout, never absent. `modified` reports a dirty tree at build time, and is
+`false` on any published artifact.
+
+**A build made in a linked `git worktree` reports no revision.** Measured on 2026-08-01: the
+same commit built from a clone reports `7db15f76…`, and built from `git worktree add --detach`
+reports `""`. A worktree's `.git` is a file pointing elsewhere rather than a directory, and the
+toolchain's VCS stamping does not follow it. This costs nothing for a release — GitHub's
+`actions/checkout` produces an ordinary clone — but it means a developer debugging a build from
+a worktree will see an empty `revision` and should not read it as a bug in this subcommand.
+
 ### 1. `probe` — is a device reachable
 
 ```
@@ -2086,7 +2132,8 @@ agree.
 ## Versioning
 
 - Every stdout object carries `"proto":<int>`.
-- `probe` reports `broker` (the binary's own version) and `adb` (the adb server's).
+- `probe` reports `broker` (the binary's own version) and `adb` (the adb server's). `version`
+  reports `broker` too, without needing a device.
 - The archiver checks `proto` at `probe` time and refuses to run against an unknown major
   version rather than misparsing it.
 - Adding fields is compatible. Removing or repurposing one is a `proto` bump. New `code`
@@ -2120,6 +2167,27 @@ future reader has to decode. This is a **one-time exception, not a precedent**: 
 removed from this contract, once a consumer exists, gets the ordinary bump. **That consumer now
 exists**, so the exception is spent, and the paragraph below is what the rules look like applied
 with a reader on the other side of them.
+
+**The `version` subcommand is compatible**, and it is the first change made with the exception
+above already spent, so it is worth stating why rather than asserting it. It adds a subcommand
+and a stdout object; it adds, removes and repurposes no member of any existing one, and
+`ProbeResponse` in particular is byte-identical. A consumer built against the four subcommands
+never invokes it and cannot observe it. `proto` stays `1`.
+
+Two decisions inside it are versioning decisions rather than implementation ones. The VCS
+revision is reported **here and nowhere else** — not as a `probe` member, where every consumer
+would parse a value none of them acts on, and not in the audit record, where it would be a new
+field in the canonical form the hash chain is computed over and therefore a log-format break:
+`foundation/audit`'s `decodeLine` rejects unknown members, so a chain written with an extra
+field does not verify under a binary without it, in either direction. And the unstamped default
+version moved from `0.1.0` to `0.0.0+dev`, so that a hand-built binary can never present itself
+on the wire as the release carrying that same number. Neither is a wire change for a consumer
+that reads `probe`.
+
+**The broker version has never been in the audit record**, and three comments in the tree said
+otherwise until 2026-08-01. `audit.Record` has fourteen fields and none is a version. This is
+worth recording because the mistaken belief made the audit record look like a place a version
+could cheaply go, and it is the one place it cannot.
 
 The rename from `photos-adb-broker` to `adb-broker`, the new `--client` flag, and the
 `caller_uid`/`client_asserted` audit fields are all likewise compatible: the flag is
