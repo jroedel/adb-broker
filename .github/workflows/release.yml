@@ -148,6 +148,18 @@ jobs:
 
   # Everything the release job does up to the point of publishing, with none of
   # its permissions. Run this before cutting a tag.
+  #
+  # It validates the PIPELINE, not the digest, and the difference is not
+  # obvious. Go derives the main module's version from a VCS tag pointing at
+  # HEAD, so the same commit built before and after tagging embeds a different
+  # `mod` line in its build info — a pseudo-version here, the tag there — and
+  # the binaries therefore differ. Measured on v0.1.0-rc1: 8 bytes and a
+  # different SHA-256, everything else in the build info identical.
+  #
+  # So do not pre-compute a consumer's embedded digest from a dry run. It will
+  # never match the release. Take it from the published artifact, or rebuild
+  # the tag from a clean clone — that IS byte-identical, verified on the same
+  # release.
   dry-run:
     if: github.event_name == 'workflow_dispatch'
     needs: gate

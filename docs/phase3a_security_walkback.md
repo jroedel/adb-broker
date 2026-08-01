@@ -200,12 +200,42 @@ possible place to discover a mistake in the thing that makes releases:
    `go version -m` cannot catch it — it records the commit but never `-ldflags`. The only reader
    that can is the binary itself, which is what B built.
 
-**Rehearsed, not yet run on a tag.** Verified from a clean clone at `2eeb8e2`: both artifacts
-build, the amd64 one reports `1.2.0` at that commit with `"modified":false`, and
-`sha256sum -c SHA256SUMS` passes. Both failure arms of the check script were exercised too — a
-version that does not match, and a build from a dirty tree. What has *not* been exercised is
-GitHub's side: the attestation step, `gh release create`, and the ancestry guard all run for the
-first time on the first real tag. Cut it with the dry run first.
+### Run end to end, on `v0.1.0-rc1`
+
+Tagged 2026-08-01 as a shakedown rather than a production release. Every step ran: the ancestry
+guard passed, the gate passed, both artifacts built and were checked, the attestation was
+signed, and `gh release create` published it as a pre-release, so it did not become `latest`.
+
+Verified from the **published assets**, not from the run's own report:
+
+- `sha256sum -c SHA256SUMS` passes for both.
+- The binary reports `{"broker":"0.1.0-rc1","revision":"a336b590…","modified":false}`.
+- `gh attestation verify <file> --repo jroedel/adb-broker` exits 0 for both. SLSA v1 provenance,
+  signed via `token.actions.githubusercontent.com`, naming `.github/workflows/release.yml @
+  refs/tags/v0.1.0-rc1` at `a336b59`. Both binaries are subjects of the one statement.
+
+**The build is reproducible, which is worth more than either mechanism D plans.** A fresh clone,
+`git checkout v0.1.0-rc1`, `make dist VERSION=0.1.0-rc1` — byte-identical to the published
+artifacts, both architectures, on a different machine from the one that built them. Anyone can
+therefore confirm a release's digest from source without trusting GitHub, the attestation, or
+this project. See D, where it becomes a third lever.
+
+**A dry run can never reproduce the tagged build's bytes, and that is not a defect.** The
+rehearsal's amd64 binary was 8 bytes smaller than the release's, with a different digest, at the
+same commit with the same flags. The whole difference is one line of build info:
+
+```
+dry run:  mod github.com/jroedel/adb-broker v0.0.0-20260801151438-a336b590ff9c
+release:  mod github.com/jroedel/adb-broker v0.1.0-rc1
+```
+
+Go derives the main module's version from a VCS tag pointing at HEAD. At rehearsal time no tag
+existed, so it embedded a pseudo-version; the tag is what changes it. **So the dry run validates
+the pipeline, not the digest.** Anyone pre-computing a consumer's embedded SHA-256 from a
+rehearsal gets a value that will never match. Take it from the release.
+
+Before this, verified locally from a clean clone at `2eeb8e2`, including both failure arms of the
+check script — a version that does not match, and a build from a dirty tree.
 
 ---
 
@@ -221,6 +251,16 @@ network access to the transparency log.
 - **Embed the expected SHA-256 for the pinned version in the consumer** — that is what the
   consumer can actually enforce, offline, with nothing but `crypto/sha256`. The digest ships
   *inside* the consumer, never fetched alongside the binary.
+- **A third lever, free, discovered in C's rehearsal: the build is reproducible.** A clean clone
+  at the tag plus `make dist VERSION=<tag without v>` produces the published bytes exactly —
+  verified on `v0.1.0-rc1`, both architectures, on a machine other than the one that built them.
+  That is a stronger statement than either mechanism above, because it needs no trust at all:
+  not in GitHub, not in the signing infrastructure, not in this project. It is not something the
+  consumer can do at install time — it needs a Go toolchain and a checkout — so it does not
+  replace the embedded digest. What it does is let anyone establish, once, that the digest the
+  consumer embeds corresponds to this source. **Where the embedded digest comes from is
+  therefore a settled question: read it from the published `SHA256SUMS`, or reproduce it from
+  the tag. Never from a dry run** — see C for why that can never match.
 
 If shipping broker releases faster than consumer releases ever becomes the constraint, the
 stdlib-only alternative is an Ed25519 (minisign-style) signature with the public key compiled
