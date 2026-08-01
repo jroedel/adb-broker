@@ -4,7 +4,7 @@ A small Go binary that mediates every read of the phone. This document specifies
 consumer needs from it and why, so the broker can be implemented and tested
 independently.
 
-`photos` is the originating consumer — its `foundation/source/adb` adapter satisfies the
+`photos` is the originating consumer — its `foundation/source/adbbroker` adapter satisfies the
 `foundation/source.Reader` port, and nothing above that port knows the broker exists — but
 **the broker is not exclusive to it.** It is a standalone binary in its own repository,
 `github.com/jroedel/adb-broker`, installed once per host and invoked by any number of
@@ -188,8 +188,17 @@ publish two anchor identities and a `verify` run under either sees only its own 
 
 For reference, `photos` locates it in this order and reports clearly if it finds nothing:
 
-1. `source.broker_path` in `photos.yaml`, if set.
-2. `adb-broker` on `PATH`.
+1. `source.broker_path` in `photos.yaml`, if set — which also opts `photos` out of
+   installing or upgrading anything: an explicitly configured path means the user has
+   taken ownership of placement and version.
+2. `~/.local/bin/adb-broker`, the canonical path — the copy `photos` manages under **The
+   consumer install contract**: installed when missing, upgraded in place when older than
+   the release `photos` pins, never downgraded, left alone when current.
+3. `adb-broker` on `PATH`, for a copy someone installed by hand somewhere else. It is
+   used as found and `photos` installs nothing — installing at the canonical path
+   alongside it would create exactly the second copy this section argues against. When
+   copies exist both at the canonical path and elsewhere on `PATH`, `photos` warns that
+   their anchor trails will diverge, because nothing else on the machine will.
 
 Other consumers may do whatever suits them, but a broker found *beside a consumer's own
 executable* — the packaged case an earlier draft specified — remains the arrangement to avoid,
