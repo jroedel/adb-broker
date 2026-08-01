@@ -59,6 +59,11 @@ adb-broker-linux-amd64: OK
 > unmapped uid), defeating the rule that no environment variable can move the log. Reproduced
 > against the published artifact, not merely suspected. `v0.1.0-rc2` is the first usable tag;
 > `zarf/repro-passwd-fallback.sh` distinguishes the two and needs no privileges.
+>
+> Its release and binaries are deleted, and it is `retract`ed in `go.mod` so `go get` and
+> `go install` refuse it with that reason. Neither step is total: the version stays in
+> proxy.golang.org's immutable cache, and its provenance attestation stays in a public
+> transparency log. If you already hold an rc1 binary, replace it.
 
 Two optional checks. The release carries a provenance attestation:
 
