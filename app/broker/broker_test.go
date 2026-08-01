@@ -987,7 +987,20 @@ func TestAnUnopenableAuditLogEndsEverySubcommand(t *testing.T) {
 		{"probe"},
 		{"list", "--root", "/sdcard/DCIM/Camera"},
 		{"fetch", "--path", examplePath},
-		{"verify", "--anchors", "-"},
+
+		// verify needs --log naming the missing path EXPLICITLY, and the other three
+		// must not have it. verify is the one subcommand exempt from the fail-closed
+		// check, so it never calls openAuditLog and the seam runWithLog swaps is invisible
+		// to it: left to itself it resolves auditLogPath() and reads the log of whoever is
+		// running the suite.
+		//
+		// Without the flag this case asserted nothing about this binary. It passed on any
+		// machine where ~/.local/state/adb-broker/audit.log happened not to exist — which
+		// is every machine that has never run a release build, including CI — and failed
+		// the moment one did, reporting "partial" and exit 0 over the host's real log.
+		// Found exactly that way on 2026-08-01, after running a downloaded v0.1.0-rc1
+		// binary on the development host created one.
+		{"verify", "--log", missing, "--anchors", "-"},
 	} {
 		store := newFakeStore()
 

@@ -37,10 +37,45 @@ The broker arranges none of these and fails loudly on each:
 
 No root, no service account, no install script.
 
+### From a release
+
+Linux, `amd64` and `arm64`. Substitute the version you want — pin one, don't track `latest`.
+
+```sh
+curl -fsSLO https://github.com/jroedel/adb-broker/releases/download/v0.1.0-rc1/adb-broker-linux-amd64
+curl -fsSLO https://github.com/jroedel/adb-broker/releases/download/v0.1.0-rc1/SHA256SUMS
+sha256sum --ignore-missing -c SHA256SUMS
+install -D -m 0755 adb-broker-linux-amd64 ~/.local/bin/adb-broker
+adb-broker version
+```
+
+```
+adb-broker-linux-amd64: OK
+{"proto":1,"status":"ok","broker":"0.1.0-rc1","revision":"a336b590ff9c3fb9dbfb3505ee1756b4f8ed2382","modified":false}
+```
+
+Two optional checks. The release carries a provenance attestation:
+
+```sh
+gh attestation verify adb-broker-linux-amd64 --repo jroedel/adb-broker
+```
+
+and the build is reproducible — clone the repo, `git checkout v0.1.0-rc1`, `make dist
+VERSION=0.1.0-rc1`, and you get the published bytes exactly. That one requires trusting nobody
+at all, which is why it is worth knowing about even if you never run it.
+
+There is no macOS or Windows build. Windows does not compile; macOS is left out deliberately,
+because it has no journald and the audit anchor would silently never publish — leaving a broker
+whose tamper-evidence is absent while everything still reports success.
+
+### From source
+
 ```sh
 make build
 install -D -m 0755 bin/adb-broker ~/.local/bin/adb-broker   # or: make install
 ```
+
+### Either way
 
 **Install it at exactly one path.** Every audit anchor carries the publishing binary's
 journald-stamped `_EXE`, and `verify` accepts only anchors bearing the running binary's own
@@ -51,6 +86,12 @@ consumer's own executable.
 
 Discovery is the consumer's concern. `photos`, the originating consumer, looks at
 `source.broker_path` in its config, then `adb-broker` on `PATH`.
+
+**If your consumer installs the broker itself** rather than asking the user to, there is a short
+contract it has to follow — one canonical path, an exact pinned version, an embedded SHA-256
+verified before an atomic `rename(2)` into place, a refusal to downgrade, and a `probe` straight
+afterwards. Each rule is there because breaking it fails silently. It is specified in
+[`docs/ADB_BROKER.md`](docs/ADB_BROKER.md) → **The consumer install contract**.
 
 On first run the binary creates its own audit log at
 `~/.local/state/adb-broker/audit.log` (`0600`, in a `0700` parent) and anchors the empty

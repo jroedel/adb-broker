@@ -199,6 +199,16 @@ copies append to the same per-uid log, and only their anchors diverge. Nothing e
 `verify` under either path reports a log longer than that path's own anchors claim — which is
 the one outcome the tool treats as unremarkable (see **Fail closed**). One installed path.
 
+**The one-path rule gained a second consumer on 2026-08-01, and it is not the same argument.**
+Until then this was about discovery: wherever a consumer *finds* the binary, there must be only
+one of it. A consumer that *installs* the binary is a stronger case, because it can create the
+second copy rather than merely stumble on one — and because two consumers now share the file.
+Hence rules 1, 4 and 5 of **The consumer install contract**: one canonical path, an atomic
+replacement so a half-written binary is never at it, and a refusal to downgrade so two consumers
+pinning different versions do not flip it under each other. Anchors carry the publishing binary's
+`_EXE`, which is a path and not a hash, so upgrading in place at a stable path keeps one anchor
+identity across every version — the property all three rules exist to preserve.
+
 ---
 
 ## Transport
@@ -2034,6 +2044,93 @@ install -D -m 0755 bin/adb-broker ~/.local/bin/adb-broker
 
 `make install` is exactly that and needs no privilege. There is no `make verify-install`
 any more, because there are no install-time properties left to check.
+
+### Installing from a release
+
+Tagged releases publish `adb-broker-linux-amd64`, `adb-broker-linux-arm64` and a `SHA256SUMS`,
+plus a provenance attestation. **Linux only, `amd64` and `arm64`.** Windows does not compile
+(`syscall.SYS_FCNTL`). macOS is excluded on purpose rather than pending: it compiles and runs,
+but there is no journald, so the anchor write fails — and that failure is by design non-fatal,
+so every read would succeed while the only remaining tamper-evidence control was silently
+absent, and `verify` would then report `no anchors found` → `"status":"partial"` → exit `0`,
+which is the result that reads as a pass. A macOS artifact would ship a broker whose audit story
+is quietly gone. Supporting it needs a decision on purpose — a different anchor sink, or an
+explicit refusal to run where it cannot anchor — not a build matrix entry.
+
+```
+curl -fsSLO https://github.com/jroedel/adb-broker/releases/download/vX.Y.Z/adb-broker-linux-amd64
+curl -fsSLO https://github.com/jroedel/adb-broker/releases/download/vX.Y.Z/SHA256SUMS
+sha256sum --ignore-missing -c SHA256SUMS
+install -D -m 0755 adb-broker-linux-amd64 ~/.local/bin/adb-broker
+```
+
+Two further checks, neither required to install and both worth knowing exist:
+
+```
+gh attestation verify adb-broker-linux-amd64 --repo jroedel/adb-broker
+```
+
+names the workflow, ref and commit the artifact was built by. And the build is **reproducible** —
+a clean clone at the tag plus `make dist VERSION=X.Y.Z` produces the published bytes exactly,
+verified on `v0.1.0-rc1` for both architectures on a machine other than the one that built them.
+That is the strongest of the three, because it requires trusting nobody: not GitHub, not the
+signing infrastructure, not this project. It is also the one nobody runs, which is why the digest
+is what the contract below actually mandates.
+
+### The consumer install contract
+
+Normative, for a consumer that installs the broker for its user rather than asking them to.
+`photos` is the originating one; these rules bind any of them. Each exists because getting it
+wrong fails *quietly* — none of these produces an error at the time.
+
+1. **One canonical path, `~/.local/bin/adb-broker`, shared by every consumer.** Never a private
+   copy beside a consumer's own executable. See **Discovery**, where the reason is argued: two
+   copies split the anchor trail in two and nothing errors.
+
+2. **Pin an exact version. Never `latest`.** The consumer owns the `proto` check, and pinning is
+   what makes that check mean anything — a floating version can change `proto` under a consumer
+   that has already decided it is compatible.
+
+3. **Embed the expected SHA-256 for the pinned version, and verify before installing.** The
+   digest ships *inside* the consumer, never fetched alongside the binary; a digest downloaded
+   from the same place as the artifact is a checksum, not a control. Verification needs nothing
+   but `crypto/sha256`, works offline, and is the only one of the three mechanisms above a
+   consumer can perform at install time.
+
+   Take the digest from the published `SHA256SUMS`, or reproduce it from the tag. **Never from a
+   dry run of the release workflow** — Go derives the main module's version from a VCS tag
+   pointing at HEAD, so the same commit built before and after tagging embeds a different `mod`
+   line and hashes differently. Measured on `v0.1.0-rc1`: 8 bytes, and everything else in the
+   build info identical.
+
+4. **Install atomically.** Download to a temporary file *in the destination directory*, verify
+   the digest, `chmod 0755`, then `rename(2)` into place. Never write the final path directly: a
+   consumer interrupted mid-download otherwise leaves a truncated binary at the path every other
+   consumer on the machine executes.
+
+5. **Refuse to downgrade.** Read what is already there with `adb-broker version` — that
+   subcommand exists for this, and answers with no device and no audit log, which matters
+   because the copy in place may have been installed by another consumer on a host that has
+   never run it. A digest comparison cannot substitute: a mismatch says *different*, never
+   *older*. Two consumers pinning different versions must not flip the binary under each other.
+
+6. **Run `probe` immediately after installing**, and surface `no_adb_server` and `unauthorized`
+   with instructions. This carries more weight than it looks. The broker neither ships nor
+   locates `adb`, so both host preconditions are entirely the user's to satisfy, and they are
+   the ones that cost the most time when wrong — particularly that USB-debugging authorization
+   is per *adb-server RSA key*, i.e. per account, and misreads as "USB debugging is off".
+
+What the contract deliberately does **not** ask for: verifying the attestation at install time.
+Doing so means either shelling out to `gh` — not present on an end-user machine — or linking
+`sigstore-go`, and it needs network access to a transparency log. It is the right thing to
+*publish* and the wrong thing to depend on. If shipping broker releases faster than consumer
+releases ever becomes the binding constraint, the stdlib-only alternative is an Ed25519
+(minisign-style) signature with the public key compiled into the consumer, verified with
+`crypto/ed25519`, at the cost of managing a signing key in Actions secrets.
+
+**None of this survives the binary being overwritten afterwards.** The installed file and the
+account that could replace it are the same uid; `THREAT_MODEL.md` §4.4 T34 accepts that
+explicitly, and no install-time check has anything to say about it.
 
 ### What was withdrawn, and why
 

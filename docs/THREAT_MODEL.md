@@ -83,7 +83,9 @@ Availability is deliberately **not** on this list. See §7.1.
                              └─────────┘
 ```
 
-Four boundaries, and it is worth being explicit about which are enforced by what:
+Five boundaries, and it is worth being explicit about which are enforced by what. The fifth is
+new on 2026-08-01 and exists only because the binary is now downloaded rather than compiled by
+whoever runs it:
 
 | Boundary | Enforced by | Strength |
 |---|---|---|
@@ -91,6 +93,7 @@ Four boundaries, and it is worth being explicit about which are enforced by what
 | Broker → phone | The adb sync service vocabulary the broker will emit | Compiled constant, not convention |
 | Broker → audit log | Nothing, since 2026-08-01. The broker and the log's owner are the same account | **Not a boundary.** Was two independent kernel-enforced controls; see §5.5 |
 | Audit log → tamper detection | Hash chain + journald anchor | Detection, not prevention — and not against the backup account itself |
+| Release artifact → installed binary | An embedded SHA-256 the consumer checks before installing; a provenance attestation and a reproducible build for anyone auditing after the fact | Detection at install time only. Nothing revisits the file afterwards — see §4.4, T34 |
 
 The third row used to read *separate uid, `chattr +a`, root-owned parent directory*. That
 install was withdrawn (`ADB_BROKER.md` → **Installation**), and the row is left in place
@@ -171,6 +174,25 @@ This is a real adversary, not a hypothetical, and it is the one the volume pin a
 symlink refusal exist for. A broker that validated only the requested path string and read
 whatever came back would have an allowlist that any app on the device could step around.
 
+### A5 — Whoever controls the release artifact
+
+New on 2026-08-01, and new because the software changed rather than because the analysis
+improved. Until tagged releases existed, every operator compiled the binary from a checkout they
+could read, and the only way to ship them different code was to change the source. That is the
+premise §6.6 rested on, and it is gone: the consumer is now told to download a binary it did not
+build, from a host neither it nor this project controls.
+
+The adversary is anyone who can put bytes where a consumer will fetch them — a compromised
+maintainer account, a compromised Actions runner, a GitHub-side compromise, or anything on the
+network between the release and the download.
+
+What makes this adversary worth its own entry rather than a footnote to A2 is *reach*. A2b can
+already overwrite the installed binary on one host, having got onto it. A5 substitutes code on
+**every** host that installs, before any of them has been touched, and the substituted binary is
+subject to none of the controls in this document — it is the thing that was supposed to enforce
+them. Every threat in §4 is answered by code, so an adversary who chooses the code answers
+nothing.
+
 ### A4 — The environment, behaving badly without malice
 
 A replug that renumbers the transport, a storage remount that reassigns `dev`, an adb
@@ -240,6 +262,18 @@ allowlist plus the volume pin — carrying more than it was credited with.
 | T30 | A fixture binary in a production path bypasses the allowlist | Fixture mode is behind a build tag, absent from the release binary, produces a differently-named binary, and reports a `+fixture` version visible in the first `probe` and in the audit log | judgement | The allowlist still applies to virtual paths, so a fixture binary is not itself an escape — only a remap |
 
 ---
+
+### 4.4 The binary itself
+
+New with A5. The asset here is not the phone, the log or the archive — it is the code that
+protects all three, so a threat that lands here defeats §4.1 through §4.3 at once without
+touching any of them.
+
+| # | Threat | Control | Evidence | Residual |
+|---|---|---|---|---|
+| T32 | The published artifact is not what this source builds — a substituted binary, or a compromised runner | **Reproducibility.** A clean clone at the tag plus `make dist VERSION=<tag>` produces the published bytes exactly, so anyone can rebuild and compare without trusting the publisher. Plus a signed SLSA v1 provenance attestation binding each artifact to the workflow, ref and commit that produced it; plus the release workflow's own guards — the tag must descend from `main`, and `check-artifact.sh` refuses to publish a binary that misreports its version, its commit, or a clean tree | **measured, 2026-08-01 on `v0.1.0-rc1`** — rebuilt from a fresh clone on a different machine, byte-identical for both architectures; `gh attestation verify` exits 0 for both and names `.github/workflows/release.yml @ refs/tags/v0.1.0-rc1` at `a336b59` | **Detection, and only if someone looks.** Neither control fires by itself. The attestation proves *where a binary came from*, never that the source it came from is honest — an adversary who commits to `main` gets a perfectly valid attestation. Reproducibility is the stronger of the two precisely because it needs no trust, and the weaker in practice because nobody runs it |
+| T33 | A consumer installs a different artifact than the one it was written against — a substitution in transit, or version drift | The consumer embeds the expected SHA-256 for the **pinned** version and verifies before installing, offline, with nothing but `crypto/sha256`. Never `latest`. See `ADB_BROKER.md` → **The consumer install contract** | judgement | The digest ships inside the consumer, so an adversary who can edit the consumer defeats it — but that adversary has no need of the broker. TLS is *not* relied on here |
+| T34 | The installed binary is replaced after it is installed | **None.** | — | **None, deliberately.** This is A2b, and §5.5 already accepts it: the binary and the account that could overwrite it are the same uid. A digest checked at install time says nothing about the file a minute later |
 
 ## 5. Where controls stop
 
@@ -550,12 +584,32 @@ appending to the audit log.
 The broker is a read-only client that a caller can invoke in a loop. Nothing rate-limits it,
 and nothing needs to: the caller already has whatever access it would abuse.
 
-### 6.6 Supply chain
+### 6.6 Supply chain — no longer wholly out of scope
 
-Nothing in the design verifies that the installed binary was built from reviewed source —
-no signature, no reproducible build, no attestation. "Widening the allowlist requires
-editing the source and rebuilding, which is a reviewable, attributable act" is a claim about
-process, not a control the binary enforces. See §8.2.
+**This section said the opposite until 2026-08-01, and it was not wrong when written.** It read:
+"Nothing in the design verifies that the installed binary was built from reviewed source — no
+signature, no reproducible build, no attestation." All three clauses are now false. Tagged
+releases publish a SLSA v1 provenance attestation, and the build reproduces byte-for-byte from a
+clean clone at the tag (measured on `v0.1.0-rc1`). The old text is quoted rather than deleted
+because what changed is the software, not the analysis: until releases existed, every operator
+compiled from a checkout they could read, and there was nothing for a supply-chain control to
+protect.
+
+What is in scope now is A5 and T32–T34 in §4.4. What remains out of scope:
+
+- **The toolchain and the runner.** A compromised Go toolchain, a compromised GitHub-hosted
+  runner image, or a compromised `actions/*` action produces a correctly attested artifact. The
+  actions are pinned to major versions, not digests, which is a deliberate cost/benefit choice
+  and not a claim that it is safe.
+- **Whether the source is honest.** No control here distinguishes reviewed source from source an
+  adversary committed. That is what §8.2 is about and it is unchanged — provenance answers
+  *where a binary came from*, never *whether the thing it came from should be trusted*.
+- **The consumer's own supply chain.** The embedded digest is only as good as the consumer
+  binary carrying it.
+
+So the honest summary is narrower than "we do supply chain now": a release can be tied to a
+commit and a workflow, and independently rebuilt by anyone who cares to. Nothing forces anyone
+to check either, and nothing vouches for the commit.
 
 ### 6.7 Confidentiality of the audit log
 

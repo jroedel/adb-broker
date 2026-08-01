@@ -73,8 +73,8 @@ purpose: a different anchor sink, or an explicit refusal to run where it cannot 
 | `foundation/adbwire` test flake | **Fixed**, `9f59ce0` — the gate is trustworthy, which C depends on |
 | **B** — version identity | **Done**, `7db15f7` |
 | **C** — release workflow | **Done**, `2eeb8e2` — rehearsed locally, not yet run on a tag |
-| **D** — consumer install contract | **Not started. Do this next.** |
-| **E** — docs | Not started; do with D |
+| **D** — consumer install contract | **Specified**, `ADB_BROKER.md` → *The consumer install contract*. Not implemented — the consumer is a separate repository |
+| **E** — docs | **Done** — `README.md`, `ADB_BROKER.md`, `THREAT_MODEL.md` |
 
 ---
 
@@ -239,7 +239,17 @@ check script — a version that does not match, and a build from a dirty tree.
 
 ---
 
-## D — the consumer-side install contract
+## D — the consumer-side install contract. Specified; not implemented
+
+**The contract now lives in `docs/ADB_BROKER.md` → *The consumer install contract*, which is
+the normative copy.** What follows is the reasoning that produced it, kept here rather than
+duplicated there.
+
+**Scope, decided 2026-08-01:** the contract is written down in this repository and implemented
+in none. The consumer is `photos`, a separate repository, whose `foundation/source/adbbroker`
+adapter today runs a broker it locates via `broker_path` or `PATH` and installs nothing. Writing
+the contract here first is deliberate: it binds *any* consumer, and a rule that exists only as
+one implementation is not a contract. Implementing it in `photos` is its own piece of work.
 
 **Both verification mechanisms, because they do different jobs.** Attestations are the right
 thing to *publish* but a poor fit for what a consumer does at runtime: verifying one means either
@@ -292,14 +302,28 @@ The rest of the contract:
 
 ---
 
-## E — docs
+## E — docs. Done
 
-- `README.md`: an "Install from a release" section plus the consumer install contract.
-- `docs/ADB_BROKER.md`: **Installation** currently says build it and put it on `PATH`; the
-  release path needs adding, and **Discovery**'s one-path argument gains a second consumer.
-- `docs/THREAT_MODEL.md`: a new adversary — **whoever controls the release artifact** — with what
-  a digest and an attestation each buy, and explicitly what they do not: neither defends against
-  the same-uid adversary overwriting the installed binary afterwards, which §5.5 already accepts.
+- `README.md`: an **Install → From a release** section, with the commands and their output as
+  observed against `v0.1.0-rc1`, and a pointer to the contract for consumers that install the
+  broker themselves.
+- `docs/ADB_BROKER.md`: **Installation** gained *Installing from a release* and *The consumer
+  install contract* — the normative copy of D. **Discovery**'s one-path argument gained its
+  second consumer, and it is a different argument: discovery is about not stumbling on a second
+  copy, installation is about not *creating* one.
+- `docs/THREAT_MODEL.md`: **A5 — whoever controls the release artifact**, a fifth trust
+  boundary, and **§4.4 The binary itself** with T32–T34. The asset there is the code that
+  enforces every other control, so a threat landing on it defeats §4.1–§4.3 at once.
+
+**§6.6 had to be rewritten rather than extended, and that is the part worth remembering.** It
+read: "Nothing in the design verifies that the installed binary was built from reviewed source —
+no signature, no reproducible build, no attestation." All three clauses became false the moment
+C shipped. It was not wrong when written — until releases existed, every operator compiled from
+a checkout they could read, and there was nothing for a supply-chain control to protect. A
+threat model has out-of-scope sections that quietly expire when the software changes shape, and
+this one expired without anyone editing it. The rewrite quotes the old text rather than deleting
+it, and states the narrower truth: a release can be tied to a commit and a workflow and
+independently rebuilt, nothing forces anyone to check either, and nothing vouches for the commit.
 
 ---
 
@@ -332,6 +356,24 @@ people usually check.
 than the binary itself, the binary has to be able to say it out loud. Otherwise the stamp is
 only a comment.
 
+**4. A fail-closed test was passing for the wrong reason, on every machine.**
+`TestAnUnopenableAuditLogEndsEverySubcommand` drives four subcommands against a log path that
+cannot be opened. Three of them go through the `openAuditLog` seam the test swaps. The fourth,
+`verify`, is the one subcommand exempt from the fail-closed check — so it never calls that seam,
+the swap is invisible to it, and it resolved `auditLogPath()` and read **the log of whoever was
+running the suite**. The case asserted nothing about this binary. It passed because
+`~/.local/state/adb-broker/audit.log` does not exist on a machine that has never run a release
+build, which is every CI runner and was every development host.
+
+Installing `v0.1.0-rc1` and running `probe` created one, and the test failed immediately —
+`"partial"`, exit 0, over the host's real log. Fixed by passing `--log` explicitly, and
+mutation-tested by removing it again. No other test invokes `verify` without `--log`.
+
+**Rule of thumb this leaves behind:** a test that substitutes a seam proves nothing about the
+code path that does not use that seam. `verify`'s exemption is documented in three places and
+was still missed here, because the test *looked* uniform — four rows in one table, one of them
+quietly testing the host instead.
+
 ---
 
 ## Open questions
@@ -357,5 +399,10 @@ only a comment.
 - The normative contract is `docs/ADB_BROKER.md`. `README.md` is the consumer-facing guide and
   was written by running the binary rather than transcribing the spec, so where it gives an
   example, that example was observed.
-- Next action: **D**, with **E**. Before either, run the release workflow's `workflow_dispatch`
-  dry run once: C is rehearsed locally but nothing in it has met GitHub yet.
+- Next action: **implement the install contract in `photos`.** A through E are done in this
+  repository; `ADB_BROKER.md` → **The consumer install contract** is the specification to build
+  against, and `foundation/source/adbbroker` is where it lands. Nothing in this repository is
+  blocking it.
+- Still open from A: the `$HOME` fallback is source-derived and has never been reproduced at
+  runtime. `docker run -u 4242` on a normal host is the way; user namespaces are denied in this
+  sandbox, confirmed again on 2026-08-01 when a browser launch failed the same way.
