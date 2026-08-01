@@ -89,24 +89,89 @@ func TestDeadlineFor(t *testing.T) {
 	})
 }
 
-// pipeWith returns a connection whose peer has already sent b and then closed.
-func pipeWith(t *testing.T, b []byte) net.Conn {
+// peerWith returns a connection whose peer has already sent b and stays open until the test
+// ends. peerClosedAfter is the same, with the peer closed once the write is done.
+//
+// # Why these are real sockets and not net.Pipe
+//
+// They were net.Pipe, and that made two of these tests race the code under test.
+//
+// net.Pipe is unbuffered — Write blocks until the reader has consumed the last byte — and its
+// SetDeadline methods return io.ErrClosedPipe the moment EITHER end is closed. This package
+// arms a deadline before every single read, in readFull, because the specification requires one
+// on every exchange. So a net.Pipe peer that closed was racing the reader's next SetReadDeadline
+// call, and whichever won decided the result: the reader either saw the EOF it was written to
+// expect, or a spurious "read/write on closed pipe" wrapped as a protocol violation.
+//
+// Measured before the change: TestReadHostPayloadZeroLength failed 7 times in 300 runs under
+// -race and 0 times in 300 without it. Merely moving the close — keeping net.Pipe but closing
+// only for the tests that need it — relocated the same failure to
+// TestReadHostStatusSilentClose, where the close lands before the reader arms anything at all.
+// That second attempt is what showed the fixture could not be arranged out of the problem:
+// under a mandatory-deadline reader, net.Pipe has no ordering in which a closed peer is safe.
+//
+// No socket behaves that way, so no adb server could ever have produced the failure. Measured on
+// loopback: SetReadDeadline succeeds after the peer has closed, bytes written before the close
+// remain readable, and EOF arrives only once they are exhausted.
+//
+// That last property is what makes these fixtures deterministic rather than merely less racy.
+// The peer writes and closes SYNCHRONOUSLY, before the reader runs at all — the kernel holds the
+// bytes and queues the FIN — so there is no goroutine here and no interleaving left to lose.
+//
+// b must fit the socket's send buffer, which every fixture in this file does by three orders of
+// magnitude. A large one would block the synchronous write.
+func peerWith(t *testing.T, b []byte) net.Conn {
 	t.Helper()
 
-	client, server := net.Pipe()
+	return newPeer(t, b, false)
+}
 
-	t.Cleanup(func() {
-		_ = client.Close()
-		_ = server.Close()
-	})
+// peerClosedAfter returns a connection whose peer sends b and then closes. It is the fixture for
+// the tests that assert on the close itself: a peer that replies nothing at all, and a payload
+// shorter than the length prefix promised.
+func peerClosedAfter(t *testing.T, b []byte) net.Conn {
+	t.Helper()
 
-	go func() {
-		if len(b) > 0 {
-			_, _ = server.Write(b)
+	return newPeer(t, b, true)
+}
+
+// newPeer is the shared body of the two fixtures above.
+func newPeer(t *testing.T, b []byte, closeAfterWriting bool) net.Conn {
+	t.Helper()
+
+	// Loopback, which is also what the production dialler talks to — 127.0.0.1:5037. Port 0
+	// lets the kernel choose, so concurrent packages cannot collide on one.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen on loopback for the fixture peer: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	client, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial the fixture peer: %v", err)
+	}
+
+	t.Cleanup(func() { _ = client.Close() })
+
+	server, err := ln.Accept()
+	if err != nil {
+		t.Fatalf("accept the fixture peer: %v", err)
+	}
+
+	t.Cleanup(func() { _ = server.Close() })
+
+	if len(b) > 0 {
+		if _, err := server.Write(b); err != nil {
+			t.Fatalf("write the fixture reply %q: %v", b, err)
 		}
+	}
 
-		_ = server.Close()
-	}()
+	if closeAfterWriting {
+		if err := server.Close(); err != nil {
+			t.Fatalf("close the fixture peer: %v", err)
+		}
+	}
 
 	return client
 }
@@ -114,7 +179,7 @@ func pipeWith(t *testing.T, b []byte) net.Conn {
 // TestReadHostStatusRejectsUnknownToken keeps a reply that is neither OKAY nor
 // FAIL from being read as either.
 func TestReadHostStatusRejectsUnknownToken(t *testing.T) {
-	nc := pipeWith(t, []byte("WHAT0000"))
+	nc := peerWith(t, []byte("WHAT0000"))
 
 	_, err := readHostStatus(t.Context(), nc, svcVersion)
 	if !errors.Is(err, ErrProtocol) {
@@ -129,7 +194,8 @@ func TestReadHostStatusRejectsUnknownToken(t *testing.T) {
 // TestReadHostStatusSilentClose is the measured empty reply: zero bytes read is
 // not a FAIL, and the error must say so rather than carrying an empty message.
 func TestReadHostStatusSilentClose(t *testing.T) {
-	nc := pipeWith(t, nil)
+	// The close IS the reply here, so this is one of the two fixtures that must perform it.
+	nc := peerClosedAfter(t, nil)
 
 	_, err := readHostStatus(t.Context(), nc, svcVersion)
 	if !errors.Is(err, ErrProtocol) {
@@ -143,7 +209,7 @@ func TestReadHostStatusSilentClose(t *testing.T) {
 
 // TestReadHostPayloadNonHexLength covers a length prefix that is not hex.
 func TestReadHostPayloadNonHexLength(t *testing.T) {
-	nc := pipeWith(t, []byte("zzzz"))
+	nc := peerWith(t, []byte("zzzz"))
 
 	_, err := readHostPayload(t.Context(), nc, svcVersion)
 	if !errors.Is(err, ErrProtocol) {
@@ -158,7 +224,7 @@ func TestReadHostPayloadNonHexLength(t *testing.T) {
 // TestReadHostPayloadZeroLength is the empty-device-list shape: a zero length is
 // a real, successful reply.
 func TestReadHostPayloadZeroLength(t *testing.T) {
-	nc := pipeWith(t, []byte("0000"))
+	nc := peerWith(t, []byte("0000"))
 
 	got, err := readHostPayload(t.Context(), nc, svcDevices)
 	if err != nil {
@@ -173,7 +239,9 @@ func TestReadHostPayloadZeroLength(t *testing.T) {
 // TestReadHostPayloadTruncated covers a server that closes part-way through its
 // reply, which is a different failure from closing before it.
 func TestReadHostPayloadTruncated(t *testing.T) {
-	nc := pipeWith(t, []byte("0010short"))
+	// The other fixture that must close: the reader is left waiting for the 11 bytes the prefix
+	// promised and did not arrive, and the close is what turns that wait into an EOF.
+	nc := peerClosedAfter(t, []byte("0010short"))
 
 	_, err := readHostPayload(t.Context(), nc, svcDevices)
 	if !errors.Is(err, ErrProtocol) {
