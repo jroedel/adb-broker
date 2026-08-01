@@ -1,13 +1,30 @@
-# Phase 3 — Device Findings
+# Device Findings
 
-First contact between the built binary and real hardware. Measured 2026-07-31 against the
-target phone, using the compiled Go implementation rather than the Python prototype that
-produced `adb_experiment.md`.
+**What real hardware has shown this binary, across every run that has met a phone.** Not a
+phase artifact: this file outlives the plan that started it, and each new run appends rather
+than replaces. It was `phase3_device_findings.md` until 2026-08-01, and the rename is the point
+— phase 3 was simply the first time anything here ran against a device, not the reason the
+record exists.
 
-Device serials are truncated throughout, per the standing rule.
+Measured against the compiled Go implementation, not the Python prototype that produced
+`adb_experiment.md`. Device serials are truncated throughout, per the standing rule.
 
-**Result: 31 of 33 device-tagged tests passed, one failed, one skipped — and both of the
-latter are findings rather than bugs.**
+Sections are numbered chronologically across runs and never renumbered, so a citation from
+elsewhere in the tree keeps pointing at the thing it cited.
+
+| Run | Sections | Outcome |
+|---|---|---|
+| **2026-07-31** — first contact | §1–§7 | 31 of 33 device tests passed, one failed, one skipped; both of the latter findings rather than bugs |
+| **2026-07-31** — Stage 2, the install | §8 | The two audit controls worked and **the anchor silently did not**; the finding that later justified withdrawing the setuid install |
+| **2026-07-31** — two unmeasured numbers | §9 | journald retention, and the linear `verify` walk |
+| **2026-08-01** — the release artifact meets the phone | §10 | All device tests pass; the published `v0.1.0-rc3` binary exercised end to end; one test found to skip on a false negative |
+
+**A standing caution this file has now earned twice.** Findings here are measurements of *a
+phone at a moment*, and a phone changes under you. §4 recorded that no zero-byte file existed;
+§10 found one. §5 measured 20,555 files under DCIM; §10 measured 20,565. Neither is a
+contradiction — both are true of the day they were taken — but a claim about device *contents*
+should never be read as permanent, and a test that depends on one will decay. The claims worth
+trusting here are the ones about *protocol behaviour*.
 
 ---
 
@@ -78,6 +95,10 @@ visible if it ever stops existing.
 
 ## 4. No zero-byte file exists any more
 
+> **Superseded by §10 (2026-08-01), in both of its claims.** A zero-byte file exists again, and
+> the skip below was *not* caused by its absence — the walk's `maxFiles` bound stops before
+> reaching it. Kept as written because the reasoning in the last paragraph is what §10 confirms.
+
 `TestDeviceRecvZeroByteFileProducesNoData` **skipped**: "no zero-byte regular file found under
 the allowlist roots in a bounded walk".
 
@@ -89,6 +110,9 @@ fixture tests, where a zero-byte file is constructed deliberately instead of hop
 Worth noting because it is a general lesson about this manifest: **a test that depends on a
 particular file existing on someone's phone is a test that decays.** The ones that survived are
 the ones that assert protocol properties.
+
+*"Deleted between runs, or outside this walk's bound" was right to offer both, and the
+disjunction was never resolved. §10 resolves it: the second.*
 
 ## 5. Enumeration and per-invocation cost, measured
 
@@ -383,3 +407,98 @@ library the walk is a non-issue (sub-second), but the *design* choice to run rot
 just of one archive run, and 3-4 minutes at one year is the kind of number that should be in the
 design rather than left as "unmeasured," since it is the point at which an operator running
 `verify` interactively would start to notice the wait.
+
+---
+
+## 10. Run of 2026-08-01 — the release artifact meets the phone
+
+Two things happened here that had not before: every device-tagged test ran green, and a
+**published release binary** — `v0.1.0-rc3`, downloaded from GitHub rather than built locally —
+was driven end to end against real hardware. Device: Pixel 8 Pro (`husky`), `adb 1.0.41`.
+
+### 10.1 All device tests pass
+
+19 device-tagged tests across `foundation/adbwire` and `business/domain/device/stores/adbsyncdb`,
+all passing, one skipped (§10.4). The failure recorded in the 2026-07-31 run is gone; the
+substantive assertions — all six roots present, no regular files at depth one, no symlinks below
+the roots, `Lstat` not following a symlink while `Stat` does, `LST2`/`STAT_V2` gating, and fetch
+digests matching a re-read — held.
+
+### 10.2 The published binary, end to end
+
+Every step run against `v0.1.0-rc3` as downloaded, not as compiled here.
+
+| Operation | Result |
+|---|---|
+| `probe` | `"status":"ok"`, `attached_devices:1`, all six roots reported, `adb 1.0.41` |
+| `list --root /sdcard/DCIM --max-depth 1` | **0 files** — consistent with §3, and with the "`--max-depth 1` is a trap" note in `README.md` |
+| `list --root /sdcard/DCIM` | **20,565 files in 6 s**, `"status":"ok"`, zero path errors |
+| `fetch` a zero-byte file | header `size:0`, trailer present, `sha256` = the empty-input digest |
+| `fetch` a 3,527,065-byte photo | **122 ms**, digest verified independently against the payload, JPEG magic intact |
+| `list --root /data/data` | `path_denied`, exit 1 |
+| `verify --anchors -` | `"status":"ok"`, 16 records, anchor seq 16 matching the head hash |
+
+**The listing summary's `files` count matched the records that preceded it exactly** — 20,566
+stdout lines, 20,565 records plus one summary. That is the contract property a consumer compares
+against, asserted here against real output rather than a fixture.
+
+**`denyBeforeBus` works on hardware.** The `/data/data` refusal is recorded at seq 16 with
+`decision=deny`, `result=path_denied`, and a zeroed volume — a refusal at the flag boundary that
+never reached the Business layer and that no decorator on the bus could have seen. It anchored
+too: `verify` covers seq 16.
+
+**`verify` returned `ok`, not `partial`, across a log written by four different binaries** —
+locally built ones, the withdrawn `v0.1.0-rc1`, and `v0.1.0-rc3` from three different paths.
+That was not the prediction, and the reason is worth recording because it clarifies what `_EXE`
+filtering actually costs: only the *most recent* anchor has to bear the running binary's path.
+rc3 wrote the last records and anchored the chain head, so the truncation check covered all 16
+regardless of who wrote seqs 1–10. A second binary at a second path splits the *anchor* trail,
+not the chain, and `verify` run from the path that most recently anchored still sees a complete
+picture.
+
+### 10.3 The library has grown, slightly
+
+| | 2026-07-31 (§5) | 2026-08-01 | Δ |
+|---|---|---|---|
+| `/sdcard/DCIM` files | 20,555 | 20,565 | +10 |
+| `/sdcard/DCIM` wall clock | 6.95 s | ~6 s | — |
+
+Ten photos in a day, on a phone in ordinary use. The point is not the number: it is that **§5's
+per-root figures are a snapshot and will drift**, and any test or budget keyed to them decays the
+same way §4's zero-byte file did.
+
+Largest file under DCIM: **5,333,190,049 bytes** (5.33 GB), still there — §2's no-fallback
+argument still has its witness. Total under DCIM alone: **142.8 GB**.
+
+### 10.4 A test that skips on a false negative
+
+`TestDeviceRecvZeroByteFileProducesNoData` skipped again, with the same message — and this time
+the message is wrong. **A zero-byte file does exist**: `/sdcard/DCIM/Camera/IMG_9446.JPG`,
+exactly one on the device.
+
+The cause is the search, not the phone. The test calls
+`collectDeviceFiles(t, ctx, sc, 8, 3000)` — depth 8, and a hard cap of **3,000 files**. The
+zero-byte file is **record #7,838** of 20,565 in walk order, so the cap stops 4,838 files short
+of it. A full listing finds it in six seconds (§10.2).
+
+This is worse than a skip that is merely unlucky, because of how it reads. *"No zero-byte
+regular file found under the allowlist roots"* states a fact about the device; what happened is
+that the search gave up early. A skip presents as "not applicable here" rather than "I stopped
+looking", so the test has been silently not running on a device where it would pass.
+
+Not urgent — the zero-`DATA` path is covered by unit and fixture tests, and §10.2 exercised it
+on this exact hardware through `fetch`. The fix is to search for what the test needs rather than
+collect a fixed prefix and filter it: stop at the first zero-byte file, or exhaust the tree.
+Left undone deliberately, and recorded here so the next reader does not re-derive it.
+
+**The general form, which is the part to keep:** a bounded search whose bound is not part of its
+failure message reports "absent" when it means "not reached". §4 read that skip as a fact about
+the phone for a day short of five months.
+
+### 10.5 Host preconditions, confirmed again
+
+§7 said USB debugging authorization is per adb-server RSA key and misreads as something else.
+Confirmed: the device enumerated as `unauthorized` until the on-device dialog was accepted, and
+the broker reported `"code":"unauthorized"` with adb's own guidance carried through in the
+message. `transport_id` changed 10 → 11 across the authorization while the serial held —
+the identity property §7's neighbours rely on, observed for free.

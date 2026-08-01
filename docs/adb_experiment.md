@@ -852,4 +852,4 @@ Ranked by how much they alter the design rather than the code.
   completed `RECV` followed by another command on the same channel, which succeeded. A wrong
   width would have left stray bytes and desynced the *next* operation rather than failing the
   current one — the same shape as the Phase 5 desync, a confident wrong answer on the following
-  command. See `phase3_device_findings.md`.
+  command. See `DEVICE_FINDINGS.md`.

@@ -78,7 +78,7 @@ The phone may not be available later, so this leads.
 4. Attempt the two remaining `adb_experiment.md` "Still untested" items that hardware allows:
    a `LIS2` stream large enough to stress the reader, and a mid-transfer `RECV` failure.
 
-**Output:** a new `docs/phase3_device_findings.md` in the established experiment style —
+**Output:** a new `docs/DEVICE_FINDINGS.md` in the established experiment style —
 measured values, what changed in the spec, what remains untested.
 
 ## Stage 2 — Install and the real audit trail (needs root from your other account)
