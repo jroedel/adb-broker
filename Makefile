@@ -55,6 +55,29 @@ build-release:
 	CGO_ENABLED=0 GOOS=$(RELEASE_GOOS) GOARCH=$(RELEASE_GOARCH) \
 		go build -trimpath -ldflags "$(LDFLAGS)" -o $(OUT) ./cmd/adb-broker
 
+## dist: build every published artifact and the SHA256SUMS over them, into dist/.
+## This is what a release IS — the release workflow calls this one target rather than looping
+## over architectures in YAML, so the set of published artifacts is defined here and a dry run
+## on a laptop produces the same set as a tag does.
+##
+## Pass the version: make dist VERSION=1.2.0. Without it every artifact reports 0.0.0+dev.
+##
+## The sums are written from inside dist/ so the file names in it are bare, which is what lets
+## a consumer run `sha256sum -c SHA256SUMS` in the directory it downloaded into.
+DIST        := dist
+DIST_ARCHES := amd64 arm64
+
+dist:
+	@mkdir -p $(DIST)
+	rm -f $(DIST)/adb-broker-linux-* $(DIST)/SHA256SUMS
+	for arch in $(DIST_ARCHES); do \
+		$(MAKE) --no-print-directory build-release \
+			VERSION=$(VERSION) RELEASE_GOARCH=$$arch \
+			OUT=$(DIST)/adb-broker-linux-$$arch || exit 1; \
+	done
+	cd $(DIST) && sha256sum adb-broker-linux-* > SHA256SUMS
+	@cat $(DIST)/SHA256SUMS
+
 ## build-fixture: compile the fixture binary, which is absent from the release build
 build-fixture:
 	@mkdir -p $(BIN)
@@ -132,8 +155,8 @@ install: build
 
 ## clean: remove build and coverage artifacts
 clean:
-	rm -rf $(BIN) coverage.out
+	rm -rf $(BIN) $(DIST) coverage.out
 
-.PHONY: help build build-release build-fixture vet fmt lint vuln-check deps-check \
+.PHONY: help build build-release dist build-fixture vet fmt lint vuln-check deps-check \
 	test-unit test-integration test-fixture test-nocgo test-device test cover \
 	install clean
